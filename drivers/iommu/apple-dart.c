@@ -945,7 +945,8 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 		if (!live)
 			continue;
 		apple_dart_retire_root(live, owned, dart->pgsize / sizeof(*live));
-		if (dart->fw_mirror && dart->version >= 0x0202 && !idx) {
+		if ((dart->fw_mirror || dart->fw_handoff) &&
+		    dart->version >= 0x0202 && !idx) {
 			struct apple_dart_stream_map stream = { .dart = dart };
 
 			__set_bit(sid, stream.sidmap);
@@ -1258,7 +1259,9 @@ apple_dart_t8020_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 static int
 apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 {
-	if (stream_map->dart->fw_mirror && stream_map->dart->version >= 0x0202)
+	/* Keep out of firmware-held slots; see apple_dart_fw_invalidate(). */
+	if ((stream_map->dart->fw_mirror || stream_map->dart->fw_handoff) &&
+	    stream_map->dart->version >= 0x0202)
 		return apple_dart_fw_invalidate(stream_map, 0, U64_MAX);
 	return apple_dart_t8110_hw_tlb_command_range(
 		stream_map, DART_T8110_TLB_CMD_OP_FLUSH_SID, false, 0, 0);
