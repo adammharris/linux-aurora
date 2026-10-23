@@ -669,6 +669,24 @@ static bool apple_dart_fw_mapping_matches(phys_addr_t phys, int prot,
 }
 
 /*
+ * Whether the firmware leaf behind root @slot of a three-level stream already
+ * translates the page at @addr to @paddr with the protection Linux asks for.
+ */
+static bool apple_dart_fw_page_matches(const struct apple_dart *dart,
+				       const struct apple_dart_fw_root *fw,
+				       u64 slot, u64 addr, phys_addr_t paddr,
+				       int prot)
+{
+	u64 leaf = (addr / dart->pgsize) % (dart->pgsize / sizeof(u64));
+	phys_addr_t phys;
+	int fw_prot;
+
+	return apple_dart_fw_leaf_decode(READ_ONCE(fw->leaf[slot][leaf]), addr,
+					 &phys, &fw_prot) &&
+	       apple_dart_fw_mapping_matches(phys, fw_prot, paddr, prot);
+}
+
+/*
  * A root slot firmware already uses can still back Linux mappings when the
  * firmware's leaf table translates every page Linux mapped there to the same
  * physical address. That is the case for the boot loader's handoff, which
@@ -1535,6 +1553,15 @@ static bool apple_dart_domain_uses_fw(struct apple_dart_domain *domain, int i,
 /*
  * Hardware continues to use every firmware-owned slot. Its entire IOVA
  * span is excluded from Linux allocation, including currently unmapped holes.
+ *
+ * Linux may still repeat a page the firmware leaf already translates, with
+ * the same physical address and protection. That happens when one domain
+ * spans several DARTs and only some of them inherited a reserved region:
+ * the J700 display subsystem uses disp0 and dispext0, and only disp0 scans
+ * out the boot framebuffer. apple_dart_inherited_phys() cannot report the
+ * region as mapped for the whole domain, so the core maps it, and the copy
+ * must be accepted on disp0 while dispext0 gets it in a vacant slot.
+ * apple_dart_publish_root() never writes the firmware slot itself.
  */
 static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 				   phys_addr_t paddr, size_t size, int prot)
@@ -1556,6 +1583,7 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 			u64 addr = dva + off;
 
 			for (sid = 0; sid < dart->num_streams; sid++) {
+				const struct apple_dart_fw_root *fw;
 				bool four;
 				u64 idx, slot;
 				const u64 *live, *owned;
@@ -1563,12 +1591,6 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 				if (!apple_dart_domain_uses_fw(domain, i, map, sid))
 					continue;
 				if (!dart->fw_handoff) {
-					const struct apple_dart_fw_root *fw;
-					phys_addr_t phys;
-					u64 pte;
-					int fw_prot;
-					u64 leaf = (addr >> pgshift) & (entries - 1);
-
 					slot = (addr >> (pgshift + bits)) & (entries - 1);
 					idx = addr >> (pgshift + 2 * bits);
 					if (idx >= DART_MAX_TTBR)
@@ -1577,10 +1599,8 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 					live = dart->locked_ttbr[sid][idx];
 					if (!live || !apple_dart_fw_slot_owned(fw, live, slot))
 						continue;
-					pte = READ_ONCE(fw->leaf[slot][leaf]);
-					if (!apple_dart_fw_leaf_decode(pte, addr, &phys, &fw_prot) ||
-					    !apple_dart_fw_mapping_matches(phys, fw_prot,
-									   paddr + off, prot)) {
+					if (!apple_dart_fw_page_matches(dart, fw, slot, addr,
+									paddr + off, prot)) {
 						ret = -EBUSY;
 						goto unlock;
 					}
@@ -1595,8 +1615,17 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 					continue;
 				live = dart->locked_ttbr[sid][idx];
 				owned = dart->locked_owned[sid][idx];
-				/* All pages of an inherited slot remain firmware's. */
-				if (live && apple_dart_fw_slot_foreign(live, owned, slot)) {
+				if (!live || !apple_dart_fw_slot_foreign(live, owned, slot))
+					continue;
+				/*
+				 * All pages of an inherited slot remain firmware's;
+				 * only a page its snapshotted leaf already maps the
+				 * same way may be repeated.
+				 */
+				fw = dart->locked_fw[sid][idx];
+				if (four || !apple_dart_fw_slot_owned(fw, live, slot) ||
+				    !apple_dart_fw_page_matches(dart, fw, slot, addr,
+								paddr + off, prot)) {
 					ret = -EBUSY;
 					goto unlock;
 				}

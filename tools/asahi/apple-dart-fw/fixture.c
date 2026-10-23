@@ -140,9 +140,16 @@ int main(int argc,char**argv){
   regions[1]=(struct iommu_resv_region){.start=0x8000,.dva=0,.length=SZ_16K,.type=IOMMU_RESV_TRANSLATED};region_count=2;
   if(!strcmp(c,"core-hole"))firmware_leaf[0]=0;
   if(!strcmp(c,"core-changed-leaf"))firmware_leaf[0]=leaf(0xc000);
+  /* A second DART of the domain whose root slot is vacant cannot inherit
+   * the region, so the core maps it and the first DART accepts the copy. */
+  static u64 vacant_root[2048],vacant_shadow[2048];struct apple_dart d2=d;
+  if(!strcmp(c,"core-second-dart")){
+   d2.locked_ttbr[0][0]=vacant_root;d2.locked_owned[0][0]=vacant_shadow;d2.locked_fw[0][0]=NULL;
+   domain.stream_maps[1].dart=&d2;domain.fw_sidmap[1][0]=1;regions[1].prot=IOMMU_READ|IOMMU_WRITE|IOMMU_CACHE;
+  }
   int result=iommu_create_device_fw_mappings(&io_domain,&dev);
   assert(io.require_translated&&result==(!strcmp(c,"core-hole")?-EBUSY:0));
-  assert(core_maps==(!strcmp(c,"core-hole")?1:0));
+  assert(core_maps==(!strcmp(c,"core-hole")||!strcmp(c,"core-second-dart")?1:0));
  }
  else if(!strncmp(c,"range-",6)){
   u64 start=0,length=0;bool four=!strncmp(c,"range-four",10);u64 window=1ULL<<40;size_t slot=four?16:1;
@@ -161,12 +168,20 @@ int main(int argc,char**argv){
  }
  else if(!strncmp(c,"map-",4)){
   root[0]=0x1401;u64 addr=0;
+  u64 paddr=0x8000;int prot=IOMMU_READ|IOMMU_WRITE|IOMMU_CACHE;
   if(!strcmp(c,"map-host")){addr=1ULL<<25;root[1]=0;}
   if(!strcmp(c,"map-owned"))shadow[0]=root[0];
   if(!strcmp(c,"map-unmatched"))d.fw_handoff=0;
   if(!strcmp(c,"map-attached")){domain.fw_sidmap[0][0]=0;domain.stream_maps[0].sidmap[0]=1;}
-  int expected=!strcmp(c,"map-host")||!strcmp(c,"map-owned")||!strcmp(c,"map-unmatched")?0:-EBUSY;
-  assert(apple_dart_check_fw_map(&domain,addr,0x8000,SZ_16K,IOMMU_READ|IOMMU_WRITE|IOMMU_CACHE)==expected);
+  /* Only a page the firmware leaf already maps the same way is repeated. */
+  if(!strcmp(c,"map-hole"))firmware_leaf[0]=0;
+  if(!strcmp(c,"map-wrong-physical"))paddr=0xc000;
+  if(!strcmp(c,"map-wrong-permission"))prot&=~IOMMU_CACHE;
+  if(!strcmp(c,"map-changed-root"))root[0]=0x1801;
+  if(!strcmp(c,"map-four"))d.tcr=1;
+  int expected=!strcmp(c,"map-host")||!strcmp(c,"map-owned")||!strcmp(c,"map-unmatched")||
+   !strcmp(c,"map-firmware")||!strcmp(c,"map-attached")?0:-EBUSY;
+  assert(apple_dart_check_fw_map(&domain,addr,paddr,SZ_16K,prot)==expected);
  }
  else if(!strncmp(c,"lookup-",7)){
   root[0]=0x1401;assert(apple_dart_inherited_phys(&domain,0)==0x8000);
