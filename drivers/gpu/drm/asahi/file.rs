@@ -405,18 +405,7 @@ impl File {
 
         gpu.get_params(&mut params)?;
 
-        if gpu.supports_vm_status() {
-            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
-        }
-        if gpu.queue_limits().is_some() {
-            params.features |=
-                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
-        }
-
-        if gpu.soft_faults() && gpu.supports_soft_faults() {
-            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
-        }
+        params.features |= gpu.feature_flags();
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
@@ -637,6 +626,7 @@ impl File {
         if vm.is_none() {
             Err(ENOENT)
         } else {
+            drop(vm);
             Ok(0)
         }
     }
@@ -698,9 +688,21 @@ impl File {
             device, size, data.flags, resv_obj, reclaim_cpu, pages_no_reclaim, commit,
         )?;
         if reg_data.gpu.prepare_new_objects() {
+            #[cfg(CONFIG_DRM_ASAHI_G15)]
+            if reg_data.gpu.as_any().is::<crate::g15::Gpu>() {
+                gem::prepare_new_object_g15(&gem)?;
+            } else {
+                let registered = device.registration_guard().ok_or(ENODEV)?;
+                let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+                gem::prepare_new_object(&gem, parent.as_ref())?;
+            }
+            #[cfg(not(CONFIG_DRM_ASAHI_G15))]
             let registered = device.registration_guard().ok_or(ENODEV)?;
-            let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
-            gem::prepare_new_object(&gem, parent.as_ref())?;
+            #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+            {
+                let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+                gem::prepare_new_object(&gem, parent.as_ref())?;
+            }
         }
 
         let handle = gem.create_handle(file)?;

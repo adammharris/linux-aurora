@@ -26,6 +26,7 @@ struct apple_atcphy {
 	u32 dp_usb_context[2][27];
 	bool pipe_pending, usb_off_pending, usb_off_drained;
 	bool usb3_port_off, park_owed;
+	bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
 	enum atcphy_mode mode, typec_mode;
 	enum atcphy_pipehandler_state pipe_state;
 };
@@ -69,11 +70,10 @@ static void regulator_disable(int p)
 	assert(!p);
 }
 struct dwc3 {
-	unsigned int current_dr_role;
 	struct phy *usb2_generic_phy[3], *usb3_generic_phy[3];
 	int num_usb2_ports, num_usb3_ports, usb2_phy, usb3_phy;
 	struct reset_controller_dev *reset;
-	int dev, usb_psy, vbus_draw_work, dr_mode;
+	int dev, usb_psy, vbus_draw_work, dr_mode, current_dr_role;
 	struct { void *notifier_call; } psy_nb;
 };
 struct dwc3_apple {
@@ -315,9 +315,6 @@ static int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state s,
 	*m = s == DWC3_APPLE_HOST ? PHY_MODE_INVALID : PHY_MODE_USB_DEVICE;
 	return 0;
 }
-/* Register tuning is outside this teardown fixture's simulated device. */
-static void dwc3_apple_apply_tunables(struct dwc3_apple *a) { (void)a; }
-#define dev_info_ratelimited(...) ((void)0)
 static int dwc3_apple_set_role(struct dwc3_apple *a, enum dwc3_apple_state s);
 static int dwc3_host_init(struct dwc3 *d)
 {
@@ -332,21 +329,6 @@ static int dwc3_gadget_init(struct dwc3 *d)
 {
 	(void)d;
 	return gadget_init_error;
-}
-/* Observe the runtime reference taken by the production role transition. */
-static unsigned int rpm_gets, rpm_puts;
-static int pm_runtime_resume_and_get(void *dev)
-{
-    (void)dev;
-    rpm_gets++;
-    return 0;
-}
-static void pm_runtime_mark_last_busy(void *dev) { (void)dev; }
-static void pm_runtime_put_autosuspend(void *dev)
-{
-    (void)dev;
-    assert(rpm_puts < rpm_gets);
-    rpm_puts++;
 }
 #define pm_runtime_get_sync(...) ((void)0)
 #define pm_runtime_allow(...) ((void)0)
@@ -381,3 +363,24 @@ static void dwc3_free_event_buffers(struct dwc3 *d)
 enum { USB_DR_MODE_HOST = 1, DWC3_GCTL_PRTCAP_HOST = 1 };
 static void dwc3_apple_set_ptrcap(struct dwc3_apple *a, u32 mode)
 { (void)a; (void)mode; assert(!"J713 pre-init path entered a legacy fixture"); }
+
+/* Runtime-PM ownership is observable even though this fixture has no device PM core. */
+static int pm_runtime_resume_and_get(void *dev)
+{
+	(void)dev;
+	return 0;
+}
+static void pm_runtime_mark_last_busy(void *dev)
+{
+	(void)dev;
+}
+static void pm_runtime_put_autosuspend(void *dev)
+{
+	(void)dev;
+}
+/* The legacy profile never has T8132 tunables. */
+static void dwc3_apple_apply_tunables(struct dwc3_apple *appledwc)
+{
+	assert(!appledwc->host_only);
+}
+#define dev_info_ratelimited(...) ((void)0)

@@ -2113,7 +2113,7 @@ impl Vm {
     /// Attach a status and job lifetime tracking before sharing a newly created user VM with
     /// queues, without the G17 canonical context views, shared-object footprints and idle
     /// residency reclaim of [`Self::with_status`]. Used by G15, whose user objects stay pinned.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     pub(crate) fn with_tracked_status(mut self) -> Result<Self> {
         self.status = Some(Arc::pin_init(
             crate::g17::status::VmStatus::new(),
@@ -2136,7 +2136,7 @@ impl Vm {
     /// and invalidated to the point of coherency first (never only invalidated: CPU-written lines
     /// may be dirty), so the copy sees what the GPU or a write-combined CPU view stored. The
     /// mappings cannot change during the copy (GPUVM exec lock).
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     pub(crate) fn read_user(&self, va: u64, buf: &mut [u8]) -> Result {
         let mut inner = lock_vm(&self.gpuvm, None, false)?;
         let mut done = 0usize;
@@ -2839,7 +2839,7 @@ impl Drop for VmInner {
 
 /// Physical regions of a UAT whose handoff the generation has already established itself
 /// ([`Uat::new_adopted`]). None of them needs to be in the kernel linear map.
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
 pub(crate) struct AdoptedRegions {
     /// The handoff region (PPL magic, lock and flush requests).
     pub(crate) handoff: Range<PhysicalAddr>,
@@ -2862,9 +2862,9 @@ impl Uat {
         })
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     /// Map a region given by its physical range, write-combined.
-    fn map_physical(range: &Range<PhysicalAddr>, min_size: usize) -> Result<UatRegion> {
+    fn map_physical(range: &Range<PhysicalAddr>, min_size: usize, reserved_ram: bool) -> Result<UatRegion> {
         let size: usize = (range.end.checked_sub(range.start).ok_or(EINVAL)?).try_into()?;
         if size < min_size || range.start & (UAT_PGMSK as PhysicalAddr) != 0 {
             return Err(EINVAL);
@@ -2880,14 +2880,30 @@ impl Uat {
             unsafe { core::mem::transmute(kernel::types::Opaque::new(raw)) };
         // SAFETY: The UAT regions are only accessed through this mapping by the CPU; the GPU
         // reaches them through its own translation.
-        let map = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WC.into()) }?;
+        let flags = io::mem::MemFlag::WC;
+        #[cfg(CONFIG_DRM_ASAHI_G15)]
+        let flags = if reserved_ram {
+            // G15 admits only whole reserved RAM pages or wholly non-RAM carveouts.
+            if crate::g15::memory_mode(range.start, size as u64)?
+                == kernel::bindings::MEMREMAP_WB as u32
+            {
+                io::mem::MemFlag::WB
+            } else {
+                flags
+            }
+        } else {
+            flags
+        };
+        #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+        let _ = reserved_ram;
+        let map = unsafe { io::mem::Mem::try_new(res, flags.into()) }?;
         Ok(UatRegion {
             base: range.start,
             map,
         })
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     /// Creates a `Uat` for a handoff that the caller establishes itself (G15).
     ///
     /// This only maps the handoff and the TTBAT (write-combined); neither is written here. The
@@ -2907,7 +2923,7 @@ impl Uat {
         geometry: UatGeometry,
         regions: &AdoptedRegions,
     ) -> Result<Self> {
-        Self::new_adopted_with_user_upper(dev, geometry, regions, true)
+        Self::new_adopted_inner(dev, geometry, regions, true, true)
     }
 
     /// Creates the same owned-RAM adopted UAT, choosing whether application contexts also
@@ -2920,8 +2936,19 @@ impl Uat {
         regions: &AdoptedRegions,
         map_kernel_to_user: bool,
     ) -> Result<Self> {
-        let handoff_rgn = Self::map_physical(&regions.handoff, HANDOFF_SIZE)?;
-        let ttbs_rgn = Self::map_physical(&regions.ttbs, SLOTS_SIZE)?;
+        Self::new_adopted_inner(dev, geometry, regions, map_kernel_to_user, false)
+    }
+
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    fn new_adopted_inner(
+        dev: &driver::AsahiDrmDevice,
+        geometry: UatGeometry,
+        regions: &AdoptedRegions,
+        map_kernel_to_user: bool,
+        reserved_ram: bool,
+    ) -> Result<Self> {
+        let handoff_rgn = Self::map_physical(&regions.handoff, HANDOFF_SIZE, reserved_ram)?;
+        let ttbs_rgn = Self::map_physical(&regions.ttbs, SLOTS_SIZE, reserved_ram)?;
 
         // SAFETY: The Handoff struct layout matches the firmware's view of memory at this
         // address, and the region is at least large enough per the check above.
@@ -2997,13 +3024,13 @@ impl Uat {
         })
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     /// Root of the kernel lower `Vm`, for TTBAT context 0 of an adopted handoff.
     pub(crate) fn kernel_lower_root(&self) -> PhysicalAddr {
         self.kernel_lower_vm.ttb()
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     /// Root whose driver-window entry names the second-level table of [`Self::kernel_vm`]'s
     /// driver window. With [`Self::new_adopted`] this is the shadow root that no context names.
     pub(crate) fn kernel_window_root(&self) -> PhysicalAddr {

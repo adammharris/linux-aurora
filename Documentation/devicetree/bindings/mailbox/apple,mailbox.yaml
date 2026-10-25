@@ -36,6 +36,7 @@ properties:
               - apple,t8142-asc-mailbox
               - apple,t6000-asc-mailbox
               - apple,t6020-asc-mailbox
+              - apple,t6030-asc-mailbox
               - apple,t6041-asc-mailbox
           - const: apple,asc-mailbox-v4
 

@@ -301,6 +301,21 @@ pub(crate) trait Gpu: Send + Sync {
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         None
     }
+    /// Shared GET_PARAMS additions, using this backend's feature-number assignments.
+    fn feature_flags(&self) -> u64 {
+        let mut flags = 0;
+        if self.supports_vm_status() {
+            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
+        }
+        if self.queue_limits().is_some() {
+            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
+        }
+        if self.soft_faults() && self.supports_soft_faults() {
+            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+        }
+        flags
+    }
     /// Temporary capacity hint and validity in milliseconds for subsequent syncobj waits.
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         None

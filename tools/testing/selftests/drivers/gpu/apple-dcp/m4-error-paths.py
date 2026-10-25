@@ -323,12 +323,22 @@ static struct platform_device provider;
 static u64 words[3];
 static const struct apple_pmp_report_offsets offsets={16};
 static struct apple_pmp_report rep={(unsigned char *)words,&offsets};
-static bool board_m4, present=true, lockable=true, bound=true;
-static unsigned reads, drops, unlocks;
+static bool board_m4, present=true, lockable=true, bound=true, report_declared=true;
+static unsigned reads, drops, unlocks, legacy_probes;
 static bool of_machine_is_compatible(const char *s) { assert(!strcmp(s,"apple,j713")); return board_m4; }
 static bool of_device_is_compatible(struct device_node *n,const char *s) { return n && !strcmp(n->compatible,s); }
 static struct device_node *of_parse_phandle(struct device_node *n,const char *s,int i) {
     assert(n && !strcmp(s,"apple,pmp-report") && i==0); return linked;
+}
+static bool of_property_present(struct device_node *n, const char *s) {
+    assert((n==&j713 || n==&j613) && !strcmp(s,"apple,pmp-report"));
+    return report_declared;
+}
+/* These cases select T8132 or the maintained 25-series supplier, never T6030. */
+static int apple_pmp_report_wait_t6030_14(struct device *supplier, unsigned timeout_ms) {
+    assert((supplier->of_node==&j713 || supplier->of_node==&j613) && timeout_ms==5000);
+    assert(!linked && !report_declared);legacy_probes++;
+    return -ENODEV;
 }
 static void of_node_put(struct device_node *n) { (void)n; }
 static struct platform_device *of_find_device_by_node(struct device_node *n) { assert(n==linked);return present?&provider:NULL; }
@@ -355,7 +365,14 @@ int main(void) {
     unsigned before=reads;
     linked=&m4_report;assert(apple_pmp_report_wait_supplier_ready(&supplier,5000)==-ENODEV);
     linked=NULL;assert(apple_pmp_report_wait_supplier_ready(&supplier,5000)==-ENODEV);
-    supplier.of_node=&j713;board_m4=true;linked=&m4_report;present=false;
+    assert(legacy_probes==0); /* A declared but invalid report never selects legacy readiness. */
+    report_declared=false;
+    assert(apple_pmp_report_wait_supplier_ready(&supplier,5000)==-ENODEV);
+    assert(legacy_probes==1 && reads==before);
+    supplier.of_node=&j713;board_m4=true;
+    assert(apple_pmp_report_wait_supplier_ready(&supplier,5000)==-ENODEV);
+    assert(legacy_probes==2 && reads==before);
+    report_declared=true;linked=&m4_report;present=false;
     assert(apple_pmp_report_wait_supplier_ready(&supplier,5000)==-EPROBE_DEFER);
     present=true;lockable=false;assert(apple_pmp_report_wait_supplier_ready(&supplier,5000)==-EPROBE_DEFER);
     lockable=true;bound=false;assert(apple_pmp_report_wait_supplier_ready(&supplier,5000)==-EPROBE_DEFER);

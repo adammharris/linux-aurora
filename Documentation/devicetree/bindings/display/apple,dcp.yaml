@@ -246,13 +246,16 @@ properties:
   mux-controls:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     minItems: 1
-    maxItems: 8
+    maxItems: 10
+    description: |
+      T6030 external DCPs may also name the two DP IN tunnel states of each
+      Type-C crossbar, in addition to the fixed output and Type-C routes.
 
   mux-control-names:
     minItems: 1
-    maxItems: 8
+    maxItems: 10
     items:
-      pattern: '^(dp-xbar|typec[0-9]+)$'
+      pattern: '^(dp-xbar|typec[0-9]+(-dpin[01])?)$'
 
   mux-index:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -352,6 +355,21 @@ required:
   - iommus
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6030-dcpext
+      required:
+        - compatible
+    else:
+      properties:
+        mux-controls:
+          maxItems: 8
+        mux-control-names:
+          maxItems: 8
+          items:
+            pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
       not:
         properties:

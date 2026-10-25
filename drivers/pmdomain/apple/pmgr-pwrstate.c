@@ -51,6 +51,8 @@ struct apple_pmgr_ps {
 	bool externally_clocked;
 	bool system_sleep;
 	bool firmware_owned;
+	/* Never enable automatic power management (apple,no-auto-pm). */
+	bool no_auto_pm;
 	bool inherited_on;
 	bool no_auto_enable;
 	bool needs_reset_idle_wait;
@@ -212,7 +214,7 @@ static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 		return apple_pmgr_ps_check_inherited(ps);
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE,
-				!ps->no_auto_enable);
+				!ps->no_auto_enable && !ps->no_auto_pm);
 	if (ret && !ps->system_sleep)
 		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
 
@@ -232,7 +234,7 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
 	if (ret)
 		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE,
-				 !ps->no_auto_enable);
+				 !ps->no_auto_enable && !ps->no_auto_pm);
 
 	return ret;
 }
@@ -463,6 +465,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "apple,externally-clocked"))
 		ps->externally_clocked = true;
 
+	/* A cold-started coprocessor CPU must not be gated behind its firmware. */
+	ps->no_auto_pm = of_property_read_bool(node, "apple,no-auto-pm");
+
 	/*
 	 * An inherited-on domain has readable state but no transition ownership.
 	 * A firmware-owned domain need not have a CPU-accessible state register;
@@ -500,7 +505,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 			 * even if it does not get there in time.
 			 */
 			active = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
-						   !ps->no_auto_enable) == 0;
+						   !ps->no_auto_enable && !ps->no_auto_pm) == 0;
 		}
 	} else if (active && !ps->firmware_owned && !ps->inherited_on) {
 		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
@@ -509,7 +514,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	/* Turn on auto-PM if the domain is already on, unless it must stay off */
 	if (active && !ps->firmware_owned && !ps->inherited_on && !ps->no_auto_enable)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
-				   APPLE_PMGR_AUTO_ENABLE);
+				   ps->no_auto_pm ? 0 : APPLE_PMGR_AUTO_ENABLE);
 
 	ret = pm_genpd_init(&ps->genpd, NULL, !active);
 	if (ret < 0) {
@@ -592,3 +597,7 @@ MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_DESCRIPTION("PMGR power state driver for Apple SoCs");
 
 module_platform_driver(apple_pmgr_ps_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_PMGR_PWRSTATE_KUNIT_TEST)
+#include "pmgr-pwrstate-test.c"
+#endif

@@ -391,6 +391,7 @@ static struct relink_test *relink_test_init(struct kunit *test)
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, t);
 	drm = &t->drm;
 	dcp = &t->dcp;
+	apple_connector_backlight_init(&t->con);
 
 	t->pdev = kunit_platform_device_alloc(test, "dcp-relink", PLATFORM_DEVID_AUTO);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, t->pdev);

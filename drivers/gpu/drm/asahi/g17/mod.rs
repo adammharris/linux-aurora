@@ -25,6 +25,8 @@ mod completion;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+pub(crate) use dependency::inherited_error;
 mod event;
 mod feed;
 mod fence;

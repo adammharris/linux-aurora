@@ -96,6 +96,16 @@ properties:
       Forces this power domain to always be powered up.
     type: boolean
 
+  apple,no-auto-pm:
+    description: |
+      Never enables automatic power management (auto-enable) for this
+      domain: once powered up it stays at its requested state until
+      Linux changes it. Required for a coprocessor CPU domain whose
+      firmware is started cold by Linux and must not be clock or power
+      gated behind its back, such as the T6030 external display
+      coprocessors' CPU domains.
+    type: boolean
+
   apple,firmware-owned:
     description:
       The boot loader hands over active hardware whose power domain remains
@@ -107,13 +117,19 @@ properties:
     type: boolean
 
   apple,inherited-on:
-    description:
-      The boot loader hands over an active domain whose state register can be
-      read, but whose power and reset transitions have not been handed over.
-      Both target and actual state must already be active, with reset,
-      auto-enable, reset-state, busy and device-disable indications clear.
+    description: |
+      On T8132, the boot loader hands over an active domain whose state
+      register can be read, but whose power and reset transitions have not
+      been handed over. Both target and actual state must already be active,
+      with reset, auto-enable, reset-state, busy and device-disable clear.
       The OS verifies that state, retains an always-on domain, and refuses
-      power-off and reset operations without writing its state register.
+      power-off and reset without writing the register.
+
+      On T6030, T6031 and T8122, this marks the internal display chain left
+      running by the boot loader. The display handoff requires the marker
+      before adding the PMP and setting apple,min-state on that chain.
+      These older domains retain their normal PMGR transition ownership;
+      unlike apple,firmware-owned, their registers remain writable.
     type: boolean
 
   apple,min-state:
