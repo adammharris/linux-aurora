@@ -36,7 +36,6 @@ static inline void dcp_mode_begin(struct dcp_mode_state *state)
 static inline void dcp_mode_set_valid(struct dcp_mode_state *state, bool valid)
 {
 	unsigned long flags;
-	bool valid;
 
 	spin_lock_irqsave(&state->lock, flags);
 	state->valid = valid;

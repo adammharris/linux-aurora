@@ -3054,12 +3054,6 @@ static void __exit tipd_core_exit(void)
 }
 module_exit(tipd_core_exit);
 
-static void __exit tipd_core_exit(void)
-{
-	tipd_debugfs_exit();
-}
-module_exit(tipd_core_exit);
-
 MODULE_AUTHOR("Heikki Krogerus <heikki.krogerus@linux.intel.com>");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("TI TPS6598x USB Power Delivery Controller Core Functions");

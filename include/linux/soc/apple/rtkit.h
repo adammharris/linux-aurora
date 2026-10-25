@@ -58,14 +58,6 @@ struct apple_rtkit_inherited_buffer {
 #define APPLE_RTKIT_NEEDS_COREANALYTICS	BIT(1)
 
 /*
- * The co-processor places its shared buffers itself. A buffer request that
- * carries an IOVA is set up with shmem_setup and acknowledged by sending the
- * request back unchanged. The crashlog endpoint is started while the endpoint
- * map is handled, before the map is acknowledged.
- */
-#define APPLE_RTKIT_COPROC_PLACES_BUFFERS	BIT(0)
-
-/*
  * Struct to represent implementation-specific RTKit operations.
  *
  * @flags:         Combination of APPLE_RTKIT_* flags describing the

@@ -1198,11 +1198,6 @@ struct mm_struct *mm_alloc(void)
 {
 	return __mm_alloc(false, 0);
 }
-
-struct mm_struct *mm_alloc(void)
-{
-	return __mm_alloc(false, 0);
-}
 EXPORT_SYMBOL_IF_KUNIT(mm_alloc);
 
 struct mm_struct *mm_alloc_exec(void)

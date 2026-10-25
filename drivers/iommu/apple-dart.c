@@ -2275,18 +2275,6 @@ static void apple_dart_set_locked_window(struct apple_dart_domain *domain,
 		WRITE_ONCE(dart->locked_window[sid], start);
 }
 
-/* Record the DVA window of @domain for invalidates of @stream_map's streams. */
-static void apple_dart_set_locked_window(struct apple_dart_domain *domain,
-					 struct apple_dart_stream_map *stream_map)
-{
-	struct apple_dart *dart = stream_map->dart;
-	u64 start = domain->domain.geometry.aperture_start + domain->dma_offset;
-	int sid;
-
-	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
-		WRITE_ONCE(dart->locked_window[sid], start);
-}
-
 static int
 apple_dart_setup_translation_locked(struct apple_dart_domain *domain,
 				    struct apple_dart_stream_map *stream_map)

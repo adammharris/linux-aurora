@@ -127,18 +127,6 @@ static bool check_pte(struct page_vma_mapped_walk *pvmw, unsigned long pte_nr)
 	}
 #endif
 
-#ifdef CONFIG_MM_SUBPAGE
-	if (pvmw->flags & PVMW_SUBPAGE) {
-		if (!(pvmw->flags & PVMW_MIGRATION))
-			return pte_present(ptent) &&
-				pte_phys_mm(pvmw->vma->vm_mm, ptent) ==
-				PFN_PHYS(pvmw->pfn) + pvmw->subpage_offset;
-		if (pte_swp_subpage_offset(ptent) != pvmw->subpage_offset)
-			return false;
-		/* The common migration check below validates the native PFN. */
-	}
-#endif
-
 	if (pvmw->flags & PVMW_MIGRATION) {
 		const softleaf_t entry = softleaf_from_pte(ptent);
 

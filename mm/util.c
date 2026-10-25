@@ -565,35 +565,27 @@ int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
 			const struct task_struct *task, bool bypass_rlim)
 {
 	unsigned long locked_vm, limit;
-	unsigned int shift = PAGE_SHIFT - MM_ACCOUNT_SHIFT;
 	int ret = 0;
 
 	mmap_assert_write_locked(mm);
 
-	/* This exported API receives native physical-page counts. */
-	if (pages > ULONG_MAX >> shift)
-		return -ENOMEM;
-	pages <<= shift;
 	locked_vm = mm->locked_vm;
 	if (inc) {
 		if (!bypass_rlim) {
-			limit = task_rlimit(task, RLIMIT_MEMLOCK) >> MM_ACCOUNT_SHIFT;
-			if (pages > limit || locked_vm > limit - pages)
+			limit = task_rlimit(task, RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+			if (locked_vm + pages > limit)
 				ret = -ENOMEM;
 		}
-		if (!ret && pages > ULONG_MAX - locked_vm)
-			ret = -ENOMEM;
 		if (!ret)
 			mm->locked_vm = locked_vm + pages;
 	} else {
-		if (WARN_ON_ONCE(pages > locked_vm))
-			return -EINVAL;
+		WARN_ON_ONCE(pages > locked_vm);
 		mm->locked_vm = locked_vm - pages;
 	}
 
 	pr_debug("%s: [%d] caller %ps %c%lu %lu/%lu%s\n", __func__, task->pid,
-		 (void *)_RET_IP_, (inc) ? '+' : '-', pages << MM_ACCOUNT_SHIFT,
-		 locked_vm << MM_ACCOUNT_SHIFT, task_rlimit(task, RLIMIT_MEMLOCK),
+		 (void *)_RET_IP_, (inc) ? '+' : '-', pages << PAGE_SHIFT,
+		 locked_vm << PAGE_SHIFT, task_rlimit(task, RLIMIT_MEMLOCK),
 		 ret ? " - exceeded" : "");
 
 	return ret;

@@ -3282,10 +3282,6 @@ int mpol_set_shared_policy(struct shared_policy *sp,
 	if (vma_subpage_offset(vma) || ((vma->vm_end - vma->vm_start) & ~PAGE_MASK))
 		return -EINVAL;
 
-	/* Never truncate a partial cache-page policy update to zero or a neighbour. */
-	if (vma_subpage_offset(vma) || ((vma->vm_end - vma->vm_start) & ~PAGE_MASK))
-		return -EINVAL;
-
 	if (pol) {
 		new = sp_alloc(pgoff, pgoff_end, pol);
 		if (!new)

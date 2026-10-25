@@ -96,20 +96,6 @@ static inline bool cd321x_pm_mux_done(struct cd321x_pm_state *pm)
 	return retried;
 }
 
-/*
- * Ends the retries of a change that a mux held up, see cd321x_pm_mux_held().
- * Returns true if there were any.
- */
-static inline bool cd321x_pm_mux_done(struct cd321x_pm_state *pm)
-{
-	bool retried = pm->mux_retry_ms;
-
-	pm->mux_retry_ms = 0;
-	pm->mux_retries = 0;
-	pm->mux_since_ms = 0;
-	return retried;
-}
-
 static inline void cd321x_pm_prepare(struct cd321x_pm_state *pm)
 {
 	if (pm->phase != CD321X_PM_REMOVED)

@@ -628,13 +628,6 @@ struct bcm4377_data {
 	bool quiesced;
 	bool wake_armed;
 
-	/* Set once a recovery reprobe has been queued for this binding. */
-	unsigned long reset_pending;
-
-	/* System sleep: firmware quiesced, or kept running to wake us. */
-	bool quiesced;
-	bool wake_armed;
-
 	struct bcm4377_context *ctx;
 	dma_addr_t ctx_dma;
 
@@ -3075,18 +3068,6 @@ static int bcm4377_suspend(struct device *dev)
 		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
 		bcm4377_queue_setup_retry(bcm4377);
 		return ret;
-	}
-
-	if (device_may_wakeup(dev)) {
-		/*
-		 * Remote wakeup: leave the firmware running and the function
-		 * in D0, so a connection attempt from a wake-allowed device
-		 * raises an interrupt. Saving the state here stops the PCI
-		 * core from putting the function into D3hot.
-		 */
-		pci_save_state(pdev);
-		bcm4377->wake_armed = !enable_irq_wake(pdev->irq);
-		return 0;
 	}
 
 	if (device_may_wakeup(dev)) {

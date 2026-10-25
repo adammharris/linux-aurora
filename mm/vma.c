@@ -3087,10 +3087,6 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 			.index = addr >> PAGE_SHIFT, .offset = addr & ~PAGE_MASK,
 		});
 
-		vmg_set_page_offset(&vmg, (struct vm_page_offset) {
-			.index = addr >> PAGE_SHIFT, .offset = addr & ~PAGE_MASK,
-		});
-
 		vmg.prev = vma;
 		/* vmi is positioned at prev, which this mode expects. */
 		vmg.just_expand = true;

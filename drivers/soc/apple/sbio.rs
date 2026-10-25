@@ -2163,83 +2163,6 @@ impl SepData {
             // Each step has said why it failed.
             Err(_) => false,
         }
-        if self.profile.nonce_session && !self.authenticate_sensor_session() {
-            return false;
-        }
-        self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
-        self.note_sensor_recoveries();
-        let _ = self.log_identity_count(c"after sensor serial registration");
-        true
-    }
-
-    fn sensor_platform_identity() -> Result<[u8; 12]> {
-        let node = kernel::of::root().ok_or(ENODEV)?;
-        let property: KVec<u8> = node.get_property(c"serial-number")?;
-        let length = property.iter().position(|byte| *byte == 0).ok_or(EINVAL)?;
-        let mut identity = [0; 12];
-        if length == 0 || length > identity.len() || property.len() != length + 1 {
-            return Err(EINVAL);
-        }
-        identity[..length].copy_from_slice(&property[..length]);
-        Ok(identity)
-    }
-
-    fn sensor_session_request(&self, opcode: u16, name: &'static CStr, bytes: &[u8]) -> bool {
-        match self.sbio_transfer_raw(opcode, name, bytes) {
-            Ok(reply) if reply.status.is_ok() => true,
-            Ok(reply) => {
-                dev_err!(self.dev, "sensor: {} refused with status {}\n", name, reply.status);
-                false
-            }
-            Err(error) => {
-                dev_err!(self.dev, "sensor: {} transfer failed: {:?}\n", name, error);
-                false
-            }
-        }
-    }
-
-    fn authenticate_sensor_session(&self) -> bool {
-        let nonce = match sensor::session_nonce() {
-            Ok(nonce) => nonce,
-            Err(error) => {
-                dev_err!(self.dev, "sensor: nonce read failed: {:?}\n", error);
-                self.sensor_step_failed(c"nonce read");
-                return false;
-            }
-        };
-        self.sensor_trace(c"nonce read");
-        if !self.sensor_session_request(0x81, c"SENSOR_NONCE", &nonce) {
-            self.sensor_step_failed(c"SENSOR_NONCE");
-            return false;
-        }
-        self.sensor_trace(c"SENSOR_NONCE");
-
-        if !self.sensor_key_loaded.load(Relaxed) {
-            let firmware = match kernel::firmware::Firmware::request(
-                c"apple/msrk-j700.bin", &self.dev,
-            ) {
-                Ok(firmware) => firmware,
-                Err(error) => {
-                    dev_err!(
-                        self.dev,
-                        "sensor: signed root-key container unavailable: {:?}\n",
-                        error
-                    );
-                    return false;
-                }
-            };
-            if firmware.data().is_empty()
-                || !self.sensor_session_request(0x86, c"SENSOR_ROOT_KEY", firmware.data())
-            {
-                self.sensor_step_failed(c"SENSOR_ROOT_KEY");
-                return false;
-            }
-            self.sensor_key_loaded.store(true, Relaxed);
-            self.sensor_trace(c"SENSOR_ROOT_KEY");
-        }
-        // Each identification starts a new sensor-side exchange, even though
-        // the signed key remains loaded for the lifetime of the enclave.
-        self.establish_session()
     }
 
     /// SENSOR_NONCE, the signed root key once a boot, and the session share.
@@ -3373,7 +3296,7 @@ impl SepData {
     /// The system is about to suspend. End any capture in progress, hold new
     /// ones, and wait for the enrol or verify work to stop touching the sensor
     /// before devices go down.
-    pub(crate) fn sleep_prepare(&self) -> Result<()> {
+    pub(crate) fn sleep_prepare(&self) {
         let woke = {
             let mut session = self.bio_session.lock();
             self.suspending.store(true, Relaxed);
@@ -3396,15 +3319,14 @@ impl SepData {
                 // the sensor again.
                 dev_warn!(
                     self.dev,
-                    "Touch ID: capture did not drain within {} ms; aborting suspend\n",
+                    "Touch ID: a capture was still running {} ms after the system started to sleep; continuing\n",
                     SLEEP_DRAIN_MS
                 );
-                return Err(EBUSY);
+                return;
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
             waited += 10;
         }
-        Ok(())
     }
 
     /// The system has resumed, or the suspend was aborted.

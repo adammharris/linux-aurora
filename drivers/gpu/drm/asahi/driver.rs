@@ -217,13 +217,6 @@ impl platform::Driver for AsahiPlatformDriver {
         }
     }
 
-    fn unbind(_pdev: &platform::Device<Core>, this: Pin<&Self>) {
-        if let Some(gpu) = (*this.drm).gpu.as_any().downcast_ref::<g17::Gpu>() {
-            // Driver data is dropped after devres, so CPU control must happen in unbind.
-            gpu.shutdown();
-        }
-    }
-
     /// Device probe function.
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,

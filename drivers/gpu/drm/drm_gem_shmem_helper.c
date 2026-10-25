@@ -1023,22 +1023,6 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 	    (!vma->vm_file || vma->vm_file->f_mapping != obj->dev->anon_inode->i_mapping))
 		return -EINVAL;
 
-	/* Validate bytes, including a partial native-page offset from PRIME. */
-	{
-		pgoff_t index = drm_gem_shmem_object_offset(obj, vma->vm_pgoff);
-		unsigned long offset, length = vma->vm_end - vma->vm_start;
-
-		if (check_mul_overflow(index, PAGE_SIZE, &offset) ||
-		    check_add_overflow(offset, (unsigned long)vma_subpage_offset(vma), &offset) ||
-		    offset > obj->size || length > obj->size - offset)
-			return -EINVAL;
-	}
-
-	/* Revocation zaps the device anon mapping only. */
-	if (shmem->reclaimable_cpu_mappings &&
-	    (!vma->vm_file || vma->vm_file->f_mapping != obj->dev->anon_inode->i_mapping))
-		return -EINVAL;
-
 	dma_resv_lock(shmem->base.resv, NULL);
 	if (shmem->reclaimable_cpu_mappings) {
 		if (!refcount_inc_not_zero(&shmem->cpu_vma_count))

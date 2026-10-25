@@ -610,15 +610,6 @@ static inline u32 bpf_obj_uptr_extra_size(const struct btf_record *rec)
 #endif
 }
 
-static inline u32 bpf_obj_uptr_extra_size(const struct btf_record *rec)
-{
-#ifdef CONFIG_MM_SUBPAGE
-	return IS_ERR_OR_NULL(rec) ? 0 : rec->uptr_extra_size;
-#else
-	return 0;
-#endif
-}
-
 static inline void bpf_obj_swap_uptrs(const struct btf_record *rec, void *dst, void *src)
 {
 	unsigned long *src_uptr, *dst_uptr;

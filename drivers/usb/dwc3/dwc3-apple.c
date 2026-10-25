@@ -899,14 +899,6 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "Failed to set up wakeup\n");
 
 	/*
-	 * Like a PCI xHCI controller, allow USB devices to wake the system by default. This has
-	 * to be set before dwc3_core_probe(), which hands it on to the xHCI device.
-	 */
-	ret = devm_device_init_wakeup(dev);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to set up wakeup\n");
-
-	/*
 	 * On this platform, DWC3 can only be brought up after parts of the PHY have been
 	 * initialized with knowledge of the target mode and cable orientation from typec_set_mux.
 	 * Since this has not happened here we cannot setup DWC3 yet and instead defer this until

@@ -1,7 +1,7 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
 T8140/J700 experimental radio PCIe bootstrap
-==========================================
+============================================
 
 The J700 path trains port 0, validates a bounded PIODMA bootstrap request,
 and enables native ECAM for the MediaTek Wi-Fi and Bluetooth functions.

@@ -1121,41 +1121,56 @@ static int vfio_iommu_type1_pin_pages(void *iommu_data,
 {
 	struct vfio_iommu *iommu = iommu_data;
 	struct vfio_iommu_group *group;
-	unsigned long pinned = 0;
+	int i, j, ret;
+	unsigned long remote_vaddr;
+	struct vfio_dma *dma;
 	bool do_accounting;
 	dma_addr_t iova_end;
 	size_t iova_size;
-	int i, ret;
 
 	if (!iommu || !pages || npage <= 0)
 		return -EINVAL;
-	/* Callers recover the original byte offset from the returned page. */
-	user_iova = ALIGN_DOWN(user_iova, PAGE_SIZE);
+
+	/* Supported for v2 version only */
 	if (!iommu->v2)
 		return -EACCES;
+
 	if (check_mul_overflow(npage, PAGE_SIZE, &iova_size) ||
 	    check_add_overflow(user_iova, iova_size - 1, &iova_end))
 		return -EOVERFLOW;
 
 	mutex_lock(&iommu->lock);
+
 	if (WARN_ONCE(iommu->vaddr_invalid_count,
 		      "vfio_pin_pages not allowed with VFIO_UPDATE_VADDR\n")) {
 		ret = -EBUSY;
 		goto pin_done;
 	}
+
+	/* Fail if no dma_umap notifier is registered */
 	if (list_empty(&iommu->device_list)) {
 		ret = -EINVAL;
 		goto pin_done;
 	}
-	do_accounting = list_empty(&iommu->domain_list);
-	for (i = 0; i < npage; i++) {
-		unsigned long done = 0;
 
-		pages[i] = NULL;
-		while (done < PAGE_SIZE) {
-			dma_addr_t iova = user_iova + PAGE_SIZE * i + done;
-			struct vfio_dma *dma = vfio_find_dma(iommu, iova, 1);
-			unsigned long length, pfn;
+	/*
+	 * If iommu capable domain exist in the container then all pages are
+	 * already pinned and accounted. Accounting should be done if there is no
+	 * iommu capable domain in the container.
+	 */
+	do_accounting = list_empty(&iommu->domain_list);
+
+	for (i = 0; i < npage; i++) {
+		unsigned long phys_pfn;
+		dma_addr_t iova;
+		struct vfio_pfn *vpfn;
+
+		iova = user_iova + PAGE_SIZE * i;
+		dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
+		if (!dma) {
+			ret = -EINVAL;
+			goto pin_unwind;
+		}
 
 		if ((dma->prot & prot) != prot) {
 			ret = -EPERM;
@@ -1199,17 +1214,26 @@ static int vfio_iommu_type1_pin_pages(void *iommu_data,
 				   (iova - dma->iova) >> pgshift, 1);
 		}
 	}
-	ret = npage;
+	ret = i;
+
 	group = vfio_iommu_find_iommu_group(iommu, iommu_group);
 	if (!group->pinned_page_dirty_scope) {
 		group->pinned_page_dirty_scope = true;
 		iommu->num_non_pinned_groups--;
 	}
+
 	goto pin_done;
+
 pin_unwind:
-	vfio_unpin_external_range(iommu, user_iova, pinned, do_accounting);
-	while (i >= 0)
-		pages[i--] = NULL;
+	pages[i] = NULL;
+	for (j = 0; j < i; j++) {
+		dma_addr_t iova;
+
+		iova = user_iova + PAGE_SIZE * j;
+		dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
+		vfio_unpin_page_external(dma, iova, do_accounting);
+		pages[j] = NULL;
+	}
 pin_done:
 	mutex_unlock(&iommu->lock);
 	return ret;
@@ -1219,21 +1243,39 @@ static void vfio_iommu_type1_unpin_pages(void *iommu_data,
 					 dma_addr_t user_iova, int npage)
 {
 	struct vfio_iommu *iommu = iommu_data;
+	bool do_accounting;
 	dma_addr_t iova_end;
 	size_t iova_size;
-	unsigned long unpinned;
+	int i;
 
-	if (WARN_ON(!iommu->v2) || WARN_ON(npage <= 0))
+	/* Supported for v2 version only */
+	if (WARN_ON(!iommu->v2))
 		return;
-	user_iova = ALIGN_DOWN(user_iova, PAGE_SIZE);
+
+	if (WARN_ON(npage <= 0))
+		return;
+
 	if (WARN_ON(check_mul_overflow(npage, PAGE_SIZE, &iova_size) ||
 		    check_add_overflow(user_iova, iova_size - 1, &iova_end)))
 		return;
+
 	mutex_lock(&iommu->lock);
-	unpinned = vfio_unpin_external_range(iommu, user_iova, iova_size,
-					   list_empty(&iommu->domain_list));
+
+	do_accounting = list_empty(&iommu->domain_list);
+	for (i = 0; i < npage; i++) {
+		dma_addr_t iova = user_iova + PAGE_SIZE * i;
+		struct vfio_dma *dma;
+
+		dma = vfio_find_dma(iommu, iova, PAGE_SIZE);
+		if (!dma)
+			break;
+
+		vfio_unpin_page_external(dma, iova, do_accounting);
+	}
+
 	mutex_unlock(&iommu->lock);
-	WARN_ON(unpinned != iova_size);
+
+	WARN_ON(i != npage);
 }
 #endif
 
@@ -1913,27 +1955,25 @@ static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
 static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
 				 unsigned long vaddr)
 {
-	long old_pages = dma->locked_vm;
+	struct task_struct *task = current->group_leader;
+	struct mm_struct *mm = current->mm;
+	long npage = dma->locked_vm;
+	bool lock_cap;
 	int ret;
 
-	if (mm == dma->mm) {
-		if (pages == old_pages)
-			return 0;
-		ret = mm_lock_acct(task, mm, lock_cap, (long)pages - old_pages);
-		if (!ret)
-			dma->locked_vm = pages;
-		return ret;
-	}
-	ret = mm_lock_acct(task, mm, lock_cap, pages);
+	if (mm == dma->mm)
+		return 0;
+
+	lock_cap = capable(CAP_IPC_LOCK);
+	ret = mm_lock_acct(task, mm, lock_cap, npage);
 	if (ret)
 		return ret;
 
-	/* Metadata adoption can deduplicate charges, but not original PIN refs. */
-	ret = mm_lock_acct(dma->task, dma->mm, dma->lock_cap, -old_pages);
-	if (ret) {
-		mm_lock_acct(task, mm, lock_cap, -(long)pages);
-		return ret;
+	if (mmget_not_zero(dma->mm)) {
+		mm_lock_acct(dma->task, dma->mm, dma->lock_cap, -npage);
+		mmput(dma->mm);
 	}
+
 	if (dma->task != task) {
 		put_task_struct(dma->task);
 		dma->task = get_task_struct(task);
@@ -1942,40 +1982,9 @@ static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
 	dma->mm = mm;
 	mmgrab(dma->mm);
 	dma->lock_cap = lock_cap;
-	dma->locked_vm = pages;
 	return 0;
 }
 #endif
-
-static int vfio_change_dma_mm(struct vfio_dma *dma, struct task_struct *task,
-			      struct mm_struct *mm, bool lock_cap)
-{
-	return vfio_change_dma_mm_pages(dma, task, mm, lock_cap, dma->locked_vm);
-}
-
-static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
-				 unsigned long vaddr)
-{
-	struct vfio_fragment_provider *provider;
-	int ret;
-
-	if (dma->fragments || (mm_page_size(current->mm) == PAGE_SIZE &&
-			      IS_ALIGNED(vaddr, PAGE_SIZE)))
-		return vfio_change_dma_mm(dma, current->group_leader, current->mm,
-					  capable(CAP_IPC_LOCK));
-
-	/* Prepare only metadata: failure must preserve every legacy pin/charge. */
-	provider = vfio_fragments_prepare_native(iommu, dma);
-	if (IS_ERR(provider))
-		return PTR_ERR(provider);
-	ret = vfio_change_dma_mm_pages(dma, current->group_leader, current->mm,
-				      capable(CAP_IPC_LOCK), vfio_fragments_native_pages(provider));
-	if (ret)
-		vfio_fragments_abort_native(provider);
-	else
-		vfio_fragments_commit_native(dma, provider);
-	return ret;
-}
 
 static int vfio_dma_do_map(struct vfio_iommu *iommu,
 			   struct vfio_iommu_type1_dma_map *map)

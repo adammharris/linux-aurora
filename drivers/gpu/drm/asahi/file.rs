@@ -376,32 +376,6 @@ impl File {
             _ => {}
         }
 
-        match data.param_group {
-            uapi::DRM_ASAHI_PARAM_GROUP_VM_STATUS if gpu.supports_vm_status() => {
-                return Self::get_vm_status(data, file);
-            }
-            uapi::DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR if gpu.supports_vm_status() => {
-                return Self::register_vm_status_mirror(data, file);
-            }
-            uapi::DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS => {
-                if data.pad != 0
-                    || data.size < core::mem::size_of::<uapi::drm_asahi_queue_limits>() as u64
-                {
-                    return Err(EINVAL);
-                }
-                let limits = gpu.queue_limits().ok_or(EINVAL)?;
-                let words = [limits.max_queues, limits.max_in_flight_per_queue, 0, 0];
-                UserSlice::new(
-                    UserPtr::from_addr(data.pointer as _),
-                    core::mem::size_of_val(&words),
-                )
-                .writer()
-                .write(&words)?;
-                return Ok(0);
-            }
-            _ => {}
-        }
-
         if data.param_group != 0 || data.pad != 0 {
             cls_pr_debug!(Errors, "get_params: Invalid arguments\n");
             return Err(EINVAL);
@@ -1448,12 +1422,6 @@ impl File {
             &vec,
             objects,
         );
-
-        if ret.is_ok() {
-            if let Some((util_min, duration_ms)) = gpu.syncobj_wait_hint() {
-                file.set_syncobj_wait_hint(util_min, duration_ms);
-            }
-        }
 
         if ret.is_ok() {
             if let Some((util_min, duration_ms)) = gpu.syncobj_wait_hint() {

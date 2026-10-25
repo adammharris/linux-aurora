@@ -1067,7 +1067,6 @@ static const struct apple_epic_service_ops dptxep_ops[] = {
 		.teardown = dptxport_teardown,
 		.init = dptxport_init,
 		.call = dptxport_call,
-		.call_v2 = dptxport_group_call,
 	},
 	{}
 };

@@ -271,9 +271,6 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 	if (ps->firmware_owned || ps->inherited_on)
 		return -EPERM;
 
-	if (ps->firmware_owned)
-		return -EPERM;
-
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)

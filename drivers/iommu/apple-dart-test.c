@@ -97,7 +97,6 @@ static void apple_dart_test_before_attach(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, dart->regs);
 	spin_lock_init(&dart->lock);
 	mutex_init(&domain->init_lock);
-	master.dma_max = DMA_BIT_MASK(dart->ias);
 	master.stream_maps[0].dart = dart;
 	__set_bit(0, master.stream_maps[0].sidmap);
 	/* of_xlate() starts each master with the window of its DART. */

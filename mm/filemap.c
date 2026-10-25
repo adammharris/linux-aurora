@@ -3977,11 +3977,6 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 		return filemap_map_user_pages(vmf, start_pgoff, end_pgoff);
 #endif
 
-#ifdef CONFIG_MM_SUBPAGE
-	if (mm_page_size(vma->vm_mm) != PAGE_SIZE)
-		return filemap_map_user_pages(vmf, start_pgoff, end_pgoff);
-#endif
-
 	/*
 	 * Recalculate end_pgoff based on file_end before calling
 	 * next_uptodate_folio() to avoid races with concurrent

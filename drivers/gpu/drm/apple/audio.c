@@ -113,32 +113,6 @@ static const struct snd_pcm_hardware dcp_pcm_hw_unplugged = {
 	.periods_max		= DCPAUD_PERIODS_MAX,
 };
 
-/*
- * Without a sink the DCP has no audio elements to derive constraints from.
- * Offer a plain stereo format so that the PCM can still be opened and
- * configured, as HDMI PCMs on other platforms can. Userspace (PipeWire,
- * PulseAudio) probes the PCM once when the card appears and drops the
- * output for good if that fails, so a monitor attached later would never
- * show up. Starting the stream still fails until a sink is connected.
- */
-static const struct snd_pcm_hardware dcp_pcm_hw_unplugged = {
-	.info	 = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
-		   SNDRV_PCM_INFO_INTERLEAVED,
-	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE |
-		   SNDRV_PCM_FMTBIT_S32_LE,
-	.rates			= SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 |
-				  SNDRV_PCM_RATE_48000,
-	.rate_min		= 32000,
-	.rate_max		= 48000,
-	.channels_min		= 2,
-	.channels_max		= 2,
-	.buffer_bytes_max	= SIZE_MAX,
-	.period_bytes_min	= 4096,
-	.period_bytes_max	= SIZE_MAX,
-	.periods_min		= 2,
-	.periods_max		= UINT_MAX,
-};
-
 static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
 {
 	int ret;

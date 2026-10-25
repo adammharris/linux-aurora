@@ -81,10 +81,6 @@ static bool hpage_acct_unref(struct io_ring_ctx *ctx, struct page *hpage)
 static void io_fragment_account_put(struct io_fragment_account *account);
 #endif
 
-#ifdef CONFIG_MM_SUBPAGE
-static void io_fragment_account_put(struct io_fragment_account *account);
-#endif
-
 /* only define max */
 #define IORING_MAX_FIXED_FILES	(1U << 20)
 #define IORING_MAX_REG_BUFFERS	(1U << 14)

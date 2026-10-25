@@ -635,21 +635,6 @@ void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 	connector->display_info.height_mm = height_mm;
 }
 
-void dcp_update_connector_dimensions(struct apple_dcp *dcp,
-				     struct drm_connector *connector)
-{
-	int width_mm = READ_ONCE(dcp->width_mm);
-	int height_mm = READ_ONCE(dcp->height_mm);
-
-	lockdep_assert_held(&connector->dev->mode_config.mutex);
-	if (!width_mm || !height_mm) {
-		width_mm = dcp->panel.width_mm;
-		height_mm = dcp->panel.height_mm;
-	}
-	connector->display_info.width_mm = width_mm;
-	connector->display_info.height_mm = height_mm;
-}
-
 bool dcp_has_panel(struct apple_dcp *dcp)
 {
 	return iomfb_is_m4(dcp) || dcp->panel.width_mm > 0;
@@ -1029,12 +1014,6 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 		if (ret)
 			return ret;
 	}
-
-	/* External H17P does not program adaptive sync. */
-	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-	    crtc_state->vrr_enabled)
-		return -EINVAL;
 
 	needs_modeset = drm_atomic_crtc_needs_modeset(crtc_state) ||
 			!READ_ONCE(dcp->mode_state.valid);
@@ -2320,32 +2299,6 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 		return dcp_external_link_locked(dcp);
 	}
 
-	if (dcp_is_external_h17p(dcp)) {
-		bool new_cable;
-
-		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
-		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
-		cancel_work_sync(&dcp->external_stop_work);
-		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
-		guard(mutex)(&dcp->external_lock);
-		new_cable = !dcp->external_cable;
-		if (new_cable)
-			dcp->external_generation++;
-		dcp->external_cable = true;
-		WRITE_ONCE(dcp->external_physically_absent, false);
-		dcp_external_publish_generation(dcp);
-		scoped_guard(mutex, &dcp->hpd_mutex) {
-			WRITE_ONCE(dcp->typec_cable_connected, true);
-			if (new_cable) {
-				dcp->typec_generation++;
-				dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
-				dcp_announce_end(&dcp->announce);
-			}
-			dcp->placeholder_retried = false;
-		}
-		return dcp_external_link_locked(dcp);
-	}
-
 	if (dcp_is_typec_output(dcp)) {
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		guard(mutex)(&dcp->hpd_mutex);
@@ -2575,16 +2528,6 @@ int dcp_start(struct platform_device *pdev)
 		if (ret)
 			return ret;
 		return 0;
-	}
-
-	if (IS_ERR_OR_NULL(dcp->rtk))
-		return -ENODEV;
-
-	/* Make the H17P allocator available before external service discovery. */
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
-		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
-		if (ret)
-			return dev_err_probe(dcp->dev, ret, "Failed to start remote allocator\n");
 	}
 
 	if (IS_ERR_OR_NULL(dcp->rtk))
@@ -3860,26 +3803,6 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		return dev_err_probe(dev, -EBUSY,
 				     "External DCP is not in the inherited idle state\n");
 
-	/*
-	 * Display coprocessors running H17-generation firmware are left running
-	 * by the bootloader with their firmware mapped through a locked DART.
-	 * Linux attaches to that session with a standard RTKit INIT/HELLO
-	 * exchange and must not stop or restart the ASC.
-	 */
-	if (dcp->hw.adopt_live_session) {
-		cpu_ctrl = readl_relaxed(dcp->coproc_reg +
-					 APPLE_DCP_COPROC_CPU_CONTROL);
-		if (!(cpu_ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
-			return dev_err_probe(dev, -EOPNOTSUPP,
-					     "DCP was not left running by the bootloader\n");
-	}
-
-	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-	    !dcp_external_is_idle(dcp))
-		return dev_err_probe(dev, -EBUSY,
-				     "External DCP is not in the inherited idle state\n");
-
 	if (dcp->index || dcp->dptx_phy || dcp->dptx_die)
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
@@ -4205,11 +4128,6 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 	}
 
 	dcp_fabric_shutdown_dptx(dcp);
-
-	if (!IS_ERR_OR_NULL(dcp->dptx_controller_ep)) {
-		afk_shutdown(dcp->dptx_controller_ep);
-		dcp->dptx_controller_ep = NULL;
-	}
 
 	if (!IS_ERR_OR_NULL(dcp->dptx_controller_ep)) {
 		afk_shutdown(dcp->dptx_controller_ep);
@@ -5011,86 +4929,6 @@ static void dcp_platform_complete(struct device *dev)
 	mutex_lock(&dcp->hpd_mutex);
 	WRITE_ONCE(dcp->external_suspended, false);
 	mutex_unlock(&dcp->hpd_mutex);
-}
-
-/*
- * The display stays powered across system sleep, and the blanking present
- * queued by the DRM and backlight suspend handlers must reach the firmware
- * before its mailbox interrupt is suspended.
- */
-static void dcp_drain_for_sleep(struct apple_dcp *dcp)
-{
-	int pass;
-
-	if (!dcp->hw.adopt_live_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
-	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
-		return;
-
-	/*
-	 * A completed present can schedule one more brightness present, and a
-	 * rejected one a delayed retry; run a pending retry now instead of
-	 * letting it fire after the mailbox has suspended.  Four passes cover
-	 * the first attempt and the policy's three retries.  A fade still
-	 * running ends at its target first.
-	 */
-	if (dcp_has_panel(dcp))
-		dcp_backlight_finish_fade(dcp);
-	for (pass = 0; pass < 4; pass++) {
-		flush_delayed_work(&dcp->iomfb.backlight_retry);
-		if (dcp_has_panel(dcp))
-			flush_work(&dcp->bl_update_wq);
-		if (!iomfb_queue_drain(dcp, msecs_to_jiffies(500))) {
-			dev_warn(dcp->dev, "display updates still pending at suspend\n");
-			return;
-		}
-		/*
-		 * A crashed or stopped DCP takes no more presents, so a level
-		 * still pending there can never be sent and is not waited for.
-		 * Checking after the drain, which returns at once for such a
-		 * DCP, also covers a crash during the pass.
-		 */
-		if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.stopped))
-			return;
-		if (!dcp_backlight_active(dcp) || !dcp_backlight_pending(dcp))
-			return;
-	}
-	dev_warn(dcp->dev, "brightness change still pending at suspend\n");
-}
-
-/*
- * DPMS off leaves the internal H17P pipe scanning out (see dcp_poweroff()),
- * and while it scans out the firmware publishes a property to the AP on every
- * frame.  The mailbox interrupt is not suspended, so each of those messages
- * wakes a CPU out of suspend-to-idle about 60 times a second.  Hold the
- * messages in the mailbox for system sleep and process them at resume.
- * apple-drm is a consumer of this device, so its suspend handler has blanked
- * the panel before this runs and its resume handler restores the CRTC after.
- */
-static void dcp_hold_for_sleep(struct apple_dcp *dcp)
-{
-	/* A failed component bind leaves no coprocessor session to hold. */
-	if (IS_ERR_OR_NULL(dcp->rtk) ||
-	    !dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
-	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
-	    READ_ONCE(dcp->crashed))
-		return;
-
-	iomfb_pause_presentation(dcp, true);
-	if (iomfb_queue_settle(dcp, msecs_to_jiffies(500))) {
-		iomfb_pause_presentation(dcp, false);
-		return;
-	}
-	apple_rtkit_hold_rx(dcp->rtk);
-	dcp->rx_held = true;
-}
-
-static void dcp_release_after_sleep(struct apple_dcp *dcp)
-{
-	if (!dcp->rx_held)
-		return;
-	dcp->rx_held = false;
-	apple_rtkit_resume_rx(dcp->rtk);
-	iomfb_pause_presentation(dcp, false);
 }
 
 static int dcp_platform_suspend(struct device *dev)

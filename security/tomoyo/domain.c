@@ -945,38 +945,46 @@ bool tomoyo_dump_page(struct linux_binprm *bprm, unsigned long pos,
 bool tomoyo_dump_page(struct linux_binprm *bprm, unsigned long pos,
 		      struct tomoyo_page_dump *dump)
 {
-	const unsigned int offset = offset_in_page(pos);
-	const unsigned int length = PAGE_SIZE - offset;
+	struct page *page;
+#ifdef CONFIG_MMU
+	int ret;
+#endif
 
 	/* dump->data is released by tomoyo_find_next_domain(). */
 	if (!dump->data) {
 		dump->data = kzalloc(PAGE_SIZE, GFP_NOFS);
 		if (!dump->data)
 			return false;
-		dump->pos = ULONG_MAX;
 	}
-	if (pos >= dump->pos && (pos & PAGE_MASK) == (dump->pos & PAGE_MASK))
-		return true;
-	/* A failed partial copy must not leave the previous cache valid. */
-	dump->pos = ULONG_MAX;
+	/* Same with get_arg_page(bprm, pos, 0) in fs/exec.c */
 #ifdef CONFIG_MMU
 	/*
-	 * Inspect the nascent MM's virtual bytes. Smaller userspace mappings
-	 * can use several independently retained fragments within this range.
+	 * This is called at execve() time in order to dig around
+	 * in the argv/environment of the new process
+	 * (represented by bprm).
 	 */
-	if (access_remote_vm(bprm->mm, pos, dump->data + offset, length,
-			     FOLL_FORCE) != length)
+	mmap_read_lock(bprm->mm);
+	ret = get_user_pages_remote(bprm->mm, pos, 1,
+				    FOLL_FORCE, &page, NULL);
+	mmap_read_unlock(bprm->mm);
+	if (ret <= 0)
 		return false;
 #else
-	{
-		struct page *page = bprm->page[pos / PAGE_SIZE];
+	page = bprm->page[pos / PAGE_SIZE];
+#endif
+	if (page != dump->page) {
+		const unsigned int offset = pos % PAGE_SIZE;
 		char *kaddr = kmap_local_page(page);
 
-		memcpy(dump->data + offset, kaddr + offset, length);
+		dump->page = page;
+		memcpy(dump->data + offset, kaddr + offset,
+		       PAGE_SIZE - offset);
 		kunmap_local(kaddr);
 	}
+	/* Same with put_arg_page(page) in fs/exec.c */
+#ifdef CONFIG_MMU
+	put_page(page);
 #endif
-	dump->pos = pos;
 	return true;
 }
 #endif

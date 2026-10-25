@@ -538,10 +538,6 @@ static inline pte_t pte_move_swp_offset(pte_t pte, long delta)
 	new = pte_swp_set_subpage_offset(new, pte_swp_subpage_offset(pte));
 #endif
 
-#ifdef CONFIG_MM_SUBPAGE
-	new = pte_swp_set_subpage_offset(new, pte_swp_subpage_offset(pte));
-#endif
-
 	return new;
 }
 

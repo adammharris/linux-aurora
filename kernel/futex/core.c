@@ -523,44 +523,6 @@ static void futex_put_page_ref(struct futex_page_ref *ref)
 	put_page(ref->page);
 }
 
-/* Keep a typed slot reference alive until the mapping identity is sampled. */
-struct futex_page_ref {
-	struct page *page;
-#ifdef CONFIG_MM_SUBPAGE
-	struct user_page_fragment fragment;
-#endif
-};
-
-static int futex_get_page_ref(struct mm_struct *mm, unsigned long address,
-		unsigned long uaddr, unsigned int size, unsigned int flags,
-		struct futex_page_ref *ref)
-{
-#ifdef CONFIG_MM_SUBPAGE
-	if (mm_page_size(mm) != PAGE_SIZE) {
-		int ret = get_user_fragments_remote(mm, uaddr, size, flags,
-						   &ref->fragment, 1);
-
-		if (ret != 1)
-			return ret ?: -EFAULT;
-		ref->page = folio_page(ref->fragment.folio,
-				      ref->fragment.offset >> PAGE_SHIFT);
-		return 1;
-	}
-#endif
-	return get_user_pages_fast(address, 1, flags, &ref->page);
-}
-
-static void futex_put_page_ref(struct futex_page_ref *ref)
-{
-#ifdef CONFIG_MM_SUBPAGE
-	if (ref->fragment.folio) {
-		release_user_fragments(&ref->fragment, 1, false);
-		return;
-	}
-#endif
-	put_page(ref->page);
-}
-
 /**
  * get_futex_key() - Get parameters which are the keys for a futex
  * @uaddr:	virtual address of the futex

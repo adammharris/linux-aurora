@@ -46,7 +46,6 @@ use core::{
         self,
         NonNull, //
     },
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 #[cfg(CONFIG_DRM_LEGACY)]
@@ -509,10 +508,7 @@ impl<T: drm::Driver> Deref for Device<T> {
     type Target = T::Data;
 
     fn deref(&self) -> &Self::Target {
-        debug_assert!(self.data_initialized.load(Ordering::Acquire));
-        // SAFETY: Safe constructors initialize data; new_uninit() requires callers
-        // to prevent data access until init_data() succeeds.
-        unsafe { &*self.data.get().cast::<T::Data>() }
+        &self.data
     }
 }
 
@@ -627,8 +623,7 @@ where
     unsafe fn work_container_of(ptr: *mut Work<Self, ID>) -> *mut Self {
         // SAFETY: The caller promises that `ptr` points at a `Work` field in
         // `T::Data`.
-        let data_ptr = unsafe { T::Data::work_container_of(ptr) }
-            .cast::<UnsafeCell<MaybeUninit<T::Data>>>();
+        let data_ptr = unsafe { T::Data::work_container_of(ptr) };
 
         // SAFETY: `T::Data` is stored as the `data` field in `Device<T, C>`.
         unsafe { crate::container_of!(data_ptr, Self, data) }

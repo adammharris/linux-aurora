@@ -39,17 +39,6 @@ struct DCP_FW_NAME(dcp_swap) {
 	u8 h17p_pre_swap_id[0x48];
 #endif
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	/*
-	 * H17P inserts 0x48 bytes between flags2 and the swap ID, which moves
-	 * to +0x98.  Every following field shifts with it: surf_ids +0x9c,
-	 * src_rect +0xac, surf_flags +0xec, dst_rect +0x10c,
-	 * swap_enabled/completed +0x14c/+0x150, bg_color +0x154.  The gap holds
-	 * two small u32 counters (at +0x50 and +0x78) that are not modelled.
-	 */
-	u8 h17p_pre_swap_id[0x48];
-#endif
-
 	u32 swap_id;
 
 	u32 surf_ids[SWAP_SURFACES];
@@ -96,13 +85,6 @@ struct DCP_FW_NAME(dcp_swap) {
 #endif
 	u32 unk_flags;
 	u32 unk_flags2;
-#endif
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	/*
-	 * The H17P A408 request is 0xe9c bytes; with a 0x22c-byte surface,
-	 * SWAP_SURFACES = 4 and no surf2 block, that leaves this tail.
-	 */
-	u8 h17p_tail[0xda];
 #endif
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
