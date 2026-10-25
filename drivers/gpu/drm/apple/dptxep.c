@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2022 Sven Peter <sven@svenpeter.dev> */
 
+#include <linux/unaligned.h>
 #include <linux/bitfield.h>
 #include <linux/completion.h>
 #include <linux/module.h>
@@ -8,12 +9,14 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/printk.h>
+#include <linux/string.h>
 #include <linux/unaligned.h>
 
 #include <linux/soc/apple/dp-tunnel.h>
 
 #include "afk.h"
 #include "dcp.h"
+#include "dcp-hdmi.h"
 #include "dptxep.h"
 #include "dcp-180hz.h"
 #include "dptx-service.h"
@@ -82,6 +85,19 @@ struct dptxport_apcall_drive_settings {
 struct dptxport_apcall_set_tiled {
 	__le32 retcode;
 };
+
+/*
+ * SetTiledDisplayHints payload, as DCP sends it for an LG UltraFine 5K
+ * (offsets in bytes): tile location (column, row) at 0x08/0x0c, tiles
+ * across and down at 0x30/0x34, the whole display's size at 0x38/0x3c.
+ */
+#define DPTX_TILE_HINT_LOC_X	0x08
+#define DPTX_TILE_HINT_LOC_Y	0x0c
+#define DPTX_TILE_HINT_TILES_H	0x30
+#define DPTX_TILE_HINT_TILES_V	0x34
+#define DPTX_TILE_HINT_WIDTH	0x38
+#define DPTX_TILE_HINT_HEIGHT	0x3c
+#define DPTX_TILE_HINT_MIN_SIZE	0x40
 
 /*
  * A Thunderbolt DP tunnel uses the same CORE|ATC|DIE|CONNECTED target as a
@@ -223,6 +239,12 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 {
 	return dptxport_set_hpd_timeout(service, hpd, MSEC_PER_SEC);
+}
+
+/* The sink raised IRQ_HPD: the firmware services the request as a DP source. */
+int dptxport_sink_irq(struct apple_epic_service *service)
+{
+	return afk_service_call(service, 8, 9, NULL, 0, 16, NULL, 0, 16);
 }
 
 static int
@@ -533,9 +555,17 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 		 * dcp_tunnel_crossbar_up().
 		 */
 		if (dptx->atcphy && service->ep->dcp->dptx_tunnel) {
-			dcp_tunnel_set_rate(service->ep->dcp, dptx->atcphy,
-					    link_rate);
+			ret = dcp_tunnel_set_rate(service->ep->dcp, dptx->atcphy,
+						 dptx->unit, link_rate);
+			/* T6030 14.7: refuse a rate whose tunnel clock failed. */
+			if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
+				reply->retcode = cpu_to_le32(1);
+				reply->link_rate = cpu_to_le32(dptx->link_rate);
+				return 0;
+			}
 		} else if (dptx->atcphy) {
+			/* No clocked crossbar output across a PHY rate change. */
+			dcp_direct_crossbar_link(service->ep->dcp, false);
 			dptx->phy_ops.dp.link_rate = phy_link_rate;
 			dptx->phy_ops.dp.set_rate = 1;
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
@@ -569,7 +599,8 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 	 * DEVICE_NOT_STARTED (~5.5s). Advertise HPD so firmware uses
 	 * that path instead of waiting for a PHY start.
 	 */
-	reply->supported = cpu_to_le32(dcp_is_typec_output(dcp) ? 1 : 0);
+	reply->supported = cpu_to_le32(dcp_is_typec_output(dcp) &&
+				       !dcp_ext_dptx_607(dcp) ? 1 : 0);
 	dev_dbg(dcp->dev, "DPTXPort: GET_SUPPORTS_HPD %u usb4=%d\n",
 		le32_to_cpu(reply->supported), dcp_is_usb4_output(dcp));
 	return 0;
@@ -589,13 +620,41 @@ dptxport_call_get_supports_downspread(struct apple_epic_service *service,
 	return 0;
 }
 
-static int dptxport_call_set_tiled_display_hint(void *reply_,
-						 size_t reply_size)
+static int dptxport_call_set_tiled_display_hint(struct apple_epic_service *service,
+						 const void *data, size_t data_size,
+						 void *reply_, size_t reply_size)
 {
 	struct dptxport_apcall_set_tiled *reply = reply_;
+	struct dptx_port *dptx = service->cookie;
+	const u8 *hint = data;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
+
+	if (dptx)
+		smp_store_release(&dptx->tile_hint, false);
+	if (dptx && data_size >= DPTX_TILE_HINT_MIN_SIZE) {
+		u32 h = get_unaligned_le32(hint + DPTX_TILE_HINT_TILES_H);
+		u32 v = get_unaligned_le32(hint + DPTX_TILE_HINT_TILES_V);
+		u32 x = get_unaligned_le32(hint + DPTX_TILE_HINT_LOC_X);
+		u32 y = get_unaligned_le32(hint + DPTX_TILE_HINT_LOC_Y);
+
+		dptx->tiles_h = min(h, 255U);
+		dptx->tiles_v = min(v, 255U);
+		dptx->tile_x = min(x, 255U);
+		dptx->tile_y = min(y, 255U);
+		/* Only the two horizontal tiles carried by these two ports fit. */
+		smp_store_release(&dptx->tile_hint,
+				  h == 2 && v == 1 && x == dptx->unit && y == 0 &&
+				  get_unaligned_le32(hint + DPTX_TILE_HINT_WIDTH) &&
+				  get_unaligned_le32(hint + DPTX_TILE_HINT_HEIGHT));
+		if (h > 1 || v > 1)
+			dev_info(service->ep->dcp->dev,
+				 "DPTXPort: port %u carries tile (%u,%u) of a %ux%u tiled %ux%u display\n",
+				 dptx->unit, x, y, h, v,
+				 get_unaligned_le32(hint + DPTX_TILE_HINT_WIDTH),
+				 get_unaligned_le32(hint + DPTX_TILE_HINT_HEIGHT));
+	}
 
 	reply->retcode = cpu_to_le32(1);
 	return 0;
@@ -608,6 +667,7 @@ dptxport_call_activate(struct apple_epic_service *service,
 {
 	struct dptx_port *dptx = service->cookie;
 	struct apple_dcp *dcp = service->ep->dcp;
+	int ret;
 
 	/*
 	 * No PHY mode change for a tunnel: the ATC PHY stays in USB4/TBT
@@ -617,8 +677,18 @@ dptxport_call_activate(struct apple_epic_service *service,
 	 */
 	if (dptx->atcphy && !dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
-	if (dcp->dptx_tunnel)
-		dcp_tunnel_dpin_activate(dcp, true);
+	if (dcp->dptx_tunnel) {
+		ret = dcp_tunnel_dpin_activate(dcp, dptx->unit, true);
+		/* T6030 14.7: report a failed tunnel activation to DCP. */
+		if (ret && dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
+			dev_err(dcp->dev, "DPTX tunnel activation failed: %d\n", ret);
+			if (reply_size < sizeof(__le32))
+				return -EINVAL;
+			memcpy(reply, data, min(reply_size, data_size));
+			put_unaligned_le32(1, reply);
+			return 0;
+		}
+	}
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
@@ -638,7 +708,9 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	dcp_180hz_invalidate(dcp);
 	dev_dbg(dcp->dev, "DPTXPort: DEACTIVATE\n");
 	if (dcp->dptx_tunnel)
-		dcp_tunnel_dpin_activate(dcp, false);
+		dcp_tunnel_dpin_activate(dcp, dptx->unit, false);
+	else
+		dcp_direct_crossbar_link(dcp, false);
 	if (dptx->atcphy && !dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
 
@@ -691,6 +763,9 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	trace_dptxport_apcall(dptx, 0, idx, data_size);
 	dev_dbg(service->ep->dcp->dev, "DPTXPort: APCALL %u (%zu bytes)\n",
 		 idx, data_size);
+	if (service->ep->dcp->external)
+		dev_info(service->ep->dcp->dev, "DPTX callback %u size %zu reply %zu\n",
+			 idx, data_size, reply_size);
 	if (data_size && service->ep->dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		print_hex_dump_debug("DPTXPort: apcall data: ",
@@ -701,13 +776,29 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
 		/* A re-link takes an established tunnel's crossbar down first. */
 		if (service->ep->dcp->dptx_tunnel && dptx->link_rate)
-			dcp_tunnel_crossbar_down(service->ep->dcp);
+			dcp_tunnel_crossbar_down(service->ep->dcp, dptx->unit);
+		else if (dptx->link_rate)
+			dcp_direct_crossbar_link(service->ep->dcp, false);
 		return dptxport_call_will_change_link_config(service);
 	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG: {
 		int ret = dptxport_call_did_change_link_config(service);
 
-		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate)
-			dcp_tunnel_crossbar_up(service->ep->dcp);
+		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate) {
+			int xret = dcp_tunnel_crossbar_up(service->ep->dcp, dptx->unit);
+
+			/* T6030 14.7: fail the link config without a crossbar. */
+			if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7)
+				ret = xret;
+		} else if (!ret && dptx->link_rate) {
+			dcp_direct_crossbar_link(service->ep->dcp, true);
+		}
+		if (!ret)
+			dcp_hdmi_link_configured(service->ep->dcp, dptx->link_rate);
+		if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+		    service->ep->dcp->dptx_tunnel && reply_size >= sizeof(__le32)) {
+			put_unaligned_le32(1, reply);
+			return 0;
+		}
 		return ret;
 	}
 	case DPTX_APCALL_GET_MAX_LINK_RATE:
@@ -751,9 +842,18 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			 service->ep->dcp->dptx_phy);
 		memcpy(reply, data, min(reply_size, data_size));
 		return 0;
-	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
+	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
+		int ret;
+
 		memcpy(reply, data, min(reply_size, data_size));
-		return dptxport_call_set_tiled_display_hint(reply, reply_size);
+		ret = dptxport_call_set_tiled_display_hint(service, data,
+							   data_size, reply,
+							   reply_size);
+		/* The T8122 dcpext gets 0, as from AsahiLinux/linux#607. */
+		if (!ret && reply_size >= 4 && dcp_ext_dptx_607(service->ep->dcp))
+			memset(reply, 0, 4);
+		return ret;
+	}
 	case DPTX_APCALL_GET_DRIVE_SETTINGS:
 		return dptxport_call_get_drive_settings(service, data, data_size,
 							reply, reply_size);
@@ -806,8 +906,20 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 			    const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
-	int port = dptx_service_port(name, class, unit, service->ep->wire_v2,
-				     dcp->index, dcp->hw.num_dptx_ports);
+	int port;
+
+	/*
+	 * T6030 14.7 also announces the low-power port service, and may leave
+	 * its class empty.
+	 */
+	if (dcp_fw_is_14_7(dcp) && name &&
+	    (!strcmp(name, "dcpdptx-port-epic") ||
+	     !strcmp(name, "dcp-lpdptx-port-epic")) &&
+	    (!class || !class[0] || !strcmp(class, "AppleDCPDPTXRemotePort")))
+		port = unit >= 0 && unit < 2 ? unit : -EINVAL;
+	else
+		port = dptx_service_port(name, class, unit, service->ep->wire_v2,
+					 dcp->index, dcp->hw.num_dptx_ports);
 
 	if (port < 0)
 		return port;
@@ -822,6 +934,9 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 
 	dptx_service_publish(service);
 	complete(&port->enable_completion);
+	/* A connect that found no port yet is retried from process context. */
+	if (service->ep->dcp->external_native)
+		schedule_work(&service->ep->dcp->external_ready_work);
 	/* Publication may follow the startup wait or the bounded retry window. */
 	if (service->ep->dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
@@ -856,13 +971,12 @@ static int dptxport_v2_group_call(struct apple_epic_service *service, u16 group,
 
 /*
  * Group 1 calls 3 and 4 come around link (re)configuration, audio prepare
- * included. They carry a lane count at +0x10 in (1, 3) and at +0x00 in
- * (1, 4); the J700 code reads (1, 3) as drive settings with levels per
- * lane from +0x20, and its group 0 GET (0, 4) has the count at +0x00.
- * macOS 13 acks both with the request, (1, 3) with +0x00..0x03
- * cleared and (1, 4) with +0x10..0x13 and +0x20 to the end cleared, so
- * what DCP left there does not go back (42 of 42 traced pairs on t6020,
- * 13.5 firmware: TV through a USB-C to HDMI adapter, Dell over TB).
+ * included. Handled as group 0's SET and GET_DRIVE_SETTINGS, which have
+ * the same numbers, they stored addresses from their payload as drive
+ * settings, and DCP then refused to start audio to a TV behind a USB-C to
+ * HDMI adapter (M2 Pro, 13.5 firmware). Answer each with its request, with
+ * +0x00..0x03 cleared for (1, 3), and +0x10..0x13 and everything from +0x20
+ * cleared for (1, 4).
  */
 static int dptxport_call_group1(u32 command, const void *data,
 				size_t data_size, void *reply, size_t reply_size)
@@ -890,6 +1004,14 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group,
 	if (service->ep->wire_v2)
 		return dptxport_v2_group_call(service, group, command, data,
 					     size, reply, room);
+
+	/* Legacy dispatch is by command, except the tested 13.5 group-1 calls. */
+	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_13_5 &&
+	    group == 1 && (command == 3 || command == 4))
+		return dptxport_call_group1(command, data, size, reply, room);
+	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_12_3 ||
+	    service->ep->dcp->fw_compat == DCP_FIRMWARE_V_13_5)
+		return dptxport_call(service, command, data, size, reply, room);
 
 	if (!group)
 		return dptxport_call(service, command, data, size, reply, room);
@@ -925,6 +1047,22 @@ static void dptxport_teardown(struct apple_epic_service *service)
 static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
+		.prepare = dptxport_prepare,
+		.teardown = dptxport_teardown,
+		.init = dptxport_init,
+		.call = dptxport_call,
+		.call_v2 = dptxport_group_call,
+	},
+	/* T6030 14.7 announces the port by name, possibly without a class. */
+	{
+		.name = "dcpdptx-port-epic",
+		.prepare = dptxport_prepare,
+		.teardown = dptxport_teardown,
+		.init = dptxport_init,
+		.call = dptxport_call,
+	},
+	{
+		.name = "dcp-lpdptx-port-epic",
 		.prepare = dptxport_prepare,
 		.teardown = dptxport_teardown,
 		.init = dptxport_init,
@@ -1000,6 +1138,17 @@ int dptxep_init(struct apple_dcp *dcp)
 		ret = wait_for_completion_timeout(&dcp->dptxport[port].enable_completion,
 						timeout);
 		if (!ret) {
+			/*
+			 * 14.7 does not announce the port during boot. A fake
+			 * channel 0 is interface_id 0, and the firmware answers
+			 * kIOReturnNoDevice (0xe00002c0). Leave the endpoint
+			 * up so a later announce can still bind.
+			 */
+			if (dcp_fw_is_14_7(dcp)) {
+				dev_info(dcp->dev,
+					 "DPTX port %u not announced yet\n", port);
+				return 0;
+			}
 			dev_warn(dcp->dev, "DPTX transport ready but port %u service not announced\n",
 				 port);
 			return -ETIMEDOUT;
@@ -1010,4 +1159,56 @@ int dptxep_init(struct apple_dcp *dcp)
 	}
 
 	return dcp_180hz_init(dcp);
+}
+
+static void dpav_ctrl_bind(struct apple_epic_service *service, const char *name,
+			   const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	dev_info(dcp->dev,
+		 "DPAV service %s class %s unit %lld channel %u\n",
+		 name ? name : "", class ? class : "", unit, service->channel);
+	if (name && !strcmp(name, "dcpav-controller-epic")) {
+		dcp->dpav_ctrl = service;
+		complete_all(&dcp->dpav_ctrl_ready);
+	}
+}
+
+static const struct apple_epic_service_ops dpav_ctrl_ops[] = {
+	{
+		.name = "dcpav-controller-epic",
+		.init = dpav_ctrl_bind,
+	},
+	{
+		.name = "DCPAVController",
+		.init = dpav_ctrl_bind,
+	},
+	{
+		.name = "dcpdp-controller-epic",
+		.init = dpav_ctrl_bind,
+	},
+	{}
+};
+
+int dpav_ctrl_init(struct apple_dcp *dcp)
+{
+	int ret;
+
+	init_completion(&dcp->dpav_ctrl_ready);
+	dcp->dpavctrlep = afk_init(dcp, DPAV_CTRL_ENDPOINT, dpav_ctrl_ops);
+	if (IS_ERR(dcp->dpavctrlep))
+		return PTR_ERR(dcp->dpavctrlep);
+
+	ret = afk_start(dcp->dpavctrlep);
+	if (ret) {
+		dev_warn(dcp->dev, "DPAV controller endpoint failed to start: %d\n",
+			 ret);
+		return 0;
+	}
+
+	if (!wait_for_completion_timeout(&dcp->dpav_ctrl_ready,
+					 msecs_to_jiffies(1000)))
+		dev_info(dcp->dev, "DPAV controller did not announce a service\n");
+	return 0;
 }

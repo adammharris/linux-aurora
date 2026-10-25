@@ -93,6 +93,16 @@ patternProperties:
           - shutdown
           - reboot
 
+      integral-time-constant-ms:
+        minimum: 1
+        description: |
+          Integral time constant for the power allocator governor, relative to
+          its undershoot proportional gain. The estimated per-poll integral
+          gain is k_pu times polling-delay-passive divided by this time, so the
+          integral gain per unit time can be retained when polling is changed.
+          Requires a nonzero polling-delay-passive. If omitted, the governor
+          retains its existing estimate of k_pu divided by ten per poll.
+
       thermal-sensors:
         $ref: /schemas/types.yaml#/definitions/phandle-array
         maxItems: 1
@@ -211,7 +221,8 @@ patternProperties:
                   device. Using the THERMAL_NO_LIMIT (-1UL) constant in the
                   cooling-device phandle limit specifier lets the framework
                   use the minimum and maximum cooling state for that cooling
-                  device automatically.
+                  device automatically. If three arguments are specified,
+                  the first argument is the cooling device specifier.
 
               contribution:
                 $ref: /schemas/types.yaml#/definitions/uint32
@@ -225,6 +236,17 @@ patternProperties:
               - trip
               - cooling-device
             additionalProperties: false
+
+    allOf:
+      - if:
+          required:
+            - integral-time-constant-ms
+        then:
+          properties:
+            polling-delay-passive:
+              minimum: 1
+          required:
+            - polling-delay-passive
 
     required:
       - thermal-sensors

@@ -1443,7 +1443,7 @@ xfs_attr3_leaf_init(
 	struct xfs_da_args	args = {
 		.trans		= tp,
 		.dp		= dp,
-		.owner		= dp->i_ino,
+		.owner		= I_INO(dp),
 		.geo		= dp->i_mount->m_attr_geo,
 	};
 
@@ -1715,7 +1715,7 @@ xfs_attr3_leaf_add_work(
 			/*
 			 * This freemap entry starts at the old end of the
 			 * leaf entry array, so we need to adjust its base
-			 * upward to accomodate the larger array.
+			 * upward to accommodate the larger array.
 			 */
 			diff = sizeof(struct xfs_attr_leaf_entry);
 		} else if (ichdr->freemap[i].size > 0 &&

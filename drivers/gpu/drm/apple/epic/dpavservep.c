@@ -168,6 +168,7 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 		dcp->dcpavserv.enabled = false;
 		dcp->dcpavserv.service = NULL;
 		dcp->dcpavserv.epoch++;
+		dcp->dcpavserv.opened = NULL;
 		dcpavserv_invalidate_edid(dcp);
 		reinit_completion(&dcp->dcpavserv.enable_completion);
 		owned = true;
@@ -187,6 +188,7 @@ void dpavservep_detach(struct apple_dcp *dcp)
 	dcp->dcpavserv.enabled = false;
 	/* Also reject an in-flight prepare/OPEN with no published owner yet. */
 	dcp->dcpavserv.epoch++;
+	dcp->dcpavserv.opened = NULL;
 	reinit_completion(&dcp->dcpavserv.enable_completion);
 	if (service) {
 		afk_service_retire(service);
@@ -313,6 +315,7 @@ static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_servi
 	struct dpavserv_copy_edid_cmd cmd;
 	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
 	size_t resp_size = sizeof(*resp) + EDID_BUF_SIZE;
+	size_t reply_size;
 	int num_blocks;
 	u64 data_size;
 	int ret;
@@ -323,20 +326,20 @@ static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_servi
 	if (!resp)
 		return ERR_PTR(-ENOMEM);
 
-	ret = afk_service_call(service, 1, 7, &cmd, sizeof(cmd), EDID_BUF_SIZE, resp,
-			       resp_size, 0);
+	ret = afk_service_call_with_reply_len(service, 1, 7, &cmd, sizeof(cmd),
+					      EDID_BUF_SIZE, resp, resp_size, 0,
+					      &reply_size);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
-	if (le64_to_cpu(resp->max_size) != EDID_BUF_SIZE)
+	if (reply_size < sizeof(*resp) ||
+	    le64_to_cpu(resp->max_size) != EDID_BUF_SIZE)
 		return ERR_PTR(-EIO);
 
-	// print_hex_dump(KERN_DEBUG, "dpavserv EDID cmd: ", DUMP_PREFIX_NONE,
-	// 	       16, 1, resp, 192, true);
-
+	/* Only complete EDID blocks within the received reply may be copied. */
 	data_size = le64_to_cpu(resp->used_size);
 	if (data_size < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE ||
-	    data_size > EDID_BUF_SIZE)
+	    data_size > EDID_BUF_SIZE || data_size > reply_size - sizeof(*resp))
 		return ERR_PTR(-EIO);
 
 	/*
@@ -415,6 +418,27 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 	mutex_unlock(&dcp->dcpavserv.lock);
 	if (!service)
 		return ERR_PTR(-ENODEV);
+
+	/*
+	 * The 14.7 firmware of an external processor answers EDID requests
+	 * once its service has been opened; open each announced instance once.
+	 *
+	 * Only on Aurora's DCPLink session (T6030). The T8122 dcpext, which
+	 * Linux starts and drives through the IOMFB template, reads the EDID
+	 * directly, as in AsahiLinux/linux#607. Its firmware never answers the
+	 * open call and drops the display link instead, about 50 ms after it,
+	 * which brings the display back 4 s later: hotplug in a loop.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	    READ_ONCE(dcp->dcpavserv.opened) != service) {
+		int ret = afk_service_call(service, 4, 6, NULL, 0, 32, NULL, 0, 32);
+
+		if (ret) {
+			afk_service_put(service);
+			return ERR_PTR(ret);
+		}
+		WRITE_ONCE(dcp->dcpavserv.opened, service);
+	}
 
 	edid = service->ep->wire_v2 ? dcpavserv_read_edid_inline(service) :
 		dcpavserv_read_edid_legacy(service);

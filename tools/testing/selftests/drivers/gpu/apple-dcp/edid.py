@@ -2,7 +2,7 @@
 # Copyright 2026 Ryan Murray
 """Actual native EDID admission, service epochs, stale replies and RX progress."""
 from pathlib import Path
-from common import block, source_defines
+from common import block, source_defines, apple_function, internal_inline
 
 def rebind(root):
     base = root / 'drivers/gpu/drm/apple'
@@ -50,6 +50,9 @@ static void bitmap_release_region(unsigned long *p,unsigned int bit,int order) {
 
 static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 #define DCP_FIRMWARE_H17P 17
+/* The T6030 14.7 backend never matches these H17P scenarios. */
+#define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
+#define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
 #define EPIC_TYPE_NOTIFY 0
 #define EPIC_CAT_REPORT 0
 #define max(a,b) ((a)>(b)?(a):(b))
@@ -76,7 +79,7 @@ static bool queue_work(void *wq,struct work_struct *w) { assert(wq);bool fresh=!
 struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
 struct apple_epic_service_ops { char name[32];bool reusable,optional;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *); };
-struct epic_cmd_info { u16 tag;u8 type;size_t reply_length;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
+struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
     bool lock,enabled,torndown;unsigned int users;u32 channel;u8 cmd_tag;
@@ -89,10 +92,10 @@ struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;stru
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
     bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
-    struct { int iomfb_method_profile; } hw;
-    struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service; } dcpavserv;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead;
+    struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened; } dcpavserv;
 };
-struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
+'''+internal_inline(root,'dcp_fw_is_14_7')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;
 
 static int open_error,open_action;
@@ -590,6 +593,8 @@ static void schedule_work(int *p) { (*p)++; }
 #define trace_dcp_recv_msg(...) ((void)0)
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DCP_FIRMWARE_H17P 2
+/* The 14.7 open-before-EDID handshake is for T6030 external processors only. */
+#define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
 #define AV_ENDPOINT 0x29
 #define SYSTEM_ENDPOINT 0x20
 #define DISP0_ENDPOINT 0x23
@@ -605,9 +610,9 @@ struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; bool wire_v2; };
 struct apple_epic_service { struct apple_dcp_afkep *ep; unsigned int users; bool enabled,torndown; struct { u64 generation,epoch; } admission; void *cookie; unsigned int channel; };
 struct apple_dcp {
     struct apple_dcp_afkep *dcpavservep, *dptxep, *avep, *systemep, *ibootep, *dptx_controller_ep;
-    struct { bool lock, enabled; u64 epoch; int enable_completion; struct apple_epic_service *service; } dcpavserv;
+    struct { bool lock, enabled; u64 epoch; int enable_completion; struct apple_epic_service *service, *opened; } dcpavserv;
     struct apple_connector *connector; unsigned int nr_modes;
-    struct { int iomfb_method_profile; } hw;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead;
     bool external_physically_absent,hpd_mutex, typec_cable_connected, quiescing;
     u64 typec_generation;
     int fw_compat;
@@ -636,6 +641,8 @@ static const struct drm_edid *dcpavserv_read_edid_inline(struct apple_epic_servi
 }
 static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_service *s)
 { legacy_reads++; return dcpavserv_read_edid_inline(s); }
+static int __attribute__((unused)) afk_service_call(struct apple_epic_service *s,unsigned short group,unsigned command,const void *data,size_t data_len,size_t data_pad,void *output,size_t output_len,size_t output_pad)
+{ (void)s;(void)group;(void)command;(void)data;(void)data_len;(void)data_pad;(void)output;(void)output_len;(void)output_pad;assert(!"14.7 open-before-EDID on H17P");return -ENODEV; }
 static void iomfb_recv_msg(struct apple_dcp *d, u64 message) { (void)d; (void)message; }
 static void afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 { (void)message; received_ep=ep; receives++; }
@@ -750,7 +757,11 @@ def rx_progress(root):
     template=source('drivers/gpu/drm/apple/iomfb_template.c')
     assert 'alloc_ordered_workqueue("rtkit-%s"' in rtkit
     assert '.recv_message = dcp_recv_msg' in dcp
-    assert 'dcp_set_dimensions(dcp);' in template[template.index('"DisplayAttributes"'):]
+    attributes=template[template.index('"DisplayAttributes"'):]
+    # Catalogue ownership: DisplayAttributes records the dimensions for the
+    # transfer's attachment and defers the DRM update to dimensions_wq.
+    owned='dcp_attributes_replace(' in attributes[:attributes.index('}')]
+    assert ('dcp_attributes_replace(dcp, &ctx,' if owned else 'dcp_set_dimensions(dcp);') in attributes
     assert 'queue_work(ep->wq, &work->work)' in af
     prefix=r'''
 #undef NDEBUG
@@ -790,6 +801,7 @@ typedef uint64_t u64;
 #define APPLE_RTKIT_EP_MGMT 0
 #define APPLE_RTKIT_EP_CRASHLOG 1
 #define APPLE_RTKIT_EP_SYSLOG 2
+#define APPLE_RTKIT_EP_DEBUG 3
 #define APPLE_RTKIT_EP_IOREPORT 4
 #define APPLE_RTKIT_EP_OSLOG 8
 #define APPLE_RTKIT_APP_ENDPOINT_START 0x20
@@ -812,7 +824,7 @@ struct apple_dcp_afkep { struct apple_dcp *dcp; u8 endpoint; struct mutex lock; 
 struct test_mode_ticket { u64 generation; bool associated; };
 struct apple_dcp {
     bool quiescing; int fw_compat; void *dev;
-    struct { int iomfb_method_profile; } hw;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead;
     struct { struct mutex lock; u64 epoch; bool enabled; void *service; } dcpavserv;
     struct test_mode_ticket dummy_ticket;
     struct { u64 connection_sequence; } rate_proof;
@@ -827,7 +839,7 @@ struct apple_dcp {
 };
 struct afk_receive_message_work { struct apple_dcp_afkep *ep; u64 message; struct work_struct work; };
 struct apple_rtkit_ops { void (*recv_message)(void *,u8,u64); };
-struct apple_rtkit { bool shutting_down; const struct apple_rtkit_ops *ops; void *cookie,*dev; };
+struct apple_rtkit { bool shutting_down, sync_syslog_ack; const struct apple_rtkit_ops *ops; void *cookie,*dev; };
 struct apple_rtkit_rx_work { struct apple_rtkit *rtk; u8 ep; u64 msg; struct work_struct work; };
 #define current ((void *)1)
 static pthread_mutex_t reply_lock=PTHREAD_MUTEX_INITIALIZER;
@@ -858,10 +870,11 @@ static void iomfb_recv_message(struct apple_dcp *d,u64 message)
     u32 length=64;
     assert(dcpep_cb_prop_start(d,&length));
 }
-#define rx_unused(name) static void name(struct apple_rtkit *r,u64 m) { (void)r;(void)m; }
+#define rx_unused(name) static void __attribute__((unused)) name(struct apple_rtkit *r,u64 m) { (void)r;(void)m; }
 rx_unused(apple_rtkit_management_rx)
 rx_unused(apple_rtkit_crashlog_rx)
 rx_unused(apple_rtkit_syslog_rx)
+rx_unused(apple_rtkit_kdebug_rx)
 rx_unused(apple_rtkit_ioreport_rx)
 rx_unused(apple_rtkit_oslog_rx)
 '''
@@ -935,6 +948,52 @@ int main(void)
     puts("PASS: actual ordered RTKit RX -> synchronous IOMFB dimensions/property-start callbacks -> AFK enqueue makes reply progress while DRM mutex held; deferred dimensions update completes after release");
 }
 '''
+    if owned:
+        prefix=prefix.replace('struct apple_connector { struct drm_connector base; struct work_struct hotplug_wq; };',
+            'struct apple_connector { struct drm_connector base; struct work_struct hotplug_wq,bl_sync_wq; };',1)
+        prefix=prefix.replace('    int width_mm,height_mm; struct { int width_mm,height_mm; } panel;',
+            '    int width_mm,height_mm; struct { int width_mm,height_mm; } panel;\n'
+            '    struct mutex modes_lock; u64 modes_generation,dimensions_generation; struct work_struct dimensions_wq; bool ext_backlight;',1)
+        prefix=prefix.replace('struct { size_t length; void *data;','struct { size_t length; void *data; u64 modes_generation;',1)
+        prefix=prefix.replace('static void schedule_work(struct work_struct *w) { queue_work(&dimensions_queue,w); }','''
+static struct workqueue_struct hotplug_queue={.ready=PTHREAD_COND_INITIALIZER,.lock=PTHREAD_MUTEX_INITIALIZER};
+static void (*hotplug_fn)(struct work_struct *);
+/* dimensions_wq and the connector's hotplug work run on separate workers. */
+static void schedule_work(struct work_struct *w) { queue_work(w->fn==hotplug_fn?&hotplug_queue:&dimensions_queue,w); }
+static struct mutex *guard_lock(struct mutex *m) { mutex_lock(m); return m; }
+static void guard_unlock(struct mutex **m) { if(*m) mutex_unlock(*m); }
+#define guard(kind) struct mutex * __attribute__((cleanup(guard_unlock))) _guard = guard_lock
+#define scoped_guard(kind,l) for(struct mutex *_scoped __attribute__((cleanup(guard_unlock)))=guard_lock(l);_scoped;mutex_unlock(_scoped),_scoped=NULL)
+#define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
+#define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
+static bool dcp_has_panel(struct apple_dcp *d) { (void)d; return false; }
+/* The parser is a leaf here: the attributes report the display's 60x34 cm. */
+struct dcp_parse_ctx { int unused; };
+static int parse_display_attributes(struct dcp_parse_ctx *h,int *w,int *ht,bool *backlight)
+{ (void)h; *w=600; *ht=340; *backlight=false; return 0; }
+static int dcp_attributes_replace(struct apple_dcp *d,struct dcp_parse_ctx *h,u64 generation);
+static u64 dcp_modes_transfer_begin(struct apple_dcp *d);''',1)
+        old_rx='''    assert(message==1 && held(&d->iomfb.lock)); dcp_set_dimensions(d);'''
+        assert old_rx in prefix
+        prefix=prefix.replace(old_rx,'''    struct dcp_parse_ctx attributes={0};
+    assert(message==1 && held(&d->iomfb.lock));
+    assert(!dcp_attributes_replace(d,&attributes,dcp_modes_transfer_begin(d)));''',1)
+        prefix=prefix.replace('static void dcp_set_dimensions(struct apple_dcp *d);','static void dcp_set_dimensions(struct apple_dcp *d,u64 generation);',1)
+        prefix=prefix.replace('static u64 dcp_modes_transfer_begin(struct apple_dcp *d);','static u64 dcp_modes_transfer_begin(struct apple_dcp *d);\n'+internal_inline(root,'dcp_fw_is_14_7'),1)
+        property_header=(root/'drivers/gpu/drm/apple/dcp-property.h').read_text()
+        parts=['#include <string.h>\n'+''.join(line+'\n' for line in property_header.splitlines() if not line.startswith('#include'))
+               .replace('static inline ','static inline __attribute__((unused)) ').replace('SZ_16M','(16*SZ_1M)')]+parts
+        parts+=[apple_function(root,name) for name in ('dcp_modes_transfer_begin','dcp_modes_dimensions_work','dcp_attributes_replace')]
+        old_main='''    d.dcpavservep=&av; connector.hotplug_wq.fn=dimension_work;'''
+        assert old_main in suffix
+        suffix=suffix.replace(old_main,'''    pthread_t hotplug;
+    d.dcpavservep=&av; connector.hotplug_wq.fn=dimension_work; hotplug_fn=dimension_work;
+    d.dimensions_wq.fn=dcp_modes_dimensions_work;
+    assert(!pthread_mutex_init(&d.modes_lock.native,NULL));
+    assert(!pthread_create(&hotplug,NULL,worker,&hotplug_queue));''',1)
+        old_join='''    assert(!pthread_join(rx,NULL) && !pthread_join(afk,NULL) && !pthread_join(dimensions,NULL));'''
+        assert old_join in suffix
+        suffix=suffix.replace(old_join,old_join+'\n    assert(!pthread_join(hotplug,NULL));',1)
     return prefix + '\n'.join(parts) + suffix
 
 
@@ -962,7 +1021,7 @@ struct apple_dcp_afkep {
 };
 struct apple_dcp {
     void *dev;
-    struct { int iomfb_method_profile; } hw;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead;
     struct { unsigned enable_completion; bool enabled; } dcpavserv;
     struct apple_dcp_afkep *dcpavservep;
 };

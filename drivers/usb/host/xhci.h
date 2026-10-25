@@ -33,8 +33,11 @@
 /* xHCI PCI Configuration Registers */
 #define XHCI_SBRN_OFFSET	(0x60)
 
-/* Max number of USB devices for any host controller - limit in section 6.1 */
-#define MAX_HC_SLOTS		256
+/*
+ * Max number of Devices Slots. xHCI specification section 5.3.3
+ * Valid values are in the range of 1 to 255.
+ */
+#define MAX_HC_SLOTS		255
 /*
  * Max Number of Ports. xHCI specification section 5.3.3
  * Valid values are in the range of 1 to 255.
@@ -286,6 +289,11 @@ struct xhci_run_regs {
 	__le32			rsvd[7];
 	struct xhci_intr_reg	ir_set[1024];
 };
+
+/* Bits [13:3] of the microframe index equals the 1ms frame index */
+#define MFINDEX_TO_FRAME(p)	(((p) >> 3) & 0x7ff)
+#define MAX_FRAMES		2048
+#define MAX_UFRAMES		(MAX_FRAMES * 8)
 
 /**
  * struct doorbell_array
@@ -674,9 +682,9 @@ struct xhci_virt_ep {
 #define EP_SOFT_CLEAR_TOGGLE	BIT(7)
 /* usb_hub_clear_tt_buffer is in progress */
 #define EP_CLEARING_TT		BIT(8)
+#define EP_DROP_PENDING		BIT(9) /* port disconnect or link error, don't restart */
 	/* ----  Related to URB cancellation ---- */
 	struct list_head	cancelled_td_list;
-	struct xhci_hcd		*xhci;
 	/* Dequeue pointer and dequeue segment for a submitted Set TR Dequeue
 	 * command.  We'll need to update the ring's dequeue segment and dequeue
 	 * pointer after the command completes.
@@ -696,7 +704,7 @@ struct xhci_virt_ep {
 	struct list_head	bw_endpoint_list;
 	unsigned long		stop_time;
 	/* Isoch Frame ID checking storage */
-	int			next_frame_id;
+	int			next_uframe;
 	/* Use new Isoch TRB layout needed for extended TBC support */
 	bool			use_extended_tbc;
 	/* set if this endpoint is controlled via sideband access*/
@@ -750,14 +758,6 @@ struct xhci_virt_device {
 	struct xhci_port		*rhub_port;
 	struct xhci_interval_bw_table	*bw_table;
 	struct xhci_tt_bw_info		*tt_info;
-	/*
-	 * flags for state tracking based on events and issued commands.
-	 * Software can not rely on states from output contexts because of
-	 * latency between events and xHC updating output context values.
-	 * See xhci 1.1 section 4.8.3 for more details
-	 */
-	unsigned long			flags;
-#define VDEV_PORT_ERROR			BIT(0) /* Port error, link inactive */
 
 	/* The current max exit latency for the enabled USB3 link states. */
 	u16				current_mel;
@@ -792,18 +792,18 @@ struct xhci_tt_bw_info {
 
 /**
  * struct xhci_device_context_array
- * @dev_context_ptr	array of 64-bit DMA addresses for device contexts
+ * @ctx_array:	Pointer to an array of addresses. The array size depends on Max
+ *		Slots read from HCSPARAMS1.
+ * @dma:	DMA address to @ctx_array
+ *
+ * Device Context Base Address Array (DCBAA) - Section 6.1.
+ * ctx_array[0]:		Scratchpad Buffer Array Base Address
+ * ctx_array[1-MaxSlots]:	Device Context Base Address
  */
 struct xhci_device_context_array {
-	/* 64-bit device addresses; we only write 32-bit addresses */
-	__le64			dev_context_ptrs[MAX_HC_SLOTS];
-	/* private xHCD pointers */
+	__le64		*ctx_array;
 	dma_addr_t	dma;
 };
-/*
- * TODO: change this to be dynamically sized at HC mem init time since the HC
- * might not be able to handle the maximum number of devices possible.
- */
 
 
 struct xhci_transfer_event {
@@ -1376,7 +1376,6 @@ struct xhci_ring {
 	u32			cycle_state;
 	unsigned int		stream_id;
 	unsigned int		num_segs;
-	unsigned int		num_trbs_free; /* used only by xhci DbC */
 	unsigned int		bounce_buf_len;
 	enum xhci_ring_type	type;
 	u32			old_trb_comp_code;
@@ -1478,6 +1477,8 @@ struct xhci_port {
 	int			hcd_portnum;
 	struct xhci_hub		*rhub;
 	struct xhci_port_cap	*port_cap;
+	unsigned int		link_inactive:1;
+	unsigned int		connected:1;
 	unsigned int		lpm_incapable:1;
 	unsigned long		resume_timestamp;
 	bool			rexit_active;
@@ -1535,7 +1536,7 @@ struct xhci_hcd {
 	/* optional reset controller */
 	struct reset_control *reset;
 	/* data structures */
-	struct xhci_device_context_array *dcbaa;
+	struct xhci_device_context_array	dcbaa;
 	struct xhci_interrupter **interrupters;
 	struct xhci_ring	*cmd_ring;
 	unsigned int            cmd_ring_state;
@@ -1555,7 +1556,7 @@ struct xhci_hcd {
 	/* these are not thread safe so use mutex */
 	struct mutex mutex;
 	/* Internal mirror of the HW's dcbaa */
-	struct xhci_virt_device	*devs[MAX_HC_SLOTS];
+	struct xhci_virt_device	**devs;
 	/* For keeping track of bandwidth domains per roothub. */
 	struct xhci_root_port_bw_info	*rh_bw;
 
@@ -1964,9 +1965,10 @@ void xhci_ring_doorbell_for_active_rings(struct xhci_hcd *xhci,
 void xhci_cleanup_command_queue(struct xhci_hcd *xhci);
 void inc_deq(struct xhci_hcd *xhci, struct xhci_ring *ring);
 unsigned int count_trbs(u64 addr, u64 len);
+unsigned int xhci_num_trbs_free(struct xhci_ring *ring);
 int xhci_stop_endpoint_sync(struct xhci_hcd *xhci, struct xhci_virt_ep *ep,
 			    int suspend, gfp_t gfp_flags);
-void xhci_process_cancelled_tds(struct xhci_virt_ep *ep);
+void xhci_process_cancelled_tds(struct xhci_hcd *xhci, struct xhci_virt_ep *ep);
 void xhci_update_erst_dequeue(struct xhci_hcd *xhci,
 			      struct xhci_interrupter *ir,
 			      bool clear_ehb);

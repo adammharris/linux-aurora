@@ -22,7 +22,6 @@
 #include <linux/irqdomain.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
 #include <linux/spmi.h>
@@ -175,13 +174,12 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 	return 0;
 }
 
-static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
-			 u16 param, const u8 *buf, size_t len, u8 *ibuf, size_t ilen)
+static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
+			const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
 {
 	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
 	u32 spmi_cmd = apple_spmi_pack_cmd(opc, sid, param);
 	u32 reply, rsp;
-	size_t len_read = 0;
 	size_t i = 0, j;
 	int ret;
 
@@ -199,10 +197,10 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 
 	writel(spmi_cmd, spmi->regs + spmi->hw->command);
 
-	while (i < len) {
-		j = min_t(size_t, sizeof(spmi_cmd), len - i);
+	while (i < len_wr) {
+		j = min_t(size_t, sizeof(spmi_cmd), len_wr - i);
 		spmi_cmd = 0;
-		memcpy(&spmi_cmd, buf + i, j);
+		memcpy(&spmi_cmd, buf_wr + i, j);
 		writel(spmi_cmd, spmi->regs + spmi->hw->command);
 		i += j;
 	}
@@ -212,9 +210,16 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 		return ret;
 
 	reply = readl(spmi->regs + spmi->hw->reply);
+	if (FIELD_GET(SPMI_REPLY_CMD, reply) != opc ||
+	    FIELD_GET(SPMI_REPLY_SLAVE_ID, reply) != sid) {
+		spmi->prev_fail = true;
+		dev_err(&ctrl->dev, "unexpected SPMI response 0x%x\n", reply);
+		return -EIO;
+	}
 
 	/* Read SPMI data reply */
-	while (len_read < ilen) {
+	i = 0;
+	while (i < len_rd) {
 		if (readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty) {
 			spmi->prev_fail = true;
 			dev_err_ratelimited(&ctrl->dev,
@@ -222,9 +227,9 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 			return -EIO;
 		}
 		rsp = readl(spmi->regs + spmi->hw->reply);
-		i = min_t(size_t, sizeof(spmi_cmd), ilen - len_read);
-		memcpy(ibuf + len_read, &rsp, i);
-		len_read += i;
+		j = min_t(size_t, sizeof(spmi_cmd), len_rd - i);
+		memcpy(buf_rd + i, &rsp, j);
+		i += j;
 	}
 
 	if (!(readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty)) {
@@ -232,11 +237,11 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 		spmi->prev_fail = true;
 	}
 
-	if (!ilen && !FIELD_GET(SPMI_REPLY_ACK, reply)) {
+	if (!len_rd && !FIELD_GET(SPMI_REPLY_ACK, reply)) {
 		dev_err(&ctrl->dev, "command not acknowledged\n");
 		return -EIO;
 	}
-	if (~FIELD_GET(SPMI_REPLY_FRAME_PARITY_STATUS, reply) & ((1 << ilen) - 1)) {
+	if (~FIELD_GET(SPMI_REPLY_FRAME_PARITY_STATUS, reply) & ((1 << len_rd) - 1)) {
 		dev_err(&ctrl->dev, "some frames failed parity check\n");
 		return -EIO;
 	}
@@ -407,7 +412,6 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 		for_each_set_bit(bit, &val, 64) {
 			generic_handle_domain_irq(spmi->irqd, offset * 8 + bit);
 			handled = true;
-			val &= ~BIT(bit);
 		}
 	}
 	if (!handled)
@@ -415,15 +419,19 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	chained_irq_exit(chip, desc);
 }
 
-static void remove_chained_handler(void *data)
+static void apple_spmi_teardown_irq(void *data)
 {
-	unsigned int irq = (unsigned int)(uintptr_t)data;
+	struct apple_spmi *spmi = data;
 
-	irq_set_chained_handler_and_data(irq, NULL, NULL);
+	for (size_t offset = 0; offset < SPMI_NUM_IRQS / 8; offset += 4)
+		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
+
+	synchronize_irq(spmi->irq);
+	irq_set_chained_handler_and_data(spmi->irq, NULL, NULL);
 }
 
 static int apple_spmi_init_irq(struct platform_device *pdev,
-			  struct apple_spmi *spmi, int irq)
+			       struct apple_spmi *spmi, int irq)
 {
 	int ret;
 	struct irq_domain_info info = {
@@ -444,13 +452,13 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 	if (IS_ERR(spmi->irqd))
 		return PTR_ERR(spmi->irqd);
 
-	spmi->notify_irq = true;
-	ret = devm_add_action(&pdev->dev, remove_chained_handler, (void *)(uintptr_t)spmi->irq);
+	ret = devm_add_action(&pdev->dev, apple_spmi_teardown_irq, spmi);
 	if (ret)
 		return ret;
 
 	irq_set_chained_handler_and_data(spmi->irq, apple_spmi_irq_handler, spmi);
 	apple_spmi_irq_unmask_raw(spmi, SPMI_IRQ_NOTIFY);
+	spmi->notify_irq = true;
 
 	return 0;
 }

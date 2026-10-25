@@ -17,9 +17,14 @@
 //! then be unavailable, but no other OS's record changes.
 //!
 //! The parameter's default, -1, takes the platform profile's level: 1 on the
-//! M1 and M2 Macs, whose enclave Linux shares with a macOS install, and 0 on
-//! the MacBook Neo, which already holds Linux records from before the list
-//! existed and would otherwise lose write access to them.
+//! M1, M2 and M3 Macs, whose enclave Linux shares with a macOS install, and
+//! 0 on the MacBook Neo, which already holds Linux records from before the
+//! list existed and would otherwise lose write access to them.
+//!
+//! The effective level, whether the list could be loaded and every refused
+//! write are reported in the driver's `diag` attributes, with what they make
+//! of a fingerprint match ([`Matching`]), so that a readiness check can tell
+//! a guard that blocks matching from one that has refused nothing yet.
 //!
 //! The list entry is made durable before the enclave's write reaches the
 //! gigalocker. A crash between the two leaves an entry for a record that was
@@ -35,8 +40,10 @@ pub(crate) const OWNED_PATH: &CStr = c"/var/lib/aurora-sep-xart-owned.bin";
 
 const ENTRY_SIZE: usize = 32;
 const ENTRY_MAGIC: &[u8; 4] = b"AXGO";
-/// Bounds the file the driver reads at probe. The gigalocker has at most a
-/// few hundred slots, so a longer list is damaged.
+/// Bounds the file the driver reads at probe, counted in entries the file
+/// holds, torn and repeated ones included. The gigalocker has at most a few
+/// hundred slots, so a longer list is damaged. Appending stops at the same
+/// bound, so the driver never writes a list it would refuse to read.
 const MAX_ENTRIES: usize = 4096;
 /// Refusals are logged individually up to this count, then only counted.
 const LOGGED_REFUSALS: usize = 8;
@@ -77,6 +84,55 @@ pub(crate) fn level(param: i8, platform: u8) -> Option<u8> {
     match level {
         0 => None,
         level => Some(level.min(2)),
+    }
+}
+
+/// Whether a fingerprint match can save the state it writes to xART, as far
+/// as the driver can tell. The values are `SEP_DIAG_MATCHING_*` in `shim.h`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Matching {
+    /// xART writes are enabled and no guard runs.
+    Usable = 1,
+    /// A guard runs and nothing says it refuses a match, but nothing says it
+    /// allows one either.
+    Unverified = 2,
+    /// A match's write is refused, or known to be.
+    Blocked = 3,
+}
+
+/// What [`Matching`] is derived from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MatchFacts {
+    /// The store opened with writes enabled.
+    pub(crate) xart_writable: bool,
+    /// The platform cold-boots its enclave.
+    pub(crate) cold: bool,
+    /// The guard's effective level and whether its list loaded, or `None`
+    /// when no guard runs.
+    pub(crate) guard: Option<(u8, bool)>,
+    /// The guard's refusals since probe.
+    pub(crate) refusals: u32,
+}
+
+impl MatchFacts {
+    /// A match rewrites session records that existed before it (seen on a
+    /// T6000). It is blocked when xART is read-only, once the guard has
+    /// refused anything, when the guard has no list to allow Linux's records
+    /// by, and on a cold-boot Mac: creating the keybag there needs the guard
+    /// off, so the records a match rewrites were never listed.
+    ///
+    /// Nothing else proves an unguarded setup. An empty list in particular
+    /// does not: a guarded keybag creation on an M2 writes no record, and a
+    /// rollback can empty the list. So a guarded warm-attach Mac is
+    /// unverified until a refusal says otherwise.
+    pub(crate) fn matching(&self) -> Matching {
+        match self.guard {
+            _ if !self.xart_writable || self.refusals != 0 => Matching::Blocked,
+            None => Matching::Usable,
+            Some((_, false)) => Matching::Blocked,
+            Some(_) if self.cold => Matching::Blocked,
+            Some(_) => Matching::Unverified,
+        }
     }
 }
 
@@ -229,9 +285,21 @@ impl<F: ListFile> Guard<F> {
         Ok(())
     }
 
+    /// The level this guard applies.
+    pub(crate) fn effective_level(&self) -> u8 {
+        self.level
+    }
+
+    /// Whether Linux's list was loaded. Without it nothing can be adopted.
+    pub(crate) fn list_loaded(&self) -> bool {
+        self.file.is_some()
+    }
+
     fn adopt(&mut self, key: &Key) -> Result<()> {
         let file = self.file.as_ref().ok_or(ENOENT)?;
-        if self.owned.len() >= MAX_ENTRIES {
+        // The file's length, not the number of distinct keys: a torn or
+        // repeated entry still counts against what load() accepts.
+        if usize::try_from(self.end).map_or(true, |end| end / ENTRY_SIZE >= MAX_ENTRIES) {
             return Err(ENOSPC);
         }
         file.write_all(self.end, &encode(key))?;
@@ -250,6 +318,7 @@ impl<F: ListFile> Guard<F> {
             Verdict::Allow => Ok(()),
             Verdict::Adopt if !write => Ok(()),
             Verdict::Adopt => self.adopt(key).inspect_err(|e| {
+                crate::diag::xart_guard_refused();
                 pr_warn!(
                     "xART guard: could not list a new kind-{} record as Linux's ({:?}); refusing to write it\n",
                     key.kind,
@@ -257,6 +326,7 @@ impl<F: ListFile> Guard<F> {
                 )
             }),
             Verdict::Refuse => {
+                crate::diag::xart_guard_refused();
                 self.refused += 1;
                 if self.refused <= LOGGED_REFUSALS {
                     let action = if write { "rewrite" } else { "delete" };
@@ -272,6 +342,7 @@ impl<F: ListFile> Guard<F> {
     }
 }
 
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
 #[kernel::macros::kunit_tests(apple_sep_xart_guard)]
 mod tests {
     use super::*;
@@ -281,10 +352,56 @@ mod tests {
         Key::new(4, [byte; 16])
     }
 
+    fn facts(
+        xart_writable: bool,
+        cold: bool,
+        guard: Option<(u8, bool)>,
+        refusals: u32,
+    ) -> Matching {
+        MatchFacts {
+            xart_writable,
+            cold,
+            guard,
+            refusals,
+        }
+        .matching()
+    }
+
+    #[test]
+    fn matching_without_a_guard_is_usable() {
+        // The Neo (warm, level 0) and an M1 Pro pinned to xart_guard=0 (cold).
+        assert_eq!(facts(true, false, None, 0), Matching::Usable);
+        assert_eq!(facts(true, true, None, 0), Matching::Usable);
+    }
+
+    #[test]
+    fn matching_under_a_listed_warm_guard_is_unverified() {
+        // An M2 set up under the guard. An empty list is still "loaded", and
+        // does not make the setup unguarded.
+        assert_eq!(facts(true, false, Some((1, true)), 0), Matching::Unverified);
+        assert_eq!(facts(true, false, Some((2, true)), 0), Matching::Unverified);
+    }
+
+    #[test]
+    fn matching_is_blocked_where_it_is_known_to_be() {
+        // A cold-boot M1-family Mac under the default level 1.
+        assert_eq!(facts(true, true, Some((1, true)), 0), Matching::Blocked);
+        // No list: nothing that existed at probe is Linux's.
+        assert_eq!(facts(true, false, Some((1, false)), 0), Matching::Blocked);
+        // A refusal seen.
+        assert_eq!(facts(true, false, Some((1, true)), 1), Matching::Blocked);
+        // xART read-only: no guard runs, and no write can land.
+        assert_eq!(facts(false, false, None, 0), Matching::Blocked);
+        assert_eq!(facts(false, true, None, 0), Matching::Blocked);
+    }
+
     #[test]
     fn another_os_record_is_refused() {
         assert_eq!(decide(1, &session(1), true, false), Verdict::Refuse);
-        assert_eq!(decide(2, &Key::new(3, [1; 16]), true, false), Verdict::Refuse);
+        assert_eq!(
+            decide(2, &Key::new(3, [1; 16]), true, false),
+            Verdict::Refuse
+        );
     }
 
     #[test]
@@ -380,6 +497,8 @@ mod tests {
         let bytes = RefCell::new(KVec::new());
         let foreign = session(1);
         let mut guard = Guard::with_file(1, keys(&[foreign])?, Ok(MemFile(&bytes)));
+        assert_eq!(guard.effective_level(), 1);
+        assert!(guard.list_loaded());
         assert_eq!(guard.check(&foreign, true), Err(EPERM));
         assert_eq!(guard.check(&foreign, false), Err(EPERM));
         // A refusal lists nothing.
@@ -439,10 +558,89 @@ mod tests {
         Ok(())
     }
 
+    /// A list file of `entries`, each written as given.
+    fn list_of(entries: &[Key]) -> Result<KVec<u8>> {
+        let mut bytes = KVec::with_capacity(entries.len() * ENTRY_SIZE, GFP_KERNEL)?;
+        for key in entries {
+            bytes.extend_from_slice(&encode(key), GFP_KERNEL)?;
+        }
+        Ok(bytes)
+    }
+
+    fn numbered(i: usize) -> Key {
+        let mut uuid = [0u8; 16];
+        uuid[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        Key::new(4, uuid)
+    }
+
+    #[test]
+    fn a_full_list_stops_adopting_and_still_opens() -> Result<()> {
+        let mut all = KVec::with_capacity(MAX_ENTRIES, GFP_KERNEL)?;
+        for i in 0..MAX_ENTRIES {
+            all.push(numbered(i), GFP_KERNEL)?;
+        }
+        let bytes = RefCell::new(list_of(&all)?);
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        assert!(guard.file.is_some());
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Err(ENOSPC));
+        assert_eq!(bytes.borrow().len(), MAX_ENTRIES * ENTRY_SIZE);
+        drop(guard);
+        // Reopened: still within what load() accepts, and Linux's records
+        // are still Linux's.
+        let mut guard = Guard::with_file(1, keys(&[numbered(7)])?, Ok(MemFile(&bytes)));
+        assert!(guard.file.is_some());
+        assert_eq!(guard.check(&numbered(7), true), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_entries_count_against_the_bound() -> Result<()> {
+        // Fewer distinct keys than the bound, but as many entries: a list
+        // that reached its length through repeats.
+        let distinct = MAX_ENTRIES - 96;
+        let mut all = KVec::with_capacity(MAX_ENTRIES, GFP_KERNEL)?;
+        for i in 0..MAX_ENTRIES {
+            all.push(numbered(i % distinct), GFP_KERNEL)?;
+        }
+        let bytes = RefCell::new(list_of(&all)?);
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        assert_eq!(guard.owned.len(), distinct);
+        // Appending would make a list the next boot refuses.
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Err(ENOSPC));
+        assert_eq!(bytes.borrow().len(), MAX_ENTRIES * ENTRY_SIZE);
+        drop(guard);
+        let guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        assert!(guard.file.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_torn_tail_at_the_bound_takes_the_last_entry() -> Result<()> {
+        let mut all = KVec::with_capacity(MAX_ENTRIES - 1, GFP_KERNEL)?;
+        for i in 0..MAX_ENTRIES - 1 {
+            all.push(numbered(i), GFP_KERNEL)?;
+        }
+        let mut list = list_of(&all)?;
+        list.extend_from_slice(&encode(&numbered(MAX_ENTRIES))[..10], GFP_KERNEL)?;
+        let bytes = RefCell::new(list);
+
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        // The torn tail is overwritten by the one entry that still fits.
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Ok(()));
+        assert_eq!(bytes.borrow().len(), MAX_ENTRIES * ENTRY_SIZE);
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES + 1), true), Err(ENOSPC));
+        drop(guard);
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        assert!(guard.file.is_some());
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Ok(()));
+        Ok(())
+    }
+
     #[test]
     fn without_the_list_nothing_is_adopted() -> Result<()> {
         let foreign = session(1);
         let mut guard = Guard::<MemFile<'_>>::with_file(1, keys(&[foreign])?, Err(ENOENT));
+        assert!(!guard.list_loaded());
         assert_eq!(guard.check(&foreign, true), Err(EPERM));
         assert!(guard.check(&session(6), true).is_err());
         // Deleting a record that does not exist changes nothing.
@@ -459,7 +657,9 @@ mod tests {
         assert_eq!(level(-1, profile::T8103.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T6000.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T6020.xart_guard), Some(1));
+        assert_eq!(level(-1, profile::T6020_SEPOS13.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T8112.xart_guard), Some(1));
+        assert_eq!(level(-1, profile::T8122.xart_guard), Some(1));
         // Off on the Neo, whose Linux records predate the list.
         assert_eq!(level(-1, profile::T8140.xart_guard), None);
         assert_eq!(level(i8::MIN, 1), Some(1));

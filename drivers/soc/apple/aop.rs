@@ -8,6 +8,7 @@
 use core::{
     arch::asm,
     cmp,
+    marker::Unpin,
     mem,
     ptr::{self, NonNull},
     slice, //
@@ -30,11 +31,13 @@ use kernel::{
     firmware::Firmware,
     fmt,
     io::{
-        mem::IoMem,
+        io_project,
         Io,
-        RelaxedMmio, //
+        IoBase,
+        IoSysMap,
+        Mmio,
+        Region, //
     },
-    iosys_map::IoSysMapRef,
     module_platform_driver,
     new_condvar,
     new_mutex,
@@ -50,7 +53,10 @@ use kernel::{
         AOP, //
     },
     soc::apple::mailbox,
-    soc::apple::rtkit,
+    soc::apple::rtkit::{
+        self,
+        ASC_CPU_CONTROL, //
+    },
     str::CString,
     sync::{
         aref::ARef,
@@ -85,8 +91,10 @@ const AOP_MMIO_SIZE: usize = 0x1e0000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
-const CPU_CONTROL: usize = 0x44;
-const CPU_RUN: u32 = 0x1 << 4;
+/// The largest firmware segment the bootloader reserves in DRAM (T6040).
+const FW_REGION_MAX_SIZE: u64 = 0x10_0000;
+/// The DART page size the firmware segments are mapped with.
+const FW_REGION_PAGE: u64 = 0x4000;
 const AFK_ENDPOINT_START: u8 = 0x20;
 const AFK_ENDPOINT_COUNT: u8 = 0xf;
 const AFK_OPC_GET_BUF: u64 = 0x89;
@@ -333,7 +341,7 @@ struct FutureValue<T> {
     completion: CondVar,
 }
 
-impl<T> FutureValue<T> {
+impl<T: Unpin> FutureValue<T> {
     fn pin_init() -> impl PinInit<FutureValue<T>> {
         pin_init!(
             FutureValue {
@@ -593,7 +601,7 @@ impl AFKEndpoint {
         // this callback runs.
         let bound_dev = unsafe { dev.as_bound() };
         let iomem = Coherent::<u8>::zeroed_slice(bound_dev, size, GFP_KERNEL)?;
-        let iova = iomem.dma_handle();
+        let iova = iomem.dma_address();
         // Own the buffer before its address leaves the host: should the
         // doorbell fail after the firmware has seen the message, the buffer
         // must not go back to the allocator while the firmware uses it.
@@ -1026,7 +1034,7 @@ impl SetupState {
     }
 
     fn arena_iova(&self) -> Result<u64> {
-        Ok(self.arena.as_ref().ok_or(ENXIO)?.dma_handle())
+        Ok(self.arena.as_ref().ok_or(ENXIO)?.dma_address())
     }
 
     /// Returns a pointer to `len` bytes at `off` in the arena after checking
@@ -1328,7 +1336,7 @@ impl WorkItem for AopServiceRegisterWork {
 }
 
 impl AopData {
-    fn new(dev: &platform::Device<Core>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
+    fn new(dev: &platform::Device<Core<'_>>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
         let setup_queue = if cfg.setup_port {
             Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
@@ -1506,35 +1514,222 @@ impl AopData {
 
     fn patch_bootargs(
         &self,
-        aop_mmio: &IoMem<AOP_MMIO_SIZE>,
+        aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
         patches: &[(u32, u64)],
     ) -> Result<()> {
-        let aop_mmio = aop_mmio.relaxed();
         let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
         let size = aop_mmio.read32(BOOTARGS_SIZE) as usize;
+        if offset > aop_mmio.size() || size > aop_mmio.size() - offset {
+            return Err(EINVAL);
+        }
         let mut arg_bytes = KVec::<u8>::from_elem(0, size, GFP_KERNEL)?;
-        aop_mmio.try_memcpy_fromio(&mut arg_bytes, offset)?;
+        let aop_io_array: Mmio<'_, [u8; AOP_MMIO_SIZE]> = aop_mmio.try_cast()?;
+        let bootargs = io_project!(aop_io_array, [try: offset .. offset+size]);
+        bootargs.copy_to_slice(&mut arg_bytes);
         let mut idx = 0;
         while idx < size {
+            if size - idx < 8 {
+                return Err(EINVAL);
+            }
             let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
-            let size = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
             idx += 8;
+            if len > size - idx {
+                return Err(EINVAL);
+            }
             for (k, v) in patches.iter() {
                 if *k != key {
                     continue;
                 }
-                arg_bytes[idx..idx + size].copy_from_slice(&v.to_le_bytes()[..size]);
+                if len > mem::size_of::<u64>() {
+                    return Err(EINVAL);
+                }
+                arg_bytes[idx..idx + len].copy_from_slice(&v.to_le_bytes()[..len]);
                 break;
             }
-            idx += size;
+            idx += len;
         }
-        aop_mmio.try_memcpy_toio(offset, &arg_bytes)
+        bootargs.copy_from_slice(&arg_bytes);
+        Ok(())
     }
 
-    fn start_cpu(&self, asc_mmio: &RelaxedMmio<ASC_MMIO_SIZE>) -> Result<()> {
-        let val = asc_mmio.read32(CPU_CONTROL);
-        asc_mmio.write32(val | CPU_RUN, CPU_CONTROL);
-        self.cpu_started.store(true, Release);
+    /// The physical address, IOVA and size of the `idx`-th `memory-region` of
+    /// `np`. The IOVA comes from the region's `iommu-addresses` entry for
+    /// `np`.
+    fn fw_region(np: *mut bindings::device_node, idx: c_int) -> Result<(u64, u64, u64)> {
+        // SAFETY: `np` is a valid node and the name is NUL-terminated.
+        let region =
+            unsafe { bindings::of_parse_phandle(np, c_str!("memory-region").as_char_ptr(), idx) };
+        if region.is_null() {
+            return Err(EINVAL);
+        }
+        // SAFETY: of_parse_phandle() returned a reference on `region`.
+        let _put = ScopeGuard::new(|| unsafe { bindings::of_node_put(region) });
+        let mut res = mem::MaybeUninit::<bindings::resource>::zeroed();
+        // SAFETY: `region` is a valid node and `res` is writable storage for
+        // one resource.
+        if unsafe { bindings::of_address_to_resource(region, 0, res.as_mut_ptr()) } != 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: of_address_to_resource() succeeded and filled it in.
+        let res = unsafe { res.assume_init() };
+        if res.end < res.start {
+            return Err(EINVAL);
+        }
+        let phys = res.start as u64;
+        let size = (res.end - res.start) as u64 + 1;
+
+        let mut len: c_int = 0;
+        // SAFETY: `region` is a valid node and the name is NUL-terminated.
+        let prop = unsafe {
+            bindings::of_get_property(region, c_str!("iommu-addresses").as_char_ptr(), &mut len)
+        }
+        .cast::<u32>();
+        let len = usize::try_from(len).map_err(|_| EINVAL)?;
+        if prop.is_null() || len == 0 || len % mem::size_of::<u32>() != 0 {
+            return Err(ENOENT);
+        }
+        let cells = len / mem::size_of::<u32>();
+        // SAFETY: `np` is a valid node.
+        let own = unsafe { (*np).phandle };
+        let mut found = None;
+        let mut pos = 0;
+        // Each entry is an owner phandle and an address and size in the
+        // owner's DMA address space.
+        while pos < cells {
+            // SAFETY: `pos` is below `cells`, inside the property.
+            let phandle = u32::from_be(unsafe { prop.add(pos).read_unaligned() });
+            pos += 1;
+            if own != 0 && phandle == own {
+                let mut iova: bindings::phys_addr_t = 0;
+                let mut length: usize = 0;
+                // SAFETY: `cells - pos` cells are left in the property, which
+                // bounds the tuple.
+                let next = unsafe {
+                    bindings::of_translate_dma_region_checked(
+                        np,
+                        prop.add(pos),
+                        cells - pos,
+                        &mut iova,
+                        &mut length,
+                    )
+                };
+                if next.is_null() || found.is_some() {
+                    return Err(EINVAL);
+                }
+                found = Some((iova as u64, length as u64));
+                // SAFETY: `next` points into the same property, past `pos`.
+                pos = usize::try_from(unsafe { next.offset_from(prop) }).map_err(|_| EINVAL)?;
+            } else {
+                // Another device's entry: skip it by its owner's cell count.
+                // SAFETY: A lookup; the reference is dropped right below.
+                let owner = unsafe { bindings::of_find_node_by_phandle(phandle) };
+                if owner.is_null() {
+                    return Err(EINVAL);
+                }
+                // SAFETY: `owner` is a valid node reference.
+                let n = unsafe { bindings::of_dma_region_cells(owner) };
+                // SAFETY: The reference taken by of_find_node_by_phandle().
+                unsafe { bindings::of_node_put(owner) };
+                let n = usize::try_from(n).map_err(|_| EINVAL)?;
+                if n > cells - pos {
+                    return Err(EINVAL);
+                }
+                pos += n;
+            }
+        }
+        let (iova, length) = found.ok_or(ENOENT)?;
+        if length != size {
+            return Err(EINVAL);
+        }
+        Ok((phys, iova, size))
+    }
+
+    /// Checks the firmware segments the AOP runs from DRAM (T6040). The
+    /// bootloader reserves them and lists them in `memory-region`, and each
+    /// one's `iommu-addresses` gives the IOVA the firmware uses for it. The
+    /// IOMMU core maps them in the default domain when the device is added
+    /// (one to one when the IOVA is the physical address, translated
+    /// otherwise), so they are only checked here. Every page has to be mapped
+    /// where the DT says, the external code (`__ETEXT`) at `ec0p` and any
+    /// other segment (`__OS_LOG`) at its physical address.
+    fn check_fw_regions(dev: &device::Device, ec0p: u64) -> Result<()> {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        if np.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: `np` is the device's node, valid while it is bound.
+        let count = unsafe { bindings::of_reserved_mem_region_count(np) };
+        if count <= 0 {
+            dev_err!(dev, "No firmware memory-region from the bootloader");
+            return Err(ENOENT);
+        }
+        // SAFETY: `dev` is a live device being probed.
+        let domain = unsafe { bindings::iommu_get_domain_for_dev(dev.as_raw()) };
+        let ty = if domain.is_null() {
+            bindings::IOMMU_DOMAIN_BLOCKED
+        } else {
+            // SAFETY: `domain` is the non-null domain returned above.
+            unsafe { (*domain).type_ }
+        };
+        if ty == bindings::IOMMU_DOMAIN_IDENTITY || ty == bindings::IOMMU_DOMAIN_BLOCKED {
+            dev_err!(dev, "No translated IOMMU domain for the firmware");
+            return Err(ENODEV);
+        }
+        let mut etext = false;
+        for idx in 0..count {
+            let (phys, iova, size) = Self::fw_region(np, idx).inspect_err(|e| {
+                dev_err!(dev, "Invalid firmware memory-region {} ({:?})", idx, e);
+            })?;
+            if phys % FW_REGION_PAGE != 0
+                || size % FW_REGION_PAGE != 0
+                || size > FW_REGION_MAX_SIZE
+                || iova % FW_REGION_PAGE != 0
+                || iova.checked_add(size).is_none()
+                || phys.checked_add(size).is_none()
+            {
+                dev_err!(dev, "Invalid firmware memory-region {}", idx);
+                return Err(EINVAL);
+            }
+            if iova == ec0p {
+                if etext {
+                    dev_err!(dev, "Two firmware memory-regions at EC0p {:#x}", ec0p);
+                    return Err(EINVAL);
+                }
+                etext = true;
+            } else if iova != phys {
+                dev_err!(
+                    dev,
+                    "Firmware memory-region {} at IOVA {:#x}, neither EC0p {:#x} nor its physical address",
+                    idx,
+                    iova,
+                    ec0p
+                );
+                return Err(EINVAL);
+            }
+            let mut off = 0;
+            while off < size {
+                // SAFETY: `domain` is the device's domain, live while it is
+                // bound.
+                let back =
+                    unsafe { bindings::iommu_iova_to_phys(domain, (iova + off) as _) } as u64;
+                if back != phys + off {
+                    dev_err!(
+                        dev,
+                        "Firmware memory-region {} is not mapped at IOVA {:#x}",
+                        idx,
+                        iova + off
+                    );
+                    return Err(EIO);
+                }
+                off += FW_REGION_PAGE;
+            }
+        }
+        if !etext {
+            dev_err!(dev, "No firmware memory-region at EC0p {:#x}", ec0p);
+            return Err(ENOENT);
+        }
         Ok(())
     }
 
@@ -2195,7 +2390,7 @@ impl rtkit::Buffer for NoBuffer {
     fn iova(&self) -> Result<usize> {
         unreachable!()
     }
-    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
+    fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
         unreachable!()
     }
 }
@@ -2252,6 +2447,12 @@ struct AopHwConfig {
     quiesce_on_unbind: bool,
     /// The endpoints that have to start; empty means all advertised ones.
     required_endpoints: &'static [u8],
+    /// The firmware runs segments from DRAM, which the bootloader reserves
+    /// and lists in `memory-region`; check their IOMMU mappings before
+    /// starting it (T6040).
+    fw_regions: bool,
+    /// Halt the co-processor again when its start fails (T6040).
+    halt_on_failed_start: bool,
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
@@ -2263,6 +2464,8 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
+    fw_regions: false,
+    halt_on_failed_start: false,
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
@@ -2273,6 +2476,8 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
+    fw_regions: false,
+    halt_on_failed_start: false,
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
@@ -2283,6 +2488,8 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
+    fw_regions: false,
+    halt_on_failed_start: false,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
@@ -2293,6 +2500,24 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
+    fw_regions: false,
+    halt_on_failed_start: false,
+};
+/// T6040 (J616s): macOS writes the same four boot arguments as for the
+/// T6020. The firmware's external code and log live in DRAM, mapped through
+/// the reserved regions the bootloader describes; the RTKit firmware is shut
+/// down on unbind.
+const HW_CFG_T6040: AopHwConfig = AopHwConfig {
+    ec0p: 0x0100_00000000,
+    aopt: 0,
+    alig: 64,
+    patch_bootargs: true,
+    epic_v4: false,
+    setup_port: false,
+    quiesce_on_unbind: true,
+    required_endpoints: &[],
+    fw_regions: true,
+    halt_on_failed_start: true,
 };
 /// T8140: the firmware is started with the boot arguments the bootloader
 /// left, boots through the setup port and speaks EPIC version 4. Of the
@@ -2308,11 +2533,12 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     setup_port: true,
     quiesce_on_unbind: true,
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
+    fw_regions: false,
+    halt_on_failed_start: false,
 };
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     <AopDriver as platform::Driver>::IdInfo,
     [
         (of::DeviceId::new(c_str!("apple,t8103-aop")), &HW_CFG_T8103),
@@ -2320,18 +2546,20 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t6000-aop")), &HW_CFG_T6000),
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
+        (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
     ]
 );
 
 impl platform::Driver for AopDriver {
     type IdInfo = &'static AopHwConfig;
+    type Data<'bound> = AopDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(
-        pdev: &platform::Device<Core>,
-        info: Option<&Self::IdInfo>,
-    ) -> impl PinInit<Self, Error> {
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cfg = info.ok_or(ENODEV)?;
         if RETIRED.load(Acquire) {
             dev_err!(
@@ -2343,17 +2571,22 @@ impl platform::Driver for AopDriver {
         // SAFETY: nothing of this device has DMA in flight before probe.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
         let aop_req = pdev.io_request_by_index(0).ok_or(EINVAL)?;
-        let aop_mmio = KBox::pin_init(aop_req.iomap_sized::<AOP_MMIO_SIZE>(), GFP_KERNEL)?;
+        let aop_mmio = aop_req.iomap_sized::<AOP_MMIO_SIZE>()?;
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
-        let asc_mmio = KBox::pin_init(asc_req.iomap_sized::<ASC_MMIO_SIZE>(), GFP_KERNEL)?;
+        let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
+        let asc_mmio = asc_mmio.as_view().relaxed();
+        if cfg.fw_regions {
+            // Before anything is written to the AOP: no mapping, no start.
+            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?;
+        }
         let data = AopData::new(pdev, cfg)?;
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
-        let aop_mmio = aop_mmio.access(pdev.as_ref())?;
+        let aop_mmio = aop_mmio.as_view();
         if cfg.patch_bootargs {
             data.patch_bootargs(
-                aop_mmio,
+                &aop_mmio,
                 &[
                     (from_fourcc(b"EC0p"), cfg.ec0p),
                     (from_fourcc(b"nCal"), 0x0),
@@ -2363,33 +2596,50 @@ impl platform::Driver for AopDriver {
             )?;
         }
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
-        *data.rtkit.lock() = Some(rtkit);
+        data.rtkit.lock().as_mut().set(Some(rtkit));
         if cfg.setup_port {
             AopData::setup_open(&data, pdev.as_ref())?;
         }
-        let asc_mmio = asc_mmio.access(pdev.as_ref())?.relaxed();
-        data.start_cpu(asc_mmio)?;
-        if cfg.setup_port {
+        asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
+        data.cpu_started.store(true, Release);
+        let started = if cfg.setup_port {
             // The RTKit handshake up to AP power on comes first, then the
             // setup port's own power state and endpoint buffers, and only
             // then the AFK endpoints.
-            data.wake()?;
-            data.setup_finish_boot()?;
-            // Before any client reaches the ALS service: a failure here costs
-            // the sensor, not the AOP.
-            if let Err(e) = data.setup_als_calibration() {
-                dev_warn!(pdev.as_ref(), "ALS calibration failed ({:?})", e);
-            }
-            data.start_afk()?;
+            data.wake()
+                .and_then(|()| data.setup_finish_boot())
+                .and_then(|()| {
+                    // Before any client reaches the ALS service: a failure
+                    // here costs the sensor, not the AOP.
+                    if let Err(e) = data.setup_als_calibration() {
+                        dev_warn!(pdev.as_ref(), "ALS calibration failed ({:?})", e);
+                    }
+                    data.start_afk()
+                })
         } else {
-            data.start()?;
+            data.start()
+        };
+        if let Err(e) = started {
+            if cfg.halt_on_failed_start {
+                // The same teardown as the probe guard's (which then does
+                // nothing), then back to the halted state the bootloader
+                // left.
+                data.remove();
+                asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<0>());
+                dev_err!(
+                    pdev.as_ref(),
+                    "Failed to start the AOP ({:?}), halted it again",
+                    e
+                );
+            }
+            return Err(e);
         }
         probe_guard.dismiss();
         let data = data as Arc<dyn AOP>;
         Ok(Self(data))
     }
 
-    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         // The device is still bound here, which the DMA allocations the
         // teardown frees require. Drop only repeats it as a no-op.
         this.0.remove();

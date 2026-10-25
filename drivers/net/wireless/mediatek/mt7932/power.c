@@ -14,6 +14,7 @@ static int mt_power_submit(struct mt7932 *m, u8 mode)
 	m->power_applied_valid = !ret;
 	if (!ret)
 		m->power_applied = mode;
+	dev_dbg(&m->pdev->dev, "POWER_SAVE_SUBMITTED: mode=%u status=%d\n", mode, ret);
 	return ret;
 }
 

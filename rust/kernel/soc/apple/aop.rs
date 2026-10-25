@@ -61,7 +61,7 @@ pub struct SourceRing {
 impl SourceRing {
     /// Wraps a coherent allocation as the source ring.
     pub fn new(buf: Coherent<[u8]>) -> Self {
-        let iova = buf.dma_handle();
+        let iova = buf.dma_address();
         Self { buf, iova }
     }
 

@@ -263,3 +263,63 @@ impl ControlReply {
         }
     }
 }
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_proto)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_message_round_trips() {
+        let op = op_ool_inbound_size(EP_SBIO, 0x1234_5678);
+        let msg = encode_control(&op, 0x42);
+        assert_eq!(msg.msg1, 0);
+        let f = decode(&msg);
+        assert_eq!(f.ep, EP_CONTROL);
+        assert_eq!(f.tag, 0x42);
+        assert_eq!(f.ty, OP_OOL_INBOUND_SIZE);
+        assert_eq!(f.param, EP_SBIO);
+        assert_eq!(f.data_lo, 0x1234_5678);
+    }
+
+    #[test]
+    fn only_entropy_uses_the_reserved_tag() {
+        assert!(op_get_entropy().uses_reserved_tag());
+        assert!(!op_nop(0).uses_reserved_tag());
+        assert!(!op_security_mode().uses_reserved_tag());
+        assert!(TAG_ENTROPY > TAG_POOL_LAST);
+    }
+
+    #[test]
+    fn shmem_registration_encodes_iova_and_size() -> Result {
+        let msg = shmem_registration(0xBEE0_0000, 0x4_0000)?;
+        assert_eq!(msg.msg0, 0x000b_ee00_0040_00fe);
+        assert_eq!(msg.msg1, 0);
+        let f = decode(&msg);
+        assert_eq!(f.ep, EP_SHMEM);
+        assert_eq!(f.ty, 0x40);
+        Ok(())
+    }
+
+    #[test]
+    fn shmem_registration_takes_the_largest_encodable_window() -> Result {
+        let iova = u64::from(u32::MAX) << IOVA_SHIFT;
+        let msg = shmem_registration(iova, 0xff << IOVA_SHIFT)?;
+        let f = decode(&msg);
+        assert_eq!(f.ty, 0xff);
+        assert_eq!(f.data_lo, u32::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn shmem_registration_rejects_unencodable_windows() {
+        // Empty, or not a whole number of pages.
+        assert!(shmem_registration(0xBEE0_0000, 0).is_err());
+        assert!(shmem_registration(0xBEE0_0000, 0x4_0800).is_err());
+        assert!(shmem_registration(0xBEE0_0800, 0x4_0000).is_err());
+        // The size field is eight bits of pages.
+        assert!(shmem_registration(0xBEE0_0000, 0x100 << IOVA_SHIFT).is_err());
+        // The IOVA field is 32 bits of pages.
+        assert!(shmem_registration(1u64 << (32 + IOVA_SHIFT), 0x1000).is_err());
+    }
+}

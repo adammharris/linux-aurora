@@ -1007,7 +1007,7 @@ assert_dc_off(struct intel_display *display)
 
 static int __intel_lt_phy_p2p_write_once(struct intel_encoder *encoder,
 					 int lane, u16 addr, u8 data,
-					 i915_reg_t mac_reg_addr,
+					 intel_reg_t mac_reg_addr,
 					 u8 expected_mac_val)
 {
 	struct intel_display *display = to_intel_display(encoder);
@@ -1062,7 +1062,7 @@ static int __intel_lt_phy_p2p_write_once(struct intel_encoder *encoder,
 
 static void __intel_lt_phy_p2p_write(struct intel_encoder *encoder,
 				     int lane, u16 addr, u8 data,
-				     i915_reg_t mac_reg_addr,
+				     intel_reg_t mac_reg_addr,
 				     u8 expected_mac_val)
 {
 	struct intel_display *display = to_intel_display(encoder);
@@ -1086,7 +1086,7 @@ static void __intel_lt_phy_p2p_write(struct intel_encoder *encoder,
 
 static void intel_lt_phy_p2p_write(struct intel_encoder *encoder,
 				   u8 lane_mask, u16 addr, u8 data,
-				   i915_reg_t mac_reg_addr,
+				   intel_reg_t mac_reg_addr,
 				   u8 expected_mac_val)
 {
 	int lane;
@@ -1976,7 +1976,8 @@ void intel_lt_phy_pll_enable(struct intel_encoder *encoder,
 		 * Change. We handle this step in bxt_set_cdclk().
 		 */
 		/* 10. Program DDI_CLK_VALFREQ to match intended DDI clock frequency. */
-		intel_de_write(display, DDI_CLK_VALFREQ(encoder->port), port_clock);
+		intel_de_write(display, DDI_CLK_VALFREQ(encoder->port),
+			       intel_ddi_link_symbol_clock(encoder, port_clock));
 
 		/* 11. Program PORT_CLOCK_CTL[PCLK PLL Request LN0] = 1. */
 		intel_de_rmw(display, XELPDP_PORT_CLOCK_CTL(display, port),
@@ -2023,7 +2024,8 @@ void intel_lt_phy_pll_enable(struct intel_encoder *encoder,
 			     lane_phy_pulse_status,
 			     lane_phy_pulse_status);
 	} else {
-		intel_de_write(display, DDI_CLK_VALFREQ(encoder->port), port_clock);
+		intel_de_write(display, DDI_CLK_VALFREQ(encoder->port),
+			       intel_ddi_link_symbol_clock(encoder, port_clock));
 	}
 
 	/*
@@ -2131,7 +2133,7 @@ void intel_lt_phy_set_signal_levels(struct intel_encoder *encoder,
 
 	wakeref = intel_lt_phy_transaction_begin(encoder);
 
-	trans = encoder->get_buf_trans(encoder, crtc_state, &n_entries);
+	trans = intel_ddi_buf_trans_get(encoder, crtc_state, &n_entries);
 	if (drm_WARN_ON_ONCE(display->drm, !trans)) {
 		intel_lt_phy_transaction_end(encoder, wakeref);
 		return;
@@ -2174,8 +2176,9 @@ void intel_lt_phy_dump_hw_state(struct drm_printer *p,
 {
 	int i, j;
 
-	drm_printf(p, "lt_phy_pll_hw_state: lane count: %d, ssc enabled: %d, tbt mode: %d\n",
-		   hw_state->lane_count, hw_state->ssc_enabled, hw_state->tbt_mode);
+	drm_printf(p, "lt_phy_pll_hw_state: lane count: %d, ssc enabled: %s, tbt mode: %s\n",
+		   hw_state->lane_count, str_yes_no(hw_state->ssc_enabled),
+		   str_yes_no(hw_state->tbt_mode));
 
 	for (i = 0; i < 3; i++) {
 		drm_printf(p, "config[%d] = 0x%.4x,\n",
@@ -2217,6 +2220,14 @@ static bool intel_lt_phy_pll_is_enabled(struct intel_encoder *encoder)
 			     XELPDP_LANE_PCLK_PLL_ACK(0);
 }
 
+static bool readout_ssc_state(struct intel_encoder *encoder)
+{
+	struct intel_display *display = to_intel_display(encoder);
+
+	return intel_de_read(display, XELPDP_PORT_CLOCK_CTL(display, encoder->port)) &
+		XELPDP_SSC_ENABLE_PLLA;
+}
+
 bool intel_lt_phy_tbt_pll_readout_hw_state(struct intel_display *display,
 					   struct intel_dpll *pll,
 					   struct intel_dpll_hw_state *hw_state)
@@ -2246,6 +2257,7 @@ bool intel_lt_phy_pll_readout_hw_state(struct intel_encoder *encoder,
 	owned_lane_mask = intel_lt_phy_get_owned_lane_mask(encoder);
 	lane = owned_lane_mask & INTEL_LT_PHY_LANE0 ? : INTEL_LT_PHY_LANE1;
 	wakeref = intel_lt_phy_transaction_begin(encoder);
+	pll_state->ssc_enabled = readout_ssc_state(encoder);
 
 	pll_state->lane_count = intel_readout_lane_count(encoder, INTEL_LT_PHY_LANE0,
 							 INTEL_LT_PHY_LANE1);

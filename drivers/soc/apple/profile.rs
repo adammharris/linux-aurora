@@ -16,17 +16,21 @@
 //! * `T6000` / J316s (MacBook Pro 16", M1 Pro): the T8103 boot handshake and
 //!   key store, with the sensor on the T6020 SPI2 address.
 //! * `T6020` / J414s (MacBook Pro 14", M2 Pro): the driver does the warm
-//!   single-message registration over a 0x40000 window.
+//!   single-message registration over a 0x40000 window. Before system
+//!   firmware 26.3 the enclave speaks the T8103 key store.
 //! * `T8140` / J700 (MacBook Neo, A18 Pro): iBoot boots sepOS before the AP
 //!   OS, so the driver uses the warm registration path.
 //! * `T8112` / J413, J415 (MacBook Air, M2): iBoot hands over a running SEP and
 //!   a powered sensor, so the driver uses the warm registration path.
+//! * `T8122` / J613, J615 (MacBook Air, M3): the T8112 warm registration with
+//!   the T8140 SEP DART aperture above 4 GiB.
 
 // The boot handshake, identity source, sensor and DART fields are consumed by
 // the boot-endpoint, identity and sensor-transport paths.
 #![allow(dead_code)]
 
 use kernel::of;
+use kernel::pr_info_once;
 use kernel::prelude::*;
 
 /// How the driver brings the shared-memory table to the SEP.
@@ -47,7 +51,8 @@ pub(crate) enum IdentitySource {
     /// and the boot chain forwards. A malformed or absent property is refused;
     /// the identity is never invented.
     Chosen,
-    /// A UUID provisioned in the Linux host-state store on first bring-up.
+    /// Reserved declaration; the current selector does not implement this policy.
+    /// Wiring it up on an enrolled install would change its anti-replay lane.
     HostPersisted,
 }
 
@@ -95,23 +100,24 @@ pub(crate) struct SensorProfile {
 
 /// Identity keybag `CREATE_KEYBAG` field encoding. The first word is the
 /// codec's struct version: the 13.5 enclave (T8103) takes versions 0-2 only
-/// and macOS creates an identity with version 2, while the T6020 enclave takes
-/// variant 5. Kept per-SoC so the T8103 path is correct without disturbing the
-/// proven T6020 encoding (hardware-verified for enrol, match, and reboot).
+/// and an identity is created with version 2, while the T6020 enclave on
+/// newer system firmware takes variant 5. Kept per profile so the T8103 path
+/// is correct without disturbing the proven T6020 encoding (hardware-verified
+/// for enrol, match, and reboot).
 pub(crate) struct KeybagCreate {
     /// First word: struct version (request variant), echoed back in the reply.
     pub(crate) variant: u32,
-    /// Third word: bag type. Identity is `0x400000` on 13.5; `0` on T6020,
-    /// which distinguishes the bag by the variant word instead.
+    /// Third word: bag type. Identity is `0x400000` on 13.5; `0` on variant
+    /// 5, which distinguishes the bag by the variant word instead.
     pub(crate) bag_type: u32,
     /// Fourth word: create argument / parent handle.
     pub(crate) arg: i32,
 }
 
 /// Which key-store protocol the enclave speaks. It follows the sepOS the
-/// firmware hands the SEP, not the SoC alone: the T8103 stub boots macOS 13.5
-/// (22G74)'s sepOS, whose request shapes are those of the 13.5
-/// key store; the T6020 sepOS is newer.
+/// firmware hands the SEP, not the SoC alone: the T8103 stub boots the 13.5
+/// (22G74) sepOS, whose request shapes are the 13.5 ones; the T6020 sepOS
+/// speaks them too before system firmware 26.3 (see [`t6020_profile`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyStore {
     /// macOS 13.5's key store. Before any other request the endpoint is
@@ -292,6 +298,24 @@ pub(crate) const T6020: PlatformProfile = PlatformProfile {
     xart_guard: 1,
 };
 
+/// M2 Pro/Max on system firmware before 26.3. Their enclave refuses the
+/// variant-5 create (status -13, empty reply: J414s on 26.0, J416s on 26.2)
+/// and takes the 13.5 key store, as T8103 does; J414s on 26.0 enrols,
+/// matches, signs with the reference key and restores after a reboot this way.
+/// Everything else is [`T6020`].
+pub(crate) const T6020_SEPOS13: PlatformProfile = PlatformProfile {
+    name: "T6020/J414s (13.5 key store)",
+    keybag_create: KeybagCreate {
+        variant: T8103.keybag_create.variant,
+        bag_type: T8103.keybag_create.bag_type,
+        arg: T8103.keybag_create.arg,
+    },
+    key_store: KeyStore::Sepos13 {
+        cpx_encryption_mode: 2,
+    },
+    ..T6020
+};
+
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
 /// (0x3356), and a SEP DART aperture above 4 GiB. These values describe that
 /// board; device-tree nodes remain authoritative for addresses and resources.
@@ -339,7 +363,7 @@ pub(crate) const T8140: PlatformProfile = PlatformProfile {
 /// carries `cpx-encryption-mode = 2`.
 ///
 /// The shared-memory geometry and key-store dialect follow the other
-/// warm-registration platforms (T6020, T8140).
+/// warm-registration platforms (T6020 on current firmware, T8140).
 pub(crate) const T8112: PlatformProfile = PlatformProfile {
     name: "T8112/J415",
     shmem_capacity: 0x4_0000,
@@ -362,7 +386,7 @@ pub(crate) const T8112: PlatformProfile = PlatformProfile {
     firmware_region: c"sepfw",
     // J415 accepted the 13.5 GET_CAPABILITIES/SET_ENV init but refused the
     // strict CREATE_KEYBAG (mailbox status -1, empty reply), as J700 did;
-    // use the T6020 form like the other warm-registration platforms.
+    // use the variant-5 form like the other warm-registration platforms.
     keybag_create: KeybagCreate {
         variant: 5,
         bag_type: 0,
@@ -373,6 +397,33 @@ pub(crate) const T8112: PlatformProfile = PlatformProfile {
     nonce_session: false,
     // Guarded from its first Linux boot (2026-10-16): no record refused.
     xart_guard: 1,
+};
+
+/// MacBook Air M3 (J613, J615). The J613 and J615 ADTs (26.6.2, 25G83) are
+/// wired identically: the Mesa sensor (`R3`) sits on spi2 at `0x2a1108000`,
+/// 8 MHz, chip select 0, with the same `reg` bytes as J415's, so this keeps
+/// J415's SPI mode. Its power is on the NUB GPIO controller (pin 29), not an
+/// AP GPIO, and its data-ready line is AP GPIO 199. The SEP is
+/// `iop-sep,ascwrap-v6` and its DART's input aperture is
+/// `0x100_0000_4000 + 0xffff0000`, the BIT(40) alias J700 uses, so this needs
+/// the wide DMA mask. `/defaults` carries `cpx-encryption-mode = 2`.
+///
+/// Otherwise a warm-registration platform like T8112: the shared-memory
+/// geometry and key-store dialect follow it. J613 on system firmware 27.0
+/// (OS firmware 26.6.2) attaches, provisions the keybag, enrols, matches and
+/// restores the enrolment after a reboot; J615 has not been run.
+pub(crate) const T8122: PlatformProfile = PlatformProfile {
+    name: "T8122/J613",
+    sensor: SensorProfile {
+        controller_base: 0x2_a110_8000,
+        ..T8112.sensor
+    },
+    wide_dma_mask: true,
+    // Not T8112's 32-bit window: this DART needs the wide mask.
+    dart_window: &DART_HIGH_ALIAS,
+    // A warm-attach enclave shared with macOS, as on T8112.
+    xart_guard: 1,
+    ..T8112
 };
 
 static_assert!(T8103.shmem_capacity == 0x30000);
@@ -387,6 +438,9 @@ static_assert!(T6000.sensor.controller_base == T6020.sensor.controller_base);
 static_assert!(T6000.sensor.expected_id == T6020.sensor.expected_id);
 static_assert!(T8112.shmem_capacity == T6020.shmem_capacity);
 static_assert!(T8112.sensor.controller_base == T8103.sensor.controller_base);
+static_assert!(T8122.shmem_capacity == T8112.shmem_capacity);
+static_assert!(T8122.sensor.controller_base == 0x2a1108000);
+static_assert!(T8122.wide_dma_mask);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -415,6 +469,82 @@ pub(crate) fn machine_has(compatible: &[u8]) -> bool {
     false
 }
 
+/// iBoot builds before 26.3's (betas 13822.80, release 13822.81) get the 13.5
+/// key store. The 26.0 and 26.2 enclaves refuse the variant-5 create, while
+/// 26.6.2 and 27.0 take it; 26.3 to 26.5 are untested and keep variant 5, as
+/// before. Firmware from 26.4 on has an `mBoot-` build and never gets here.
+const T6020_SEPOS13_BEFORE: (u32, u32) = (13822, 80);
+
+/// The leading `major.minor` of an `iBoot-` build string, as m1n1 copies the
+/// machine's own iBoot into `asahi,iboot1-version` ("iBoot-13822.61.10").
+/// Anything else, including an `mBoot-` build, yields `None`. Unlike
+/// `asahi,system-fw-version`, this does not depend on m1n1's version table,
+/// so every m1n1 gives the same answer.
+fn parse_iboot_build(raw: &[u8]) -> Option<(u32, u32)> {
+    fn number(text: &[u8]) -> Option<(u32, &[u8])> {
+        let digits = text.iter().take_while(|byte| byte.is_ascii_digit()).count();
+        if digits == 0 || digits > 6 {
+            return None;
+        }
+        let value = text[..digits]
+            .iter()
+            .fold(0u32, |value, &byte| value * 10 + u32::from(byte - b'0'));
+        Some((value, &text[digits..]))
+    }
+
+    let text = match raw.iter().position(|&byte| byte == 0) {
+        Some(end) => &raw[..end],
+        None => raw,
+    };
+    let (major, rest) = number(text.strip_prefix(b"iBoot-")?)?;
+    let (minor, rest) = number(rest.strip_prefix(b".")?)?;
+    match rest.first() {
+        None | Some(b'.') => Some((major, minor)),
+        Some(_) => None,
+    }
+}
+
+fn t6020_uses_sepos13(iboot: Option<&[u8]>) -> bool {
+    iboot
+        .and_then(parse_iboot_build)
+        .is_some_and(|build| build < T6020_SEPOS13_BEFORE)
+}
+
+fn chosen_string(name: &CStr) -> Option<KVec<u8>> {
+    of::chosen()?.get_property::<KVec<u8>>(name).ok()
+}
+
+/// A `/chosen` string for the log, without its NUL.
+fn shown(raw: &Option<KVec<u8>>) -> &kernel::str::BStr {
+    let raw = raw.as_deref().unwrap_or(&b"none"[..]);
+    let end = raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len());
+    kernel::str::BStr::from_bytes(&raw[..end])
+}
+
+/// The M2 Pro/Max profile for the machine's system firmware. Only an iBoot
+/// build before 26.3's selects the 13.5 key store; anything else, including
+/// a missing property, keeps [`T6020`], so a machine that works today keeps
+/// the encoding it works with.
+fn t6020_profile() -> &'static PlatformProfile {
+    let iboot = chosen_string(c"asahi,iboot1-version");
+    let firmware = chosen_string(c"asahi,system-fw-version");
+    let os_firmware = chosen_string(c"asahi,os-fw-version");
+    let sepos13 = t6020_uses_sepos13(iboot.as_deref());
+    let profile = if sepos13 { &T6020_SEPOS13 } else { &T6020 };
+    pr_info_once!(
+        "M2 Pro/Max on system firmware {} ({}), OS firmware {}: using {}\n",
+        shown(&firmware),
+        shown(&iboot),
+        shown(&os_firmware),
+        if sepos13 {
+            "the 13.5 key store"
+        } else {
+            "the variant-5 key store"
+        }
+    );
+    profile
+}
+
 /// Select the profile for the running machine. An unsupported SoC is refused
 /// rather than guessed at, so the driver cannot run a handshake with the wrong
 /// geometry.
@@ -423,7 +553,7 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
         return Ok(&T8103);
     }
     if machine_has(b"apple,t6020") {
-        return Ok(&T6020);
+        return Ok(t6020_profile());
     }
     // t6020.dtsi is defined as a cut-down t6021: it includes t6021.dtsi and
     // disables the parts the smaller die lacks. Both pull in t602x-die0.dtsi,
@@ -431,7 +561,7 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     // with the same interrupts on either part, and the T6020 constants apply
     // to the M2 Max unchanged.
     if machine_has(b"apple,t6021") {
-        return Ok(&T6020);
+        return Ok(t6020_profile());
     }
     if machine_has(b"apple,t6000") {
         return Ok(&T6000);
@@ -452,9 +582,65 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     if machine_has(b"apple,t8112") {
         return Ok(&T8112);
     }
+    // Only the boards whose ADTs were read: the other T8122 Macs (J433, J434,
+    // J504) share the SoC but their sensor wiring is unchecked.
+    if machine_has(b"apple,t8122") && (machine_has(b"apple,j613") || machine_has(b"apple,j615")) {
+        return Ok(&T8122);
+    }
     Err(ENODEV)
 }
 
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_profile)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_firmware_uses_the_legacy_key_store() {
+        assert!(t6020_uses_sepos13(Some(b"iBoot-13822.79.1\0")));
+        assert!(t6020_uses_sepos13(Some(b"iBoot-13821.999\0")));
+        assert!(!t6020_uses_sepos13(Some(b"iBoot-13822.80\0")));
+        assert!(!t6020_uses_sepos13(Some(b"iBoot-13822.81.2\0")));
+    }
+
+    #[test]
+    fn unknown_firmware_preserves_the_current_dialect() {
+        assert!(!t6020_uses_sepos13(None));
+        for raw in [
+            &b""[..],
+            &b"mBoot-1.2"[..],
+            &b"iBoot-.2"[..],
+            &b"iBoot-1."[..],
+            &b"iBoot-1234567.2"[..],
+            &b"iBoot-1.1234567"[..],
+            &b"iBoot-1.2x"[..],
+        ] {
+            assert!(!t6020_uses_sepos13(Some(raw)));
+        }
+    }
+
+    #[test]
+    fn neo_keeps_its_existing_chosen_identity_policy() {
+        // A host-persisted default would strand existing chosen-lane enrolments.
+        assert!(T8140.identity == IdentitySource::Chosen);
+    }
+
+    #[test]
+    fn profile_extensions_preserve_authenticated_neo_geometry() {
+        assert!(T8140.nonce_session);
+        assert!(T8140.wide_dma_mask);
+        assert!(!T6020_SEPOS13.nonce_session);
+        assert!(matches!(T6020_SEPOS13.key_store, KeyStore::Sepos13 { .. }));
+        assert!(T6020_SEPOS13.shmem_capacity == T6020.shmem_capacity);
+        assert!(T6020_SEPOS13.sensor.controller_base == T6020.sensor.controller_base);
+        assert!(!T8122.nonce_session);
+        assert!(T8122.wide_dma_mask);
+        assert!(T8122.shmem_capacity == T8112.shmem_capacity);
+        assert!(T8122.sensor.controller_base == 0x2_a110_8000);
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
 #[kernel::macros::kunit_tests(apple_sep_dart_window)]
 mod dart_window_tests {
     use super::*;
@@ -481,7 +667,7 @@ mod dart_window_tests {
 
     #[test]
     fn the_other_profiles_keep_the_bit40_window() {
-        for profile in [&T8103, &T6000, &T6020, &T8140] {
+        for profile in [&T8103, &T6000, &T6020, &T8140, &T6020_SEPOS13, &T8122] {
             assert_eq!(offset(profile.dart_window), 1 << 40);
             assert_eq!(range(profile.dart_window), (0, 1 << 32));
         }

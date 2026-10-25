@@ -28,6 +28,22 @@ config TYPEC_SN201202X
 	  If you choose to build this driver as a dynamically linked module, the
 	  module will be called sn201202x.ko.
 
+config TYPEC_TPS6598X_DEBUG_COMMANDS
+	bool "Debugfs command access to TPS6598x/CD321x controllers"
+	depends on TYPEC_TPS6598X_CORE && DEBUG_FS
+	help
+	  Add a root-only debugfs file, usb/tipd/<device>/command, that sends
+	  a few controller commands (LOCK, DBMa, VDMs, DVEn and DISC) to the
+	  USB Power Delivery controller. Tools such as tuxvdmtool use it to
+	  send Apple VDMs (reboot, DFU, serial, Debug USB) to a Mac connected
+	  to the port, or to enable the local end of a debug route.
+
+	  These commands can disconnect the port or reboot the connected
+	  device. The read-only register file, usb/tipd/<device>/regs, is
+	  available with DEBUG_FS whether or not this is set.
+
+	  Say N unless you use the controller's debug mode for development.
+
 config TYPEC_TIPD_KUNIT_TEST
 	tristate "KUnit tests for CD321x" if !KUNIT_ALL_TESTS
 	depends on KUNIT && TYPEC_TPS6598X_CORE

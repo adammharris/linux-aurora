@@ -37,6 +37,9 @@ struct epic_cmd_info {
 	dma_addr_t txbuf_dma;
 	size_t rxlen;
 	size_t txlen;
+	/* DMA allocation lengths above stay immutable until buffers are freed. */
+	size_t reply_len;
+	bool reply_len_valid;
 
 	u32 retcode;
 	bool done;
@@ -154,6 +157,25 @@ static inline void afk_service_put(struct apple_epic_service *service)
 		service->users--;
 	spin_unlock_irqrestore(&service->lock, flags);
 	afk_service_retry(service->ep);
+}
+
+/*
+ * Take another pin on a service the caller already keeps pinned, e.g. an
+ * owner pointer read under the owner's lock. Unlike afk_service_get() this
+ * also succeeds after teardown, so a close can still be issued.
+ */
+static inline struct apple_epic_service *afk_service_pin(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	if (!service)
+		return NULL;
+
+	spin_lock_irqsave(&service->lock, flags);
+	service->users++;
+	spin_unlock_irqrestore(&service->lock, flags);
+
+	return service;
 }
 
 static inline void afk_service_disable(struct apple_epic_service *service)
@@ -487,4 +509,12 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 				 size_t output_pad, unsigned int timeout_ms,
 				 size_t *received);
 
+/* Strict variants return only firmware-reported bytes; legacy callers unchanged. */
+int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
+		const void *payload, size_t payload_len, void *output,
+		size_t output_len, u32 *retcode, size_t *reply_len);
+int afk_service_call_with_reply_len(struct apple_epic_service *service,
+		u16 group, u32 command, const void *data, size_t data_len,
+		size_t data_pad, void *output, size_t output_len,
+		size_t output_pad, size_t *reply_len);
 #endif

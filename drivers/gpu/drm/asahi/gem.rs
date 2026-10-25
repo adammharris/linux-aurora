@@ -8,17 +8,23 @@
 //! implementing RTKit buffers on top of GEM objects for firmware use.
 
 use kernel::{
-    drm,
-    drm::gem::{
-        shmem,
-        shmem::VMap,
-        BaseObject,
-        DriverObject,
-        IntoGEMObject, //
+    drm::{
+        self,
+        gem::{
+            shmem::{
+                self,
+                VMapOwned, //
+            },
+            BaseObject,
+            DriverObject,
+            IntoGEMObject, //
+        }, //
     },
     error::Result,
+    new_mutex,
     prelude::*,
     sync::aref::ARef,
+    sync::Mutex,
     uapi, //
 };
 
@@ -32,12 +38,12 @@ use core::sync::atomic::{
 use crate::{
     debug::*,
     driver::{
-        AsahiDevice,
-        AsahiDriver, //
+        AsahiDrmDevice,
+        AsahiDrmDriver, //
     },
     file,
+    memacct,
     mmu,
-    util::*, //
 };
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gem;
@@ -57,6 +63,11 @@ pub(crate) struct AsahiObject {
     kernel: bool,
     /// Driver aliases outside the user GPUVA tree; they pin the backing.
     kernel_mappings: AtomicU64,
+    /// Memory accounting and process attribution of the held backing.
+    charge: memacct::Charge,
+    /// Serializes overlapping timestamp writes through every binding of this BO.
+    #[pin]
+    pub(crate) timestamp_lock: Mutex<()>,
 }
 
 /// Type alias for the shmem GEM object type for this driver.
@@ -71,6 +82,9 @@ pub(crate) type Object = shmem::Object<AsahiObject>;
 /// comes with unevictable, as `mapping_set_inaccessible()` sets it; nothing reads or writes a GEM
 /// shmem file through its mapping. Releasing idle backing or purging clears the mark, so the
 /// released pages can be swapped and migrated again.
+///
+/// The same transitions charge and uncharge the held pages (see [`memacct`]): a held user object
+/// counts towards the resident set of the process that created it.
 pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
     let raw = gem.as_raw();
     // SAFETY: `gem` keeps the GEM object alive. A shmem-backed object's `filp` and its
@@ -96,12 +110,16 @@ pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
     } else {
         flags.fetch_and(!inaccessible, Ordering::Relaxed);
     }
+    gem.charge.set_held(held);
 }
 
-/// Takes an owned SG table of `gem`, which holds its pages for the device, and marks the
+/// Takes the SG table of `gem`, which holds its pages for the device, and marks the
 /// object held (see [`set_mapping_held`]).
-pub(crate) fn held_sg_table(gem: &Object) -> Result<shmem::SGTable<AsahiObject>> {
-    let sgt = gem.owned_sg_table()?;
+pub(crate) fn held_sg_table<'a>(
+    gem: &'a Object,
+    dev: &'a kernel::device::Device<kernel::device::Bound>,
+) -> Result<shmem::SGTable<'a, AsahiObject>> {
+    let sgt = gem.sg_table(dev)?;
     set_mapping_held(gem, true);
     Ok(sgt)
 }
@@ -109,9 +127,7 @@ pub(crate) fn held_sg_table(gem: &Object) -> Result<shmem::SGTable<AsahiObject>>
 /// VM-private BOs share their assigned VM's reservation object. Validate this
 /// before acquiring mapping state; generic GPUVM accepts external shareable BOs.
 pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
-    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
-        && vm.is_extobj(gem)
-    {
+    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0 && vm.is_extobj(gem) {
         return Err(EINVAL);
     }
     Ok(())
@@ -120,15 +136,13 @@ pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
 unsafe impl Send for AsahiObject {}
 unsafe impl Sync for AsahiObject {}
 
-// /// Type alias for the SGTable type for this driver.
-// pub(crate) type SGTable = shmem::SGTable<AsahiObject>;
-
 /// A shared reference to a GEM object for this driver.
 pub(crate) struct ObjectRef {
     /// The underlying GEM object reference
     pub(crate) gem: ARef<Object>,
     /// The kernel-side VMap of this object, if needed
-    vmap: Option<VMap<AsahiObject, u8>>,
+    // vmap: Option<VMapOwned::<u8, AsahiObject>>,
+    vmap: Option<VMapOwned<AsahiObject, 0>>,
 }
 
 crate::no_debug!(ObjectRef);
@@ -142,11 +156,11 @@ impl ObjectRef {
     }
 
     /// Return the `VMap` for this object, creating it if necessary.
-    pub(crate) fn vmap(&mut self) -> Result<shmem::VMapRef<'_, AsahiObject, u8>> {
+    pub(crate) fn vmap(&mut self) -> Result<&shmem::VMapOwned<AsahiObject, 0>> {
         if self.vmap.is_none() {
-            self.vmap = Some(self.gem.owned_vmap()?);
+            self.vmap = Some(self.gem.owned_vmap::<0>()?);
         }
-        self.gem.vmap()
+        self.vmap.as_ref().ok_or(EINVAL)
     }
 
     /// Returns the size of an object in bytes
@@ -199,7 +213,7 @@ impl ObjectRef {
     ) -> Result<crate::mmu::KernelMapping> {
         validate_vm_binding(&self.gem, vm)?;
 
-        vm.map_at(addr, self.gem.size(), self.gem.clone(), prot, guard)
+        vm.map_at(addr, self.gem.size(), &self.gem, prot, guard)
     }
 }
 
@@ -207,10 +221,11 @@ pub(crate) struct AsahiObjConfig {
     flags: u32,
     exportable: bool,
     kernel: bool,
+    charge: memacct::Charge,
 }
 
 /// Create a new kernel-owned GEM object.
-pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+pub(crate) fn new_kernel_object(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
     new_kernel_object_mapped(dev, size, false)
 }
 
@@ -218,16 +233,30 @@ pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<Object
 ///
 /// Used for memory that a non-coherent agent reads as soon as the host has stored to it and
 /// issued a barrier, without cache maintenance.
-pub(crate) fn new_kernel_object_wc(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+pub(crate) fn new_kernel_object_wc(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
     new_kernel_object_mapped(dev, size, true)
 }
 
-fn new_kernel_object_mapped(dev: &AsahiDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
+/// Validate before rounding: wrapping a user size can create a much smaller
+/// backing than requested (or panic with overflow checks). Kernel callers use
+/// the same boundary so malformed calculated sizes cannot bypass this check.
+pub(crate) fn checked_object_size(size: usize) -> Result<usize> {
+    if size == 0 {
+        return Err(EINVAL);
+    }
+    size.checked_add(mmu::UAT_PGMSK)
+        .map(|rounded| rounded & !mmu::UAT_PGMSK)
+        .ok_or(EOVERFLOW)
+}
+
+fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
+    let size = checked_object_size(size)?;
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
-        align(size, mmu::UAT_PGSZ),
+        size,
         shmem::ObjectConfig::<AsahiObject> {
             reclaimable_cpu_mappings: false,
+            pages_no_reclaim: false,
             map_wc,
             parent_resv_obj: None,
         },
@@ -235,6 +264,7 @@ fn new_kernel_object_mapped(dev: &AsahiDevice, size: usize, map_wc: bool) -> Res
             flags: 0,
             exportable: false,
             kernel: true,
+            charge: memacct::Charge::kernel(&memacct::LEDGER, size as u64),
         },
     )?;
 
@@ -244,12 +274,17 @@ fn new_kernel_object_mapped(dev: &AsahiDevice, size: usize, map_wc: bool) -> Res
 }
 
 /// Create a new user-owned GEM object with the given flags.
+///
+/// `commit` is the admission of `size` (already rounded by [`checked_object_size`]) for the
+/// creating client; the object is attributed to the current process.
 pub(crate) fn new_object(
-    dev: &AsahiDevice,
+    dev: &AsahiDrmDevice,
     size: usize,
     flags: u32,
     parent_object: Option<&shmem::Object<AsahiObject>>,
     reclaim_cpu: bool,
+    pages_no_reclaim: bool,
+    commit: memacct::Commit,
 ) -> Result<ARef<Object>> {
     if (flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0) != parent_object.is_some()
     {
@@ -258,9 +293,10 @@ pub(crate) fn new_object(
 
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
-        align(size, mmu::UAT_PGSZ),
+        checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
             reclaimable_cpu_mappings: parent_object.is_some() && reclaim_cpu,
+            pages_no_reclaim,
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
             parent_resv_obj: parent_object,
         },
@@ -268,6 +304,7 @@ pub(crate) fn new_object(
             flags,
             exportable: parent_object.is_none(),
             kernel: false,
+            charge: memacct::Charge::user_current(commit),
         },
     )?;
 
@@ -277,13 +314,13 @@ pub(crate) fn new_object(
 
 #[vtable]
 impl DriverObject for AsahiObject {
-    type Driver = AsahiDriver;
+    type Driver = AsahiDrmDriver;
     type Args = AsahiObjConfig;
 
     const HAS_EXPORT: bool = true;
 
     /// Callback to create the inner data of a GEM object
-    fn new(_dev: &AsahiDevice, size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
+    fn new(_dev: &AsahiDrmDevice, size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
         let id = GEM_ID.fetch_add(1, Ordering::Relaxed);
         mod_pr_debug!("AsahiObject::new id={}\n", id);
         try_pin_init!(AsahiObject {
@@ -293,16 +330,22 @@ impl DriverObject for AsahiObject {
             exportable: args.exportable,
             kernel: args.kernel,
             kernel_mappings: AtomicU64::new(0),
+            charge: args.charge,
+            timestamp_lock <- new_mutex!((), "Asahi timestamp stores"),
         })
     }
 
     /// Objects the DRM core allocates for us (dma-bufs imported from other devices and dumb
     /// buffers) are shared user objects, like a GEM_CREATE object without flags.
-    fn core_object_args(_dev: &AsahiDevice, _size: usize) -> Result<Self::Args> {
+    ///
+    /// Their memory is not counted: an import's backing belongs to, and is charged by, its
+    /// exporter, and the driver offers no dumb buffers (it has no KMS).
+    fn core_object_args(_dev: &AsahiDrmDevice, _size: usize) -> Result<Self::Args> {
         Ok(AsahiObjConfig {
             flags: 0,
             exportable: true,
             kernel: false,
+            charge: memacct::Charge::none(),
         })
     }
 
@@ -357,9 +400,31 @@ impl Drop for KernelMappingPin {
 }
 
 impl AsahiObject {
+    /// Whether CPU mappings use the cacheable WRITEBACK policy.
+    pub(crate) fn is_writeback(&self) -> bool {
+        self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK != 0
+    }
+
     pub(crate) fn idle_reclaim_candidate(&self) -> bool {
         !self.kernel && !self.exportable && self.kernel_mappings.load(Ordering::Acquire) == 0
     }
+}
+
+/// Populates and pins a new user object through its DMA mapping, before any CPU view exists.
+///
+/// On a device that is not DMA-coherent, the DMA mapping cleans the cacheable kernel alias of the
+/// freshly zeroed pages to the point of coherency, so that no dirty line can later overwrite data
+/// written through a write-combined view. The pin keeps reclaim from creating a new cacheable
+/// alias. Only used when the GPU asks for it ([`crate::gpu::Gpu::prepare_new_objects`]).
+///
+pub(crate) fn prepare_new_object(
+    gem: &Object,
+    dev: &kernel::device::Device<kernel::device::Bound>,
+) -> Result {
+    // The native backend requires a non-coherent DMA device. Use its DMA mapping
+    // rather than interpreting DMA addresses as CPU physical addresses.
+    let _sgt = held_sg_table(gem, dev)?;
+    Ok(())
 }
 
 /// Purge advice for a VM-private, non-exportable object. Returns whether the
@@ -369,4 +434,24 @@ pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
         return Err(EINVAL);
     }
     Ok(u32::from(gem.madvise(i32::from(dontneed))))
+}
+
+/// Large user BOs have a cheap ENOMEM fallback instead of per-folio reclaim.
+/// Keep ordinary resource allocations and kernel-owned backing on their existing
+/// policy. 256 MiB also matches Mesa's maximum reusable BO-cache footprint.
+pub(crate) fn user_pages_no_reclaim(size: usize, g17: bool) -> bool {
+    g17 && size >= 256 * 1024 * 1024
+}
+
+#[kernel::macros::kunit_tests(asahi_gem_allocation_policy)]
+mod allocation_policy_tests {
+    use super::*;
+
+    #[test]
+    fn large_user_backing() {
+        assert!(!user_pages_no_reclaim(256 * 1024 * 1024 - 1, true));
+        assert!(user_pages_no_reclaim(256 * 1024 * 1024, true));
+        assert!(user_pages_no_reclaim(3_257_113_344, true));
+        assert!(!user_pages_no_reclaim(3_257_113_344, false));
+    }
 }

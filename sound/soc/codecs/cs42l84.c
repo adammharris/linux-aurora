@@ -10,6 +10,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/cleanup.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/kernel.h>
@@ -17,7 +18,6 @@
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/i2c.h>
-#include <linux/gpio.h>
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
@@ -52,6 +52,7 @@ struct cs42l84_private {
 	u8 pll_mclk_f;
 	u32 srate;
 	u8 stream_use;
+	bool dsp_a;
 	int hs_type;
 	bool remote_active;
 	unsigned int remote_btn1_prev;
@@ -93,13 +94,24 @@ static int cs42l84_put_dac_vol(struct snd_kcontrol *kctl,
 {
 	struct snd_soc_component *component = snd_kcontrol_chip(kctl);
 	struct soc_mixer_control *mc = (struct soc_mixer_control *) kctl->private_value;
+	long range = mc->max - mc->min;
 	int vola, volb;
 	int ret, ret2, updated = 0;
+
+	/* Check the user values as longs, before they are narrowed to int. */
+	if (val->value.integer.value[0] < 0 || val->value.integer.value[0] > range ||
+	    val->value.integer.value[1] < 0 || val->value.integer.value[1] > range)
+		return -EINVAL;
 
 	vola = val->value.integer.value[0] + mc->min;
 	volb = val->value.integer.value[1] + mc->min;
 
 	if (vola < mc->min || vola > mc->max || volb < mc->min || volb > mc->max)
+		return -EINVAL;
+
+	/* A machine driver's snd_soc_limit_volume() ceiling, as the stock volsw put enforces */
+	if (mc->platform_max && (val->value.integer.value[0] > mc->platform_max ||
+				 val->value.integer.value[1] > mc->platform_max))
 		return -EINVAL;
 
 	ret = snd_soc_component_update_bits(component, CS42L84_FRZ_CTL,
@@ -288,10 +300,9 @@ static int cs42l84_set_jack(struct snd_soc_component *component, struct snd_soc_
 	struct cs42l84_private *cs42l84 = snd_soc_component_get_drvdata(component);
 
 	/* Prevent race with interrupt handler */
-	mutex_lock(&cs42l84->irq_lock);
+	guard(mutex)(&cs42l84->irq_lock);
 	cs42l84->jack = jk;
 	snd_soc_jack_report(jk, cs42l84->hs_type, SND_JACK_HEADSET);
-	mutex_unlock(&cs42l84->irq_lock);
 
 	return 0;
 }
@@ -473,6 +484,11 @@ static int cs42l84_pll_config(struct snd_soc_component *component)
 
 static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 {
+	struct snd_soc_component *component = codec_dai->component;
+	struct cs42l84_private *cs42l84 = snd_soc_component_get_drvdata(component);
+	unsigned int inv = fmt & SND_SOC_DAIFMT_INV_MASK;
+	unsigned int ch2_edge;
+
 	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
 	case SND_SOC_DAIFMT_BC_FC:
 		break;
@@ -480,22 +496,51 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		return -EINVAL;
 	}
 
+	/*
+	 * Both formats have the same bus polarities: data one bit clock after
+	 * the rising FSYNC edge, which ASoC calls IB_IF for I2S and IB_NF for
+	 * DSP_A. In I2S each channel follows its own FSYNC edge, so the frame
+	 * must be 50 %. DSP_A takes a pulse frame: in TDM mode both channels
+	 * follow the frame-start edge, one slot apart (set in hw_params).
+	 */
 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
 	case SND_SOC_DAIFMT_I2S:
+		if (inv != SND_SOC_DAIFMT_IB_IF)
+			return -EINVAL;
+		cs42l84->dsp_a = false;
+		break;
+	case SND_SOC_DAIFMT_DSP_A:
+		if (inv != SND_SOC_DAIFMT_IB_NF)
+			return -EINVAL;
+		cs42l84->dsp_a = true;
 		break;
 	default:
 		return -EINVAL;
 	}
 
-	/* Bitclock/frame inversion */
-	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
-	case SND_SOC_DAIFMT_IB_IF:
-		break;
-	default:
-		return -EINVAL;
-	}
+	ch2_edge = cs42l84->dsp_a ? 0 : CS42L84_ASP_RX_CHx_CTL1_EDGE;
+	snd_soc_component_update_bits(component, CS42L84_ASP_CTL,
+			CS42L84_ASP_CTL_TDM_MODE,
+			cs42l84->dsp_a ? CS42L84_ASP_CTL_TDM_MODE : 0);
+	snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH2_CTL1,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
+	snd_soc_component_update_bits(component, CS42L84_ASP_TX_CH2_CTL1,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
 
 	return 0;
+}
+
+/* The first bit clock of a channel's slot, counted from its FSYNC edge. */
+static void cs42l84_set_slot_start(struct snd_soc_component *component,
+				   unsigned int ctl1, unsigned int ctl2,
+				   unsigned int bit)
+{
+	snd_soc_component_update_bits(component, ctl1,
+			CS42L84_ASP_RX_CHx_CTL1_SLOT_START_LSB,
+			FIELD_PREP(CS42L84_ASP_RX_CHx_CTL1_SLOT_START_LSB, bit));
+	snd_soc_component_update_bits(component, ctl2,
+			CS42L84_ASP_RX_CHx_CTL2_SLOT_START_MSB,
+			FIELD_PREP(CS42L84_ASP_RX_CHx_CTL2_SLOT_START_MSB, bit >> 7));
 }
 
 static int cs42l84_pcm_hw_params(struct snd_pcm_substream *substream,
@@ -504,6 +549,7 @@ static int cs42l84_pcm_hw_params(struct snd_pcm_substream *substream,
 {
 	struct snd_soc_component *component = dai->component;
 	struct cs42l84_private *cs42l84 = snd_soc_component_get_drvdata(component);
+	unsigned int ch2_start;
 	int ret;
 	u32 ccm_samp_rate;
 
@@ -538,12 +584,17 @@ static int cs42l84_pcm_hw_params(struct snd_pcm_substream *substream,
 
 	snd_soc_component_write(component, CS42L84_CCM_SAMP_RATE, ccm_samp_rate);
 
+	/* DSP_A: channel 2 starts one slot after channel 1 */
+	ch2_start = cs42l84->dsp_a ? params_physical_width(params) : 0;
+
 	switch (substream->stream) {
 	case SNDRV_PCM_STREAM_PLAYBACK:
 		snd_soc_component_write(component, CS42L84_ASP_RX_CH1_WIDTH,
 					params_width(params) - 1);
 		snd_soc_component_write(component, CS42L84_ASP_RX_CH2_WIDTH,
 					params_width(params) - 1);
+		cs42l84_set_slot_start(component, CS42L84_ASP_RX_CH2_CTL1,
+				       CS42L84_ASP_RX_CH2_CTL2, ch2_start);
 		break;
 
 	case SNDRV_PCM_STREAM_CAPTURE:
@@ -551,6 +602,8 @@ static int cs42l84_pcm_hw_params(struct snd_pcm_substream *substream,
 					params_width(params) - 1);
 		snd_soc_component_write(component, CS42L84_ASP_TX_CH2_WIDTH,
 					params_width(params) - 1);
+		cs42l84_set_slot_start(component, CS42L84_ASP_TX_CH2_CTL1,
+				       CS42L84_ASP_TX_CH2_CTL2, ch2_start);
 		break;
 	}
 
@@ -920,7 +973,7 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 	u8 current_ring_state;
 	int i;
 
-	mutex_lock(&cs42l84->irq_lock);
+	guard(mutex)(&cs42l84->irq_lock);
 	/* Read sticky registers to clear interrupt */
 	for (i = 0; i < ARRAY_SIZE(stickies); i++) {
 		regmap_read(cs42l84->regmap, irq_params_table[i].status_addr,
@@ -991,8 +1044,6 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 				break;
 			}
 
-			mutex_unlock(&cs42l84->irq_lock);
-
 			return IRQ_HANDLED;
 		}
 
@@ -1007,8 +1058,6 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 				cs42l84_detect_hs(cs42l84);
 		}
 	}
-
-	mutex_unlock(&cs42l84->irq_lock);
 
 	return IRQ_HANDLED;
 }
@@ -1202,8 +1251,8 @@ static const struct of_device_id cs42l84_of_match[] = {
 MODULE_DEVICE_TABLE(of, cs42l84_of_match);
 
 static const struct i2c_device_id cs42l84_id[] = {
-	{ "cs42l84" },
-	{}
+	{ .name = "cs42l84" },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, cs42l84_id);
 

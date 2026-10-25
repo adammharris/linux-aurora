@@ -12,8 +12,6 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/bits.h>
 
-struct swap_iocb;
-
 /* inode in-kernel data */
 
 #ifdef CONFIG_TMPFS_QUOTA
@@ -165,19 +163,18 @@ static inline bool shmem_uffd_range_missing(struct folio *folio, pgoff_t index,
 		unsigned int offset, unsigned long length) { return false; }
 static inline void shmem_uffd_mark_mapped(struct folio *folio,
 		unsigned long offset, unsigned long length) { }
-static inline void shmem_uffd_forget(struct address_space *mapping,
-				   pgoff_t start, unsigned long nr) { }
+/* Do not evaluate the arguments: folio_nr_pages() would still read flags. */
+#define shmem_uffd_forget(mapping, start, nr) do { } while (0)
 #endif
 
 void shmem_unlock_mapping(struct address_space *mapping);
 struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
 					pgoff_t index, gfp_t gfp_mask);
-int shmem_writeout(struct folio *folio, struct swap_iocb **plug,
-		struct list_head *folio_list);
+int shmem_write_folio(struct folio *folio);
 void shmem_truncate_range(struct inode *inode, loff_t start, uoff_t end);
 int shmem_unuse(unsigned int type);
 
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && defined(CONFIG_SHMEM)
 unsigned long shmem_allowable_huge_orders(struct inode *inode,
 				struct vm_area_struct *vma, pgoff_t index,
 				loff_t write_end, bool shmem_huge_force);

@@ -6,6 +6,11 @@
  * It consumes packed transfer descriptors and payload words through a
  * command FIFO. This driver intentionally implements the PIO spi-mem path
  * only; that is sufficient for SPI NOR discovery and access.
+ *
+ * On T8140 reads reach the whole boot NOR, but programs and erases are
+ * admitted only inside its unique, aligned nvram partition. Without that
+ * partition the NOR is read-only.
+ *
  */
 
 #include <linux/bitfield.h>
@@ -15,11 +20,15 @@
 #include <linux/iopoll.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/spi/spi-mem.h>
+
+#include "spi-apple-qspi-policy.h"
 
 #define APPLE_QSPI_C_OFFSET		0x800
 #define APPLE_QSPI_MIN_SIZE		(APPLE_QSPI_C_OFFSET + 0xa0)
@@ -79,7 +88,75 @@
 #define APPLE_QSPI_MAX_HZ		40000000
 #define APPLE_QSPI_TIMEOUT_MS		1000
 
+static DEFINE_MUTEX(apple_qspi_policy_lock);
+static bool read_only = true;
+static bool runtime_ready;
+static bool write_fault_latched;
+
+static int apple_qspi_set_read_only(const char *val, const struct kernel_param *kp)
+{
+	bool value;
+	int ret = kstrtobool(val, &value);
+
+	if (ret)
+		return ret;
+	mutex_lock(&apple_qspi_policy_lock);
+	/* Boot arguments and insmod cannot arm this driver before probe. */
+	if (!value && (!runtime_ready || write_fault_latched))
+		ret = -EPERM;
+	else
+		*(bool *)kp->arg = value;
+	mutex_unlock(&apple_qspi_policy_lock);
+	return ret;
+}
+
+static int apple_qspi_get_read_only(char *buf, const struct kernel_param *kp)
+{
+	int ret;
+
+	mutex_lock(&apple_qspi_policy_lock);
+	ret = param_get_bool(buf, kp);
+	mutex_unlock(&apple_qspi_policy_lock);
+	return ret;
+}
+
+static const struct kernel_param_ops apple_qspi_read_only_ops = {
+	.set = apple_qspi_set_read_only,
+	.get = apple_qspi_get_read_only,
+};
+module_param_cb(read_only, &apple_qspi_read_only_ops, &read_only, 0644);
+MODULE_PARM_DESC(read_only, "Default true; root runtime opt-in for bounded J613/J713 NVRAM writes");
+
+static bool apple_qspi_opcode_is_read(u8 opcode)
+{
+	switch (opcode) {
+	case 0x03: /* READ */
+	case 0x0b: /* FAST_READ */
+	case 0x3b: /* READ_1_1_2 */
+	case 0x6b: /* READ_1_1_4 */
+	case 0x13: /* READ_4B */
+	case 0x0c: /* FAST_READ_4B */
+	case 0x05: /* RDSR */
+	case 0x35: /* RDCR / RDSR2 */
+	case 0x15: /* RDSR3 */
+	case 0x70: /* RDFSR */
+	case 0x5a: /* RDSFDP */
+	case 0x9f: /* RDID */
+		return true;
+	default:
+		return false;
+	}
+}
+
 struct apple_qspi {
+	/* T8122/T8132 use the serialized, verified NVRAM policy. */
+	bool nvram_policy;
+	/* T8140 admits programs and erases only inside nvram. */
+	bool nvram_window;
+	u64 window_start;
+	u64 window_end;
+	bool nvram_write_candidate;
+	bool write_fault;
 	void __iomem *base;
 	void __iomem *p;
 	void __iomem *c;
@@ -393,7 +470,7 @@ static bool apple_qspi_wait_complete(struct apple_qspi *qspi)
 				 false, qspi);
 }
 
-static int apple_qspi_exec_op(struct spi_mem *mem,
+static int apple_qspi_transfer_op(struct spi_mem *mem,
 			      const struct spi_mem_op *op)
 {
 	struct spi_controller *ctlr = mem->spi->controller;
@@ -405,7 +482,7 @@ static int apple_qspi_exec_op(struct spi_mem *mem,
 	u32 descriptor, mode;
 	u32 p_status, c_status;
 	int ret, retries;
-	bool complete;
+	bool complete, tx_stream;
 
 	ret = apple_qspi_shape_op(op, &shape);
 	if (ret)
@@ -442,6 +519,12 @@ static int apple_qspi_exec_op(struct spi_mem *mem,
 	mode = apple_qspi_width_mode(shape.width);
 	if (op->data.dir == SPI_MEM_DATA_IN)
 		mode |= APPLE_QSPI_CMD_RX;
+	/* The M3/M4 controller consumes TX-only commands as one byte stream. */
+	tx_stream = qspi->nvram_policy && op->data.dir != SPI_MEM_DATA_IN;
+	if (tx_stream) {
+		shape.shared_count = 0;
+		shape.multi_count = 0;
+	}
 	descriptor = FIELD_PREP(APPLE_QSPI_CMD_MODE, mode) |
 		     APPLE_QSPI_CMD_FRAME_A | APPLE_QSPI_CMD_FRAME_B |
 		     FIELD_PREP(APPLE_QSPI_CMD_TAG, qspi->tag++ & 0xf) |
@@ -464,7 +547,8 @@ static int apple_qspi_exec_op(struct spi_mem *mem,
 	qspi->rx_left = op->data.dir == SPI_MEM_DATA_IN ? op->data.nbytes : 0;
 	qspi->active = true;
 	apple_qspi_p_write(qspi, APPLE_QSPI_P_TXFIFO, descriptor);
-	apple_qspi_p_write(qspi, APPLE_QSPI_P_TXFIFO, op->data.nbytes);
+	apple_qspi_p_write(qspi, APPLE_QSPI_P_TXFIFO,
+			   tx_stream ? tx_len : op->data.nbytes);
 	apple_qspi_fill_tx(qspi);
 	spin_unlock_irqrestore(&qspi->lock, flags);
 
@@ -512,11 +596,356 @@ out_free:
 	return ret;
 }
 
+/* Private transfers used by the serialized J613 write policy. */
+static int apple_qspi_read_register(struct spi_mem *mem, u8 opcode, u8 *buf, u32 len)
+{
+	struct spi_mem_op op = SPI_MEM_OP(SPI_MEM_OP_CMD(opcode, 1),
+		SPI_MEM_OP_NO_ADDR, SPI_MEM_OP_NO_DUMMY,
+		SPI_MEM_OP_DATA_IN(len, buf, 1));
+
+	return apple_qspi_transfer_op(mem, &op);
+}
+
+static int apple_qspi_command(struct spi_mem *mem, u8 opcode)
+{
+	struct spi_mem_op op = SPI_MEM_OP(SPI_MEM_OP_CMD(opcode, 1),
+		SPI_MEM_OP_NO_ADDR, SPI_MEM_OP_NO_DUMMY, SPI_MEM_OP_NO_DATA);
+
+	return apple_qspi_transfer_op(mem, &op);
+}
+
+static int apple_qspi_read_array(struct spi_mem *mem, u64 addr, u8 *buf, u32 len)
+{
+	struct spi_mem_op op = SPI_MEM_OP(SPI_MEM_OP_CMD(0x03, 1),
+		SPI_MEM_OP_ADDR(3, addr, 1), SPI_MEM_OP_NO_DUMMY,
+		SPI_MEM_OP_DATA_IN(len, buf, 1));
+
+	return apple_qspi_transfer_op(mem, &op);
+}
+
+static int apple_qspi_status(struct spi_mem *mem, u8 sr[3])
+{
+	static const u8 opcode[] = { 0x05, 0x35, 0x15 };
+	int i, ret;
+
+	for (i = 0; i < 3; i++) {
+		ret = apple_qspi_read_register(mem, opcode[i], &sr[i], 1);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op *op)
+{
+	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
+	unsigned long deadline;
+	u8 id[3], before[3], after[3], sr1;
+	u8 *verify;
+	u32 len = op->cmd.opcode == 0x20 ? APPLE_QSPI_ERASE_SIZE : op->data.nbytes;
+	int i, ret, disable_ret;
+
+	/* Allocate and validate EVERYTHING before a real WREN goes on the wire. */
+	verify = kmalloc(len, GFP_KERNEL);
+	if (!verify)
+		return -ENOMEM;
+	ret = apple_qspi_read_register(mem, 0x9f, id, sizeof(id));
+	if (ret)
+		goto out;
+	if (id[0] != 0xef || id[1] != 0x65 || id[2] != 0x17) {
+		ret = -ENODEV;
+		goto out;
+	}
+	ret = apple_qspi_status(mem, before);
+	if (ret)
+		goto out;
+	/* No unlocking. Conservatively refuse BP/CMP/WPS, BUSY/WEL or suspend. */
+	if (!apple_qspi_status_allows_write(before[0], before[1], before[2])) {
+		ret = -EACCES;
+		goto out;
+	}
+	ret = apple_qspi_read_array(mem, op->addr.val, verify, len);
+	if (ret)
+		goto out;
+	if (op->cmd.opcode == 0x02) {
+		const u8 *data = op->data.buf.out;
+
+		for (i = 0; i < len; i++) {
+			/* Reject attempts to turn programmed zeroes into ones. */
+			if ((verify[i] & data[i]) != data[i]) {
+				ret = -EINVAL;
+				goto out;
+			}
+		}
+		/* Identical pages need no physical program at all. */
+		if (!memcmp(verify, data, len)) {
+			ret = 0;
+			goto out;
+		}
+	}
+
+	ret = apple_qspi_command(mem, 0x06);
+	if (ret)
+		goto fault;
+	ret = apple_qspi_read_register(mem, 0x05, &sr1, 1);
+	if (ret || sr1 != (before[0] | 2)) {
+		ret = ret ?: -EIO;
+		goto fault;
+	}
+	ret = apple_qspi_transfer_op(mem, op);
+	if (ret)
+		goto fault;
+	/* Controller completion is not NOR completion. Never replay on timeout. */
+	deadline = jiffies + msecs_to_jiffies(3000);
+	do {
+		ret = apple_qspi_read_register(mem, 0x05, &sr1, 1);
+		if (ret)
+			goto fault;
+		if (!(sr1 & 1))
+			break;
+		if (time_after_eq(jiffies, deadline)) {
+			ret = -ETIMEDOUT;
+			goto fault;
+		}
+		usleep_range(1000, 2000);
+	} while (true);
+
+	ret = apple_qspi_command(mem, 0x04);
+	if (ret)
+		goto fault;
+	ret = apple_qspi_status(mem, after);
+	if (ret)
+		goto fault;
+	if (memcmp(before, after, sizeof(before))) {
+		ret = -EIO;
+		goto fault;
+	}
+	ret = apple_qspi_read_array(mem, op->addr.val, verify, len);
+	if (ret)
+		goto fault;
+	if (op->cmd.opcode == 0x02) {
+		if (memcmp(verify, op->data.buf.out, len)) {
+			ret = -EIO;
+			goto fault;
+		}
+	} else {
+		for (i = 0; i < len; i++) {
+			if (verify[i] != 0xff) {
+				ret = -EIO;
+				goto fault;
+			}
+		}
+	}
+	goto out;
+
+fault:
+	/* Best effort to clear WEL; a latched fault cannot rearm this module instance. */
+	disable_ret = apple_qspi_command(mem, 0x04);
+	qspi->write_fault = true;
+	write_fault_latched = true;
+	read_only = true;
+	dev_err(&mem->spi->dev,
+		"NVRAM write fault %d (WRDI %d); read-only latched, do not retry\n",
+		ret, disable_ret);
+out:
+	kfree(verify);
+	return ret;
+}
+
+static int apple_qspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
+{
+	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
+	struct apple_qspi_op_shape shape;
+	const char *denial = "modify-status";
+	int ret;
+
+	if (!apple_qspi_supports_op(mem, op) || apple_qspi_shape_op(op, &shape))
+		return -EOPNOTSUPP;
+	mutex_lock(&apple_qspi_policy_lock);
+	if (op->data.dir == SPI_MEM_DATA_IN && op->data.nbytes &&
+	    apple_qspi_opcode_is_read(op->cmd.opcode)) {
+		ret = apple_qspi_transfer_op(mem, op);
+		goto out;
+	}
+	ret = -EACCES;
+	if (read_only || !qspi->nvram_write_candidate || qspi->write_fault) {
+		denial = read_only ? "read-only" :
+			 !qspi->nvram_write_candidate ? "layout" : "write-fault";
+		goto out;
+	}
+	/* Single-wire, three-byte addressing only: no mode/status/OTP commands. */
+	if (shape.width != 1 || op->addr.buswidth > 1 || op->dummy.nbytes) {
+		denial = "shape";
+		goto out;
+	}
+	if (!apple_qspi_mutation_allowed(op->cmd.opcode, op->addr.nbytes,
+					op->addr.val, op->data.nbytes,
+					op->data.dir == SPI_MEM_DATA_OUT)) {
+		denial = "mutation-policy";
+		goto out;
+	}
+	/* SPI-NOR's WREN/WRDI are virtual. WEL is never left armed by a request. */
+	if (op->cmd.opcode == 0x06 || op->cmd.opcode == 0x04) {
+		ret = 0;
+		goto out;
+	}
+	ret = apple_qspi_nvram_modify(mem, op);
+out:
+	if (ret == -EACCES)
+		dev_warn_ratelimited(&mem->spi->dev,
+			"NVRAM denied: reason=%s opcode=%02x addr=%#llx addr_bytes=%u len=%u width=%u addr_width=%u dummy=%u dir=%u ro=%u candidate=%u fault=%u\n",
+			denial, op->cmd.opcode, (unsigned long long)op->addr.val,
+			op->addr.nbytes, op->data.nbytes, shape.width,
+			op->addr.buswidth, op->dummy.nbytes, op->data.dir,
+			read_only, qspi->nvram_write_candidate, qspi->write_fault);
+	mutex_unlock(&apple_qspi_policy_lock);
+	return ret;
+}
+
+/* T8140: data reads pass; anything else must stay inside the nvram window. */
+static int apple_qspi_window_exec_op(struct spi_mem *mem,
+				     const struct spi_mem_op *op)
+{
+	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
+
+	if (op->data.dir == SPI_MEM_DATA_IN && op->data.nbytes)
+		return apple_qspi_transfer_op(mem, op);
+	if (!op->dummy.nbytes &&
+	    apple_qspi_window_allowed(op->cmd.opcode, op->addr.nbytes,
+				      op->addr.val, op->data.nbytes,
+				      op->data.dir == SPI_MEM_DATA_OUT,
+				      qspi->window_start, qspi->window_end))
+		return apple_qspi_transfer_op(mem, op);
+
+	dev_warn_ratelimited(&mem->spi->dev,
+		"boot NOR request denied: opcode=%02x addr=%#llx addr_bytes=%u len=%u dir=%u nvram=[%#llx, %#llx)\n",
+		op->cmd.opcode, (unsigned long long)op->addr.val,
+		op->addr.nbytes, op->data.nbytes, op->data.dir,
+		(unsigned long long)qspi->window_start,
+		(unsigned long long)qspi->window_end);
+	return -EACCES;
+}
+
+static int apple_qspi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
+{
+	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
+
+	if (qspi->nvram_window)
+		return apple_qspi_window_exec_op(mem, op);
+	if (!qspi->nvram_policy)
+		return apple_qspi_transfer_op(mem, op);
+	return apple_qspi_exec_op(mem, op);
+}
+
 static const struct spi_controller_mem_ops apple_qspi_mem_ops = {
 	.adjust_op_size = apple_qspi_adjust_op_size,
 	.supports_op = apple_qspi_supports_op,
-	.exec_op = apple_qspi_exec_op,
+	.exec_op = apple_qspi_mem_exec_op,
 };
+
+/* Keep write qualification tied to the board and its controller aperture. */
+static bool apple_qspi_nvram_write_board(struct device_node *node,
+					 resource_size_t base)
+{
+	if (of_device_is_compatible(node, "apple,t8122-qspi"))
+		return of_machine_is_compatible("apple,j613") &&
+			base == 0x2a1118000ULL;
+	if (of_device_is_compatible(node, "apple,t8132-qspi"))
+		return of_machine_is_compatible("apple,j713") &&
+			base == 0x3ad118000ULL;
+	return false;
+}
+
+/* Require the pinned partition and single physical chip select. */
+static bool apple_qspi_nvram_layout(struct device_node *node)
+{
+	struct device_node *flash, *parts, *part;
+	u32 reg[2], cs;
+	const char *label;
+	bool found = false;
+
+	/* OF name matching excludes the unit address (@0); reg pins CS0. */
+	flash = of_get_child_by_name(node, "flash");
+	if (!flash)
+		return false;
+	if (!of_device_is_compatible(flash, "jedec,spi-nor") ||
+	    of_property_read_u32(flash, "reg", &cs) || cs) {
+		of_node_put(flash);
+		return false;
+	}
+	parts = of_get_child_by_name(flash, "partitions");
+	of_node_put(flash);
+	if (!parts)
+		return false;
+	if (of_device_is_compatible(parts, "fixed-partitions")) {
+		for_each_available_child_of_node(parts, part) {
+			if (!of_property_read_string(part, "label", &label) &&
+			    !strcmp(label, "nvram") &&
+			    of_property_count_u32_elems(part, "reg") == 2 &&
+			    !of_property_read_u32_array(part, "reg", reg, 2) &&
+			    reg[0] == APPLE_QSPI_NVRAM_START &&
+			    reg[1] == APPLE_QSPI_NVRAM_END - APPLE_QSPI_NVRAM_START)
+				found = true;
+		}
+	}
+	of_node_put(parts);
+	return found;
+}
+
+/*
+ * The one "nvram" partition of the flash on CS0, 4 KiB aligned and within
+ * 32-bit addressing. Without it, no program or erase is admitted.
+ */
+static void apple_qspi_nvram_window(struct device *dev, struct apple_qspi *qspi)
+{
+	struct device_node *flash, *parts, *part;
+	const char *label;
+	u32 reg[2], cells[2], cs;
+	u64 start = 0, end = 0;
+	int found = 0;
+
+	flash = of_get_child_by_name(dev->of_node, "flash");
+	if (!flash)
+		goto out;
+	if (!of_device_is_compatible(flash, "jedec,spi-nor") ||
+	    of_property_read_u32(flash, "reg", &cs) || cs) {
+		of_node_put(flash);
+		goto out;
+	}
+	parts = of_get_child_by_name(flash, "partitions");
+	of_node_put(flash);
+	if (!parts)
+		goto out;
+	if (of_device_is_compatible(parts, "fixed-partitions") &&
+	    !of_property_read_u32(parts, "#address-cells", &cells[0]) &&
+	    !of_property_read_u32(parts, "#size-cells", &cells[1]) &&
+	    cells[0] == 1 && cells[1] == 1) {
+		for_each_available_child_of_node(parts, part) {
+			if (of_property_read_string(part, "label", &label) ||
+			    strcmp(label, "nvram"))
+				continue;
+			found++;
+			if (of_property_count_u32_elems(part, "reg") == 2 &&
+			    !of_property_read_u32_array(part, "reg", reg, 2)) {
+				start = reg[0];
+				end = start + reg[1];
+			}
+		}
+	}
+	of_node_put(parts);
+	if (found != 1 || start >= end || end > 1ULL << 32 ||
+	    !IS_ALIGNED(start, APPLE_QSPI_ERASE_SIZE) ||
+	    !IS_ALIGNED(end, APPLE_QSPI_ERASE_SIZE))
+		start = end = 0;
+out:
+	qspi->window_start = start;
+	qspi->window_end = end;
+	if (start < end)
+		dev_dbg(dev, "boot NOR read-only outside nvram [%#llx, %#llx)\n",
+			start, end);
+	else
+		dev_dbg(dev, "boot NOR read-only: no usable nvram partition\n");
+}
 
 static int apple_qspi_probe(struct platform_device *pdev)
 {
@@ -532,6 +961,14 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	qspi = spi_controller_get_devdata(ctlr);
+	qspi->nvram_window = of_device_is_compatible(dev->of_node, "apple,t8140-qspi");
+	if (qspi->nvram_window)
+		apple_qspi_nvram_window(dev, qspi);
+	qspi->nvram_policy = of_device_is_compatible(dev->of_node, "apple,t8122-qspi") ||
+			     of_device_is_compatible(dev->of_node, "apple,t8132-qspi");
+	if (of_device_is_compatible(dev->of_node, "apple,t8122-qspi") &&
+	    !of_machine_is_compatible("apple,j613"))
+		return -ENODEV;
 	init_completion(&qspi->done);
 	spin_lock_init(&qspi->lock);
 
@@ -540,6 +977,9 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL,
 				     "QSPIMC aperture is too small\n");
 
+	qspi->nvram_write_candidate = apple_qspi_nvram_write_board(dev->of_node,
+								   res->start) &&
+		apple_qspi_nvram_layout(dev->of_node);
 	qspi->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(qspi->base))
 		return PTR_ERR(qspi->base);
@@ -575,9 +1015,10 @@ static int apple_qspi_probe(struct platform_device *pdev)
 
 	ctlr->num_chipselect = 1;
 	ctlr->max_native_cs = 1;
-	ctlr->mode_bits = SPI_CPHA | SPI_CPOL |
-			  SPI_RX_DUAL | SPI_RX_QUAD |
-			  SPI_TX_DUAL | SPI_TX_QUAD;
+	ctlr->mode_bits = SPI_CPHA | SPI_CPOL;
+	if (!qspi->nvram_policy)
+		ctlr->mode_bits |= SPI_RX_DUAL | SPI_RX_QUAD |
+				   SPI_TX_DUAL | SPI_TX_QUAD;
 	ctlr->bits_per_word_mask = SPI_BPW_MASK(8);
 	ctlr->mem_ops = &apple_qspi_mem_ops;
 
@@ -587,12 +1028,70 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret,
 				     "failed to register SPI controller\n");
 
+	mutex_lock(&apple_qspi_policy_lock);
+	runtime_ready = true;
+	mutex_unlock(&apple_qspi_policy_lock);
 	version = apple_qspi_p_read(qspi, APPLE_QSPI_P_VERSION);
 	dev_dbg(dev, "QSPIMC version %#x, %lu Hz clock, txq=%u rxq=%u\n",
 		version, clk_get_rate(qspi->clk), qspi->tx_depth,
 		qspi->rx_depth);
 	return 0;
 }
+
+/* Fixed read-only diagnostic: no user-selected opcode, address or payload. */
+static int apple_qspi_match_cs0(struct device *dev, const void *unused)
+{
+	return dev->bus == &spi_bus_type &&
+		!spi_get_chipselect(to_spi_device(dev), 0);
+}
+
+static ssize_t flash_status_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	static const u8 opcodes[] = { 0x9f, 0x05, 0x35, 0x15 };
+	struct spi_controller *ctlr = dev_get_drvdata(dev);
+	struct spi_mem mem = { };
+	struct device *child;
+	u8 *data;
+	int i, ret;
+
+	child = device_find_child(&ctlr->dev, NULL, apple_qspi_match_cs0);
+	if (!child)
+		return -ENODEV;
+	mem.spi = to_spi_device(child);
+	data = kzalloc(6, GFP_KERNEL);
+	if (!data) {
+		ret = -ENOMEM;
+		goto out_put;
+	}
+
+	/* spi-mem supplies queue, bus and I/O serialization for each read.
+	 * These are sequential samples, not an atomic protection snapshot.
+	 */
+	for (i = 0; i < ARRAY_SIZE(opcodes); i++) {
+		struct spi_mem_op op = SPI_MEM_OP(SPI_MEM_OP_CMD(opcodes[i], 1),
+			SPI_MEM_OP_NO_ADDR, SPI_MEM_OP_NO_DUMMY,
+			SPI_MEM_OP_DATA_IN(i ? 1 : 3, data + (i ? i + 2 : 0), 1));
+
+		ret = spi_mem_exec_op(&mem, &op);
+		if (ret)
+			goto out_free;
+	}
+	ret = sysfs_emit(buf, "jedec=%02x%02x%02x sr1=%02x sr2=%02x sr3=%02x\n",
+			 data[0], data[1], data[2], data[3], data[4], data[5]);
+out_free:
+	kfree(data);
+out_put:
+	put_device(child);
+	return ret;
+}
+static DEVICE_ATTR_RO(flash_status);
+
+static struct attribute *apple_qspi_attrs[] = {
+	&dev_attr_flash_status.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(apple_qspi);
 
 static int apple_qspi_suspend(struct device *dev)
 {
@@ -627,6 +1126,8 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_qspi_pm_ops, apple_qspi_suspend,
 				apple_qspi_resume);
 
 static const struct of_device_id apple_qspi_of_match[] = {
+	{ .compatible = "apple,t8122-qspi" },
+	{ .compatible = "apple,t8132-qspi" },
 	{ .compatible = "apple,t8140-qspi" },
 	{}
 };
@@ -636,6 +1137,7 @@ static struct platform_driver apple_qspi_driver = {
 	.probe = apple_qspi_probe,
 	.driver = {
 		.name = "apple-qspi",
+		.dev_groups = apple_qspi_groups,
 		.of_match_table = apple_qspi_of_match,
 		.pm = pm_sleep_ptr(&apple_qspi_pm_ops),
 	},

@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* T8132 memory/cache resources, also used by the legacy-loader adapter. */
+
+&soc {
+	mcc: memory-controller@220000000 {
+		compatible = "apple,t8132-mcc";
+		reg = <0x2 0x20000000 0x0 0x1c1c04>,
+		      <0x2 0x22000000 0x0 0x1c1c04>;
+		status = "disabled";
+	};
+
+	pmc: power-management@382800000 {
+		compatible = "apple,t8132-pmc";
+		reg = <0x3 0x82800000 0x0 0x10000>,
+		      <0x3 0x828aa000 0x0 0x3000>;
+		reg-names = "voters", "rails";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		apple,pmp = <&pmp>;
+		status = "disabled";
+
+		clpc: performance-controller@3 {
+			compatible = "apple,t8132-clpc";
+			reg = <3>;
+			apple,gpu-power-state = <&ps_gfx>;
+		};
+	};
+};

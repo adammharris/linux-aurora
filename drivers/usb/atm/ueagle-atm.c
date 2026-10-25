@@ -1560,10 +1560,8 @@ static void cmvs_file_name(struct uea_softc *sc, char *const cmv_name, int ver)
 	} else
 		file = cmv_file[sc->modem_index];
 
-	strcpy(cmv_name, FW_DIR);
-	strlcat(cmv_name, file, UEA_FW_NAME_MAX);
-	if (ver == 2)
-		strlcat(cmv_name, ".v2", UEA_FW_NAME_MAX);
+	snprintf(cmv_name, UEA_FW_NAME_MAX, FW_DIR "%s%s",
+		 file, ver == 2 ? ".v2" : "");
 	kernel_param_unlock(THIS_MODULE);
 }
 
@@ -2465,7 +2463,8 @@ static int uea_bind(struct usbatm_data *usbatm, struct usb_interface *intf,
 	if (ifnum != UEA_INTR_IFACE_NO)
 		return -ENODEV;
 
-	usbatm->flags = (sync_wait[modem_index] ? 0 : UDSL_SKIP_HEAVY_INIT);
+	usbatm->flags = (modem_index < NB_MODEM && sync_wait[modem_index]) ?
+			 0 : UDSL_SKIP_HEAVY_INIT;
 
 	/* interface 1 is for outbound traffic */
 	ret = claim_interface(usb, usbatm, UEA_US_IFACE_NO);

@@ -8,8 +8,10 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/jiffies.h>
+
 #include <asm/apicdef.h>
 #include <asm/apic.h>
+#include <asm/cpuid/api.h>
 #include <asm/msr.h>
 #include <asm/nmi.h>
 
@@ -1036,7 +1038,7 @@ static int amd_pmu_v2_handle_irq(struct pt_regs *regs)
 	 * Unmasking the LVTPC is not required as the Mask (M) bit of the LVT
 	 * PMI entry is not set by the local APIC when a PMC overflow occurs
 	 */
-	inc_irq_stat(apic_perf_irqs);
+	inc_perf_irq_stat();
 
 done:
 	cpuc->enabled = pmu_enabled;
@@ -1390,7 +1392,7 @@ static struct attribute *amd_brs_events_attrs[] = {
 static umode_t
 amd_brs_is_visible(struct kobject *kobj, struct attribute *attr, int i)
 {
-	return static_cpu_has(X86_FEATURE_BRS) && x86_pmu.lbr_nr ?
+	return cpu_feature_enabled(X86_FEATURE_BRS) && x86_pmu.lbr_nr ?
 	       attr->mode : 0;
 }
 

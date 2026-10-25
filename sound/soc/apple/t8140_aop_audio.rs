@@ -1111,7 +1111,7 @@ impl SndSocT8140AopData {
     /// older state is followed by another run.
     fn queue_jack_report(self: ArcBorrow<'_, Self>) {
         // Err = already queued: the pending report reads the new state.
-        let _ = workqueue::system().enqueue::<_, JACK_WORK>(Arc::from(self));
+        let _ = workqueue::system_dfl().enqueue::<_, JACK_WORK>(Arc::from(self));
     }
 
     fn report_mic_jack(&self) {
@@ -1784,7 +1784,7 @@ unsafe extern "C" fn hpai_pcm_trigger(
         | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
             data.hpai_want_run.store(true, Relaxed);
             // Err = already queued: the pending run will see want_run.
-            let _ = workqueue::system().enqueue::<_, HPAI_START_WORK>(Arc::from(data));
+            let _ = workqueue::system_dfl().enqueue::<_, HPAI_START_WORK>(Arc::from(data));
         }
         _ => data.hpai_want_run.store(false, Relaxed),
     }
@@ -2642,7 +2642,7 @@ unsafe extern "C" fn spkr_dai_trigger(
         | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
             context.data.spkr_want_run.store(true, Relaxed);
             // Err = already queued: the pending run will see want_run.
-            let _ = workqueue::system().enqueue::<_, SPKR_START_WORK>(context.data.clone());
+            let _ = workqueue::system_dfl().enqueue::<_, SPKR_START_WORK>(context.data.clone());
             0
         }
         bindings::SNDRV_PCM_TRIGGER_STOP
@@ -2946,7 +2946,7 @@ impl SndSocT8140AopDriver {
                 data.dev.as_raw(),
                 -1,
                 ptr::null(),
-                THIS_MODULE.as_ptr(),
+                kernel::module::this_module::<crate::LocalModule>().as_ptr(),
                 0,
                 &mut this.card,
             )
@@ -3021,7 +3021,7 @@ impl SndSocT8140AopDriver {
         // SAFETY: the descriptor, the DAI table and the controls are heap
         // allocations owned by `this.asoc`, which outlives the component.
         let ret = unsafe {
-            bindings::snd_soc_register_component(
+            bindings::snd_soc_register_component_d(
                 data.dev.as_raw(),
                 &this.asoc.component,
                 this.asoc.dais.get().cast(),
@@ -3197,20 +3197,20 @@ unsafe extern "C" fn hpai_pcm_hw_params(
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     <SndSocT8140AopDriver as platform::Driver>::IdInfo,
     [(of::DeviceId::new(c_str!("apple,t8140-aop-audio")), ())]
 );
 
 impl platform::Driver for SndSocT8140AopDriver {
     type IdInfo = ();
+    type Data<'bound> = SndSocT8140AopDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(
-        pdev: &platform::Device<Core>,
-        _info: Option<&Self::IdInfo>,
-    ) -> impl PinInit<Self, Error> {
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        _info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev = ARef::<device::Device>::from(pdev.as_ref());
         // SAFETY: this is a service device the AOP core registered, being
         // probed here; the lookup defers the probe until the core has
@@ -3299,7 +3299,7 @@ impl platform::Driver for SndSocT8140AopDriver {
         Self::new(data, fwnode)
     }
 
-    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         this.teardown();
     }
 }
@@ -3401,6 +3401,28 @@ mod tests {
     }
 }
 
+/// The card and PCM names are copied into ALSA's fixed-size fields from
+/// device-tree strings.
+#[kunit_tests(snd_soc_t8140_aop_audio_names)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_that_fits_is_copied_with_its_nul() {
+        let mut field = [0xffu8; 16];
+        assert!(copy_str(&mut field, c"AppleJ700AOP".to_bytes_with_nul()).is_ok());
+        assert_eq!(&field[..13], b"AppleJ700AOP\0");
+    }
+
+    #[test]
+    fn a_name_longer_than_its_field_is_refused() {
+        let mut field = [0u8; 16];
+        let long = c"AppleJ700LongerChassisAOP".to_bytes_with_nul();
+        assert!(copy_str(&mut field, long).is_err());
+        assert_eq!(field, [0u8; 16]);
+    }
+}
+
 #[kunit_tests(snd_soc_t8140_aop_audio_parser)]
 mod parser_tests {
     use super::*;
@@ -3481,28 +3503,6 @@ mod parser_tests {
         ));
         assert!(!producer_cursor_matches(8, u64::MAX, RING_BYTES));
         assert!(!producer_cursor_matches(8, 7, RING_BYTES));
-    }
-}
-
-/// The card and PCM names are copied into ALSA's fixed-size fields from
-/// device-tree strings.
-#[kunit_tests(snd_soc_t8140_aop_audio_names)]
-mod name_tests {
-    use super::*;
-
-    #[test]
-    fn a_name_that_fits_is_copied_with_its_nul() {
-        let mut field = [0xffu8; 16];
-        assert!(copy_str(&mut field, c"AppleJ700AOP".to_bytes_with_nul()).is_ok());
-        assert_eq!(&field[..13], b"AppleJ700AOP\0");
-    }
-
-    #[test]
-    fn a_name_longer_than_its_field_is_refused() {
-        let mut field = [0u8; 16];
-        let long = c"AppleJ700LongerChassisAOP".to_bytes_with_nul();
-        assert!(copy_str(&mut field, long).is_err());
-        assert_eq!(field, [0u8; 16]);
     }
 }
 

@@ -169,5 +169,3 @@
 &isp {
 	apple,platform-id = <2>;
 };
-
-#include "hwmon-fan-dual.dtsi"

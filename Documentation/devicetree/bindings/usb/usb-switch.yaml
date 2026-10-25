@@ -26,7 +26,9 @@ properties:
     type: boolean
 
   thunderbolt-switch:
-    description: Possible handler of USB4/Thunderbolt mode switching
+    description:
+      Possible handler of USB4/Thunderbolt host router activation and cable
+      information updates
     type: boolean
 
 additionalProperties: true

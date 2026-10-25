@@ -4,10 +4,11 @@
  * Backing-store file access. In C because the O_* flags are macro-derived and
  * absent from the Rust bindings.
  *
- * These files are the driver's own. Opens run under kernel credentials so
- * access never depends on which task triggered the operation: a keyctl(2) call
- * from an unprivileged process reaches unseal in that process's context, and
- * without this the driver could not read its own root-only store.
+ * These files are the driver's own. Opens run under kernel credentials and
+ * resolve from the root of userspace init, so access never depends on which
+ * task triggered the operation: a keyctl(2) call from an unprivileged process
+ * reaches unseal in that process's context, and without this the driver could
+ * not read its own root-only store.
  */
 
 #include <linux/cred.h>
@@ -31,9 +32,11 @@ static struct file *open_as_kernel(const char *path, int flags, umode_t mode)
 	if (!kern)
 		return ERR_PTR(-ENOMEM);
 
-	task_lock(&init_task);
-	get_fs_root(init_task.fs, &root);
-	task_unlock(&init_task);
+	/*
+	 * Resolve from the root of userspace init, which follows its
+	 * switch_root. Kernel threads, init_task included, start in nullfs.
+	 */
+	get_fs_root(userspace_init_fs, &root);
 
 	old = override_creds(kern);
 	f = file_open_root(&root, path, flags, mode);

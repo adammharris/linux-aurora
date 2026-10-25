@@ -8,20 +8,20 @@
 
 #define DIE
 #define DIE_NO 0
+#define SOC_NODE die0
 
-&die0 {
-	#include "t602x-pcie-ge.dtsi"
-};
+#include "t602x-pcie-ge.dtsi"
 
 #undef DIE
 #undef DIE_NO
+#undef SOC_NODE
 
 #define DIE _die1
 #define DIE_NO 1
+#define SOC_NODE die1
 
-&die1 {
-	#include "t602x-pcie-ge.dtsi"
-};
+#include "t602x-pcie-ge.dtsi"
 
 #undef DIE
 #undef DIE_NO
+#undef SOC_NODE

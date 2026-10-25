@@ -17,16 +17,18 @@
 #include <acpi/pcc.h>
 #include <acpi/processor.h>
 
-/* CPPCv2 and CPPCv3 support */
+/* CPPCv2, CPPCv3 and CPPCv4 support */
 #define CPPC_V2_REV	2
 #define CPPC_V3_REV	3
+#define CPPC_V4_REV	4
 #define CPPC_V2_NUM_ENT	21
 #define CPPC_V3_NUM_ENT	23
+#define CPPC_V4_NUM_ENT	25
 
 #define PCC_CMD_COMPLETE_MASK	(1 << 0)
 #define PCC_ERROR_MASK		(1 << 2)
 
-#define MAX_CPC_REG_ENT 21
+#define MAX_CPC_REG_ENT 23
 
 /* CPPC specific PCC commands. */
 #define	CMD_READ 0
@@ -67,7 +69,10 @@ struct cpc_register_resource {
 	acpi_object_type type;
 	u64 __iomem *sys_mem_vaddr;
 	union {
-		struct cpc_reg reg;
+		struct {
+			struct cpc_reg reg;
+			bool use_rmw_lock;
+		};
 		u64 int_value;
 	} cpc_entry;
 };
@@ -109,6 +114,8 @@ enum cppc_regs {
 	REFERENCE_PERF,
 	LOWEST_FREQ,
 	NOMINAL_FREQ,
+	OSPM_NOMINAL_PERF,
+	RESOURCE_PRIORITY,
 };
 
 /*
@@ -172,6 +179,8 @@ extern int cppc_get_transition_latency(int cpu);
 extern bool cpc_ffh_supported(void);
 extern bool cpc_supported_by_cpu(void);
 extern int cpc_read_ffh(int cpunum, struct cpc_reg *reg, u64 *val);
+extern int cpc_read_ffh_fb_ctrs(int cpu, struct cpc_reg *reg1, u64 *val1,
+				struct cpc_reg *reg2, u64 *val2);
 extern int cpc_write_ffh(int cpunum, struct cpc_reg *reg, u64 val);
 extern int cppc_get_epp_perf(int cpunum, u64 *epp_perf);
 extern int cppc_set_epp_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls, bool enable);
@@ -244,6 +253,11 @@ static inline bool cpc_ffh_supported(void)
 	return false;
 }
 static inline int cpc_read_ffh(int cpunum, struct cpc_reg *reg, u64 *val)
+{
+	return -EOPNOTSUPP;
+}
+static inline int cpc_read_ffh_fb_ctrs(int cpu, struct cpc_reg *reg1, u64 *val1,
+				       struct cpc_reg *reg2, u64 *val2)
 {
 	return -EOPNOTSUPP;
 }

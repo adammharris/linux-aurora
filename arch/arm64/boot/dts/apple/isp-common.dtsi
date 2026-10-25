@@ -15,7 +15,7 @@
 		#size-cells = <2>;
 		ranges;
 
-		isp_heap: isp-heap {
+		isp_heap: isp-heap@0 {
 			compatible = "apple,asc-mem";
 			/* Filled in by bootloder */
 			reg = <0 0 0 0>;

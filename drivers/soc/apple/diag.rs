@@ -9,10 +9,15 @@
 
 use kernel::{
     device,
-    prelude::*, //
+    prelude::*,
+    sync::atomic::{Atomic, Relaxed}, //
 };
 
-use crate::profile;
+use crate::{
+    profile,
+    registration,
+    xart_guard::MatchFacts, //
+};
 
 extern "C" {
     // `struct device *`, passed untyped: its lockdep map is a zero-sized
@@ -33,6 +38,10 @@ extern "C" {
     fn sep_diag_set_sensor_result(bind: c_uint, online: bool);
     fn sep_diag_set_bio_published();
     fn sep_diag_set_touchid(started: bool);
+    fn sep_diag_set_sensor_attach(state: c_int);
+    fn sep_diag_set_restore(state: c_int);
+    fn sep_diag_set_xart_guard(level: c_uint, list_loaded: bool, matching: c_int);
+    fn sep_diag_xart_guard_refused(matching: c_int);
     fn sep_diag_bringup_ended();
 }
 
@@ -44,12 +53,29 @@ pub(crate) enum Keybag {
     Failed = 3,
 }
 
+/// The enrolled fingerprints at attach, as `SEP_DIAG_RESTORE_*` in `shim.h`
+/// spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Restore {
+    /// The enclave listed them and the restore was proven: the driver logged
+    /// "Touch ID: restored N".
+    Restored = 1,
+    /// The enclave lists no enrolled identity.
+    Empty = 2,
+    /// It lists some, but the restore could not be proven.
+    Unproven = 3,
+}
+
 /// Adds the `diag` group to the SEP device, with the facts fixed at probe. The
 /// group goes away when the driver unbinds.
+///
+/// `guard` is the xART guard as the store opened it: its effective level and
+/// whether Linux's list loaded, or `None` when no guard runs.
 pub(crate) fn register(
     dev: &device::Device<device::Bound>,
     profile: &profile::PlatformProfile,
     xart_writable: bool,
+    guard: Option<(u8, bool)>,
 ) -> Result {
     // Exhaustive, so a new bootstrap or key store fails to build here until
     // the ABI has a value for it.
@@ -61,6 +87,17 @@ pub(crate) fn register(
         profile::KeyStore::Sepos13 { .. } => true,
         profile::KeyStore::Variant5 => false,
     };
+    // The facts `matching` is derived from, kept for the guard's refusals.
+    // Probe runs before the guard can refuse anything.
+    XART_WRITABLE.store(xart_writable, Relaxed);
+    COLD.store(cold, Relaxed);
+    let (level, list_loaded) = guard.unwrap_or((0, false));
+    GUARD_LEVEL.store(u32::from(level), Relaxed);
+    GUARD_LIST.store(list_loaded, Relaxed);
+    REFUSALS.store(0, Relaxed);
+    // SAFETY: no preconditions; stores three words.
+    unsafe { sep_diag_set_xart_guard(c_uint::from(level), list_loaded, matching() as c_int) };
+
     // SAFETY: `dev` is bound for the duration of the call, which is what devres
     // needs. `profile.name` is a `str`, valid for reads of `profile.name.len()`
     // bytes; the shim copies at most that many, needs no NUL terminator, and
@@ -125,6 +162,49 @@ pub(crate) fn bio_published() {
 pub(crate) fn touchid(started: bool) {
     // SAFETY: no preconditions; stores one word.
     unsafe { sep_diag_set_touchid(started) };
+}
+
+/// How far the attach of the sensor got, `SEP_DIAG_SENSOR_ATTACH_*`.
+pub(crate) fn sensor_attach(state: registration::AttachState) {
+    // SAFETY: no preconditions; stores one word.
+    unsafe { sep_diag_set_sensor_attach(state as c_int) };
+}
+
+/// What became of the enrolled fingerprints at attach.
+pub(crate) fn restore(state: Restore) {
+    // SAFETY: no preconditions; stores one word.
+    unsafe { sep_diag_set_restore(state as c_int) };
+}
+
+static XART_WRITABLE: Atomic<bool> = Atomic::new(false);
+static COLD: Atomic<bool> = Atomic::new(false);
+static GUARD_LEVEL: Atomic<u32> = Atomic::new(0);
+static GUARD_LIST: Atomic<bool> = Atomic::new(false);
+static REFUSALS: Atomic<u32> = Atomic::new(0);
+
+/// What a fingerprint match can expect of the xART guard, from the facts
+/// [`register`] stored and the refusals since.
+fn matching() -> crate::xart_guard::Matching {
+    let level = GUARD_LEVEL.load(Relaxed);
+    MatchFacts {
+        xart_writable: XART_WRITABLE.load(Relaxed),
+        cold: COLD.load(Relaxed),
+        guard: (level != 0).then(|| {
+            (
+                u8::try_from(level).unwrap_or(u8::MAX),
+                GUARD_LIST.load(Relaxed),
+            )
+        }),
+        refusals: REFUSALS.load(Relaxed),
+    }
+    .matching()
+}
+
+/// The xART guard refused one of the enclave's writes or deletes.
+pub(crate) fn xart_guard_refused() {
+    REFUSALS.fetch_add(1, Relaxed);
+    // SAFETY: no preconditions; updates two words.
+    unsafe { sep_diag_xart_guard_refused(matching() as c_int) };
 }
 
 /// The boot-time bring-up is over, however far it got.

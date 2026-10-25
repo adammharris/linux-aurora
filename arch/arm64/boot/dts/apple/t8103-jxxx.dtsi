@@ -16,6 +16,7 @@
 		dcpext = &dcpext;
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
+		disp0-piodma = &disp0_piodma;
 		serial0 = &serial0;
 		serial2 = &serial2;
 		wifi0 = &wifi0;
@@ -27,6 +28,11 @@
 		usb4-0-pcie = &apciec0;
 		usb4-1-acio = &usb4_1_acio;
 		usb4-1-nhi = &usb4_1_nhi;
+
+		usb4_0_rc = &usb4_0_acio;
+		usb4_0_nhi = &usb4_0_nhi;
+		usb4_1_rc = &usb4_1_acio;
+		usb4_1_nhi = &usb4_1_nhi;
 		usb4-1-pcie-adapter = &usb4_1_acio;
 		usb4-1-pcie = &apciec1;
 	};
@@ -121,10 +127,10 @@
 		interrupts = <106 IRQ_TYPE_LEVEL_LOW>;
 		interrupt-names = "irq";
 
-			typec1: connector {
-				compatible = "usb-c-connector";
-				power-role = "dual";
-				data-role = "dual";
+		typec1: connector {
+			compatible = "usb-c-connector";
+			power-role = "dual";
+			data-role = "dual";
 
 			ports {
 				#address-cells = <1>;
@@ -161,7 +167,8 @@
 };
 
 &display {
-	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
+	iommus = <&disp0_dart 0 0x0 0x0 0x0 0xfc000000>,
+		 <&dispext0_dart 0 0x0 0x0 0xf 0xffff0000>;
 };
 
 &dispext0_dart {
@@ -218,11 +225,9 @@
 	status = "okay";
 };
 
-&ps_atc0_common {
-	apple,always-on; /* Needs to stay on for DP-alt suspend/resume */
-};
 
-&ps_atc1_common {
+
+&ps_atc0_common {
 	apple,always-on; /* Needs to stay on for DP-alt suspend/resume */
 };
 
@@ -382,7 +387,5 @@
 &nco_clkref {
 	clock-frequency = <900000000>;
 };
-
-#include "hwmon-common.dtsi"
 
 #include "spi1-nvram.dtsi"

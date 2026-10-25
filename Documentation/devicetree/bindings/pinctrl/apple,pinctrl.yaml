@@ -22,6 +22,7 @@ properties:
               - apple,t6020-pinctrl
               - apple,t6030-pinctrl
               - apple,t6031-pinctrl
+              - apple,t6041-pinctrl
               - apple,t8122-pinctrl
               - apple,t8132-pinctrl
               - apple,t8140-pinctrl
@@ -52,6 +53,12 @@ properties:
 
   gpio-ranges:
     maxItems: 1
+
+  apple,irq-group-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 6
+    default: 0
+    description: First hardware interrupt group owned by the host.
 
   apple,npins:
     $ref: /schemas/types.yaml#/definitions/uint32

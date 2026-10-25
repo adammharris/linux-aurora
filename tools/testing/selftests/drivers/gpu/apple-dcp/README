@@ -30,10 +30,11 @@ The modules contain public synthetic host boundaries and retained assertions:
   warm reset and legacy T8103/T8122/T8140/T8142 route controls.
 * lifecycle: actual physical-disconnect authority and ownership despite failed
   teardown; a fast dock replug whose DPTX link never configures (withdrawn,
-  unacknowledged, unanswered, refused and live failures); a dock that leaves
-  during the first mode set, whose dropped present keeps the IOMFB queue busy
-  (deferred and retried stop, never-retired, post-power-off and crashed-queue
-  latches); DWC3/core/PHY PM
+  unacknowledged, unanswered, refused and live failures); an old disconnect's
+  delayed CRTC power-off racing a replacement M1/M2 Type-C session; a dock
+  that leaves during the first mode set, whose dropped present keeps the IOMFB
+  queue busy (deferred and retried stop, never-retired, post-power-off and
+  crashed-queue latches); DWC3/core/PHY PM
   and reset-reference recovery; exact firmware
   tuple/resource admission, unsupported VRR rejection and power reply bounds;
   15,552 D134 dispatcher scope/length/context and legacy reply cases.
@@ -102,3 +103,45 @@ no port down and checks that none comes up. A failed USB3 power-off or reset
 leaves dwc3 out of host mode, and a fixed-hub host whose PIPE cannot be routed
 still starts. Each fixture detects these from the source, so the expectations
 for sources without the handover remain.
+
+The m4 group executes the actual M4 firmware codecs against ten immutable
+A407 request fixtures generated from the working kernel at
+feb6464a52a7d968d8e7a0ac6a5cab2865f31782. All 71,280 bytes are compared,
+including XRGB/ARGB, cursor updates/removal, blanking, and 0/120/500-nit
+brightness. The fixture records original source hashes and synthetic input
+source; running the tests never regenerates expected bytes from current code.
+Logical blanking deliberately replaces the former purple diagnostic background
+with opaque black; only the four-byte background field of the two blanking
+fixtures permits that documented change. Protocol tests also cover independent
+A407/D590 receipt ordering, exact swap
+IDs, malformed/duplicate replies, READY identity, packet bounds, nested
+callback routing, DMA aperture/extent bounds and cursor admission. These
+remain CPU regressions, not firmware or display qualification. The common
+plane callback runs against synthetic DRM-core boundaries to check strict
+linear DMA GEM admission and active/invisible rejection. Real prepare_fb
+keeps producer preparation while the backend owns v26_6 framebuffer retirement;
+legacy retirement remains tested. Actual backend present/blank functions and
+the real common backlight state/wrappers run with a bounded mock transport,
+covering DPMS-off before delayed work and retaining active plus uncertain
+framebuffers when one of the two required receipts never arrives.
+
+run-native-m4-kms.py defaults to dry run; --compile-only needs libdrm development
+headers and never opens DRM. Explicit --execute requires root, an exact fresh
+source/Image/boot identity, the common appledrm module, a stopped display
+manager and the independent unqualified-candidate rollback guard. It resolves
+the internal CRTC through the eDP encoder mask, performs 60 bounded flips, a
+CRTC-only atomic commit, then 20 blank/unblank cycles. The operator owns desktop stop
+and restart plus kernel health monitoring; the runner never disarms rollback.
+This hardware runner is excluded from ordinary selftest execution.
+
+M4 error-path regression checks can also run independently:
+
+  python3 tools/testing/selftests/drivers/gpu/apple-dcp/m4-error-paths.py
+
+They compile the actual PMP vote state transitions, borrowed-DART fault
+handler, retained-resource cleanup action and failed-flip event handoff with
+host mocks under UndefinedBehaviorSanitizer. Controls cover accepted DISP
+surviving an unrelated failed AGX request, both reply/timeout lock orderings,
+malformed replies, true owner failure, an unowned or invalid fault SID, probe
+rollback versus published DMA lifetime, exactly-once DRM event ownership, and
+mixed-owner, truncated, failed-translation and invalid-owner IOMMU tuples.

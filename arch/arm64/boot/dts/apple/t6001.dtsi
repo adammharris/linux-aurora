@@ -43,19 +43,22 @@
 
 #define DIE
 #define DIE_NO 0
+#define SOC_NODE {/soc}
 
-&{/soc} {
-	#include "t600x-die0.dtsi"
-	#include "t600x-dieX.dtsi"
-	#include "t600x-pciec.dtsi"
-	#include "t600x-nvme.dtsi"
+#include "t600x-die0.dtsi"
+#include "t600x-dieX.dtsi"
+
+&SOC_NODE {
+#include "t600x-pciec.dtsi"
 };
 
+#include "t600x-nvme.dtsi"
 #include "t600x-gpio-pins.dtsi"
 #include "t600x-pmgr.dtsi"
 
 #undef DIE
 #undef DIE_NO
+#undef SOC_NODE
 
 
 &aic {
@@ -89,6 +92,7 @@
 	compatible = "apple,agx-t6001", "apple,agx-g13c", "apple,agx-g13s";
 };
 
+#include "hwmon-common.dtsi"
 /*
  * The ANE has run on the M1 Pro and the M1 Max, so enable it here with its
  * DARTs and the power states only it uses. t6000.dtsi includes this file.

@@ -3,10 +3,35 @@
 These files connect the Apple SEP kernel driver to the shared APFS xART
 gigalocker and the desktop fingerprint stack.
 
+The current release installer and matched packages are published in
+[omacom/linux-aurora](https://github.com/omacom/linux-aurora/releases/latest):
+
+```sh
+curl -fsSL https://github.com/omacom/linux-aurora/releases/latest/download/install-aurora-sep.sh | bash
+```
+
+The installer in this source tree is an assembly template. Use the release
+asset above, whose package checksums and GPU profiles are pinned together.
+
+Each release installer downloads its own exact package versions and verifies
+their checksums. Experimental hardware profiles require their explicit opt-ins.
+Normal stable delivery uses Omacom's package channels and installer images.
+
+For experimental acceleration on the 13-inch or 15-inch M3 MacBook Air, see
+the [M3 GPU quick start](M3-GPU.md) for the matched activation command and
+desktop GPU check.
+
+For the J413 M2 Air hibernation request, see [HIBERNATION.md](HIBERNATION.md)
+for the current platform blockers and required resume qualification.
+
 See [M1-SUPPORT.md](M1-SUPPORT.md) for the T8103 firmware requirements,
 reboot-persistent enrollment fixes, reference-key recovery caveats and current
 validation boundaries. The historical bring-up results below describe the
 individual builds at the time they were tested.
+
+For Neo OS-identity continuity, read
+[OS-IDENTITY.md](OS-IDENTITY.md) before changing boot parameters or identity
+sources. Existing chosen-lane enrolments require no migration.
 
 Install the driver service:
 
@@ -28,8 +53,9 @@ for example with `systemctl edit aurora-sep.service`:
 Environment=AURORA_SEP_READY_TIMEOUT=180
 ```
 
-The driver defaults to `xart_writes=1` and exports the `apple,sep` module
-alias for automatic loading. Writes are accepted only when the APFS `.gl`
+The driver defaults to `xart_writes=1`. It exports no module alias, so udev
+never loads it on its own: the service above loads it, once the iBoot system
+container is reachable. Writes are accepted only when the APFS `.gl`
 extent passes the driver's narrow ownership checks: one physical extent, no snapshots or revert
 state, and a single extent reference owned by the `.gl` inode. The kernel
 resolves that extent from checksum-validated APFS metadata; unsupported layouts
@@ -79,8 +105,9 @@ enrolment fails with that reason in fprintd's log, and fprintd reports
 The device-specific `apple/mesa_calibration.bin` on m2 was recovered using
 the bundled [`extract-mesa-calibration.py`](extract-mesa-calibration.py), copied
 from [Gist revision `eb079a8007985d04e75182f20994f1a1c496f12e`](https://gist.github.com/DjDeveloperr/867a1961b861c570442724f48f770158/eb079a8007985d04e75182f20994f1a1c496f12e),
-which scans the local iBoot System Container read-only for an FSCl/CALB record
-with an IM4M manifest. It checks the container structure and markers, **not**
+which scans the local iBoot System Container read-only for an FSCl/CALB `comb`
+record or a standalone FSC2 IMG4 with an IM4M manifest. It checks the container
+structure and markers, **not**
 the manifest's cryptographic signature. Keep this blob private to the machine;
 it is not a generic firmware package. On m2, a premature master
 `SAVE_CATACOMB` returned SEP status `0x6` while its component state was `0x3`
@@ -212,8 +239,25 @@ enrolled fingerprints from the enclave before the open returns, which takes
 a few seconds. `aurora-sep-ready.service`, which `aurora-sep.service` pulls
 in, makes that open at boot, before fprintd starts. The lock screen, sudo
 and polkit then find the reader and the fingerprints ready, and the first
-fingerprint request does not wait for the restore. A failed open is only
-logged. The packages install it; by hand:
+fingerprint request does not wait for the restore.
+
+An open that succeeds is not enough: the sensor can still fall short of
+attaching. The script reports Touch ID ready only once the driver's `diag`
+attributes show the sensor attached and the fingerprints restored (or none
+enrolled), the state in which the kernel logs `Touch ID: restored N`. The
+driver tries an attach that fell short once more about 10 s later, so the
+script waits for that, up to 50 s from its start. Otherwise it logs
+`Touch ID is NOT ready` with the reason and the unit fails; anything that
+merely wants it still starts.
+
+Restored is not the same as able to match: a match rewrites xART session
+records, which the xART guard can refuse. The script reads the driver's
+`matching` attribute: `usable` is ready, `blocked` is NOT ready with the
+reason and the `xart_guard=0` opt-out, and `unverified` (or a kernel that
+does not say) logs `Touch ID is restored, matching UNVERIFIED` and does not
+fail the unit. See `XART-SAFETY.md`.
+
+The packages install it; by hand:
 
 ```sh
 install -Dm755 aurora-sep-ready /usr/local/sbin/aurora-sep-ready

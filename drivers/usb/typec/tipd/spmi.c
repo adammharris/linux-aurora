@@ -5,8 +5,10 @@
 #include <linux/iopoll.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/spmi.h>
+#include <linux/usb/role.h>
 
 #include "tps6598x.h"
 
@@ -21,12 +23,16 @@ static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 	struct tps6598x *tps = spmi_device_get_drvdata(sdev);
 	struct sn201202x *sn = tps_to_sn(tps);
 
+	if (reg >= 0x80) {
+		WARN_ON(1);
+		return -EINVAL;
+	}
 	reinit_completion(&sn->select_completion);
 	err = spmi_register_zero_write(sdev, reg);
 	if (err)
 		return err;
 
-	if (sn->polled) {
+	if (sn->polled || sn->select_polled) {
 		int poll_err;
 
 		poll_err = read_poll_timeout(spmi_register_read, err,
@@ -63,6 +69,7 @@ static int regmap_sn201202x_read(void *context,
 				 const void *reg, size_t reg_size,
 				 void *val, size_t val_size)
 {
+	struct spmi_device *sdev = context;
 	int err;
 	unsigned int offset = 0x20;
 	size_t len;
@@ -79,9 +86,24 @@ static int regmap_sn201202x_read(void *context,
 
 	addr = *(u8 *)reg;
 
-	err = regmap_sn201202x_select_reg(context, addr);
+	err = regmap_sn201202x_select_reg(sdev, addr);
 	if (err)
 		return err;
+
+	if (of_device_is_compatible(sdev->dev.of_node, "apple,t8132-sn201202x")) {
+		u8 size;
+
+		/* Selection completion does not establish the payload's length. */
+		err = spmi_register_read(sdev, 0x1f, &size);
+		if (err)
+			return err;
+		if (size < val_size || size > TPS_MAX_LEN) {
+			dev_err_ratelimited(&sdev->dev,
+					    "Register %#x reports %u bytes for a %zu-byte read\n",
+					    addr, size, val_size);
+			return -EIO;
+		}
+	}
 
 	while (val_size) {
 		len = min_t(size_t, val_size, 16);
@@ -164,7 +186,7 @@ static struct regmap *__devm_regmap_init_sn201202x(struct spmi_device *sdev,
 				dev, config)
 
 static const struct of_device_id sn201202x_of_match[] = {
-	{ .compatible = "apple,sn201202x", &tipd_sn201202x_data},
+	{ .compatible = "apple,sn201202x", (void *)TIPD_VARIANT_SN201202X},
 	{}
 };
 
@@ -205,6 +227,8 @@ static int sn201202x_probe(struct spmi_device *device)
 {
 	const struct of_device_id *match;
 	const struct tipd_data *data;
+	struct usb_role_switch *sw;
+	struct fwnode_handle *fwnode;
 	struct sn201202x *sn;
 	struct tps6598x *tps;
 	int irq_select, irq_sleep, irq_wake;
@@ -213,7 +237,23 @@ static int sn201202x_probe(struct spmi_device *device)
 	match = of_match_device(sn201202x_of_match, &device->dev);
 	if (!match)
 		return -EINVAL;
-	data = match->data;
+	data = tipd_hw_variants[(enum tipd_hw_variant)match->data];
+
+	/*
+	 * tipd_init() defers until the connector's USB role switch (the dwc3)
+	 * is registered, but only after it has woken the chip, switched it to
+	 * S0 and set its interrupt mask, and the deferral then puts the chip
+	 * back to sleep. With both drivers loaded by udev at boot that cycle
+	 * could repeat several times. Defer here instead, before the chip is
+	 * touched. A connector without a role switch, or one whose remote node
+	 * is disabled, gives NULL, and the probe continues as before.
+	 */
+	fwnode = device_get_named_child_node(&device->dev, "connector");
+	sw = fwnode_usb_role_switch_get(fwnode);
+	fwnode_handle_put(fwnode);
+	if (IS_ERR(sw))
+		return dev_err_probe(&device->dev, PTR_ERR(sw), "waiting for the USB role switch\n");
+	usb_role_switch_put(sw);
 
 	sn = devm_kzalloc(&device->dev, data->tps_struct_size, GFP_KERNEL);
 	if (!sn)
@@ -236,8 +276,15 @@ static int sn201202x_probe(struct spmi_device *device)
 		if (tps->irq < 0)
 			return tps->irq;
 		irq_select = of_irq_get_byname(device->dev.of_node, "select");
-		if (irq_select < 0)
+		/* T8132 has no select notification, but retains event/sleep/wake IRQs. */
+		if (irq_select == -EINVAL || irq_select == -ENODATA) {
+			if (!of_device_is_compatible(device->dev.of_node,
+						     "apple,t8132-sn201202x"))
+				return irq_select;
+			sn->select_polled = true;
+		} else if (irq_select < 0) {
 			return irq_select;
+		}
 		irq_sleep = of_irq_get_byname(device->dev.of_node, "sleep");
 		if (irq_sleep < 0)
 			return irq_sleep;
@@ -245,10 +292,12 @@ static int sn201202x_probe(struct spmi_device *device)
 		if (irq_wake < 0)
 			return irq_wake;
 
-		ret = devm_request_irq(&device->dev, irq_select, sn201202x_irq,
-				       0, NULL, &sn->select_completion);
-		if (ret)
-			return ret;
+		if (!sn->select_polled) {
+			ret = devm_request_irq(&device->dev, irq_select, sn201202x_irq,
+					       0, NULL, &sn->select_completion);
+			if (ret)
+				return ret;
+		}
 		ret = devm_request_irq(&device->dev, irq_sleep, sn201202x_irq,
 				       0, NULL, &sn->sleep_completion);
 		if (ret)

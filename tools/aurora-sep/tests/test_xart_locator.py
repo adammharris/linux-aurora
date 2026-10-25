@@ -60,12 +60,12 @@ class RawLocatorTests(unittest.TestCase):
     def test_gigalocker_filename_forms(self):
         self.assertTrue(INSPECTOR.is_gigalocker_name(b".gl"))
         self.assertTrue(INSPECTOR.is_gigalocker_name(
-            b"242F8E43-7258-507F-AEEC-821F00290A1F.gl"))
+            b"01234567-89AB-5CDE-8F01-23456789ABCD.gl"))
         self.assertTrue(INSPECTOR.is_gigalocker_name(
-            b"242f8e43-7258-507f-aeec-821f00290a1f.gl"))
-        self.assertFalse(INSPECTOR.is_gigalocker_name(b"242F8E43.gl"))
+            b"01234567-89ab-5cde-8f01-23456789abcd.gl"))
+        self.assertFalse(INSPECTOR.is_gigalocker_name(b"01234567.gl"))
         self.assertFalse(INSPECTOR.is_gigalocker_name(
-            b"242F8E43-7258-507F-AEEC-821F00290A1G.gl"))
+            b"01234567-89AB-5CDE-8F01-23456789ABCG.gl"))
         self.assertFalse(INSPECTOR.is_gigalocker_name(b"other.gl"))
 
     def test_roots_moved_forward_pick_window_outside_real_extent(self):

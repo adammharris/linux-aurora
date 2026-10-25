@@ -31,6 +31,10 @@ properties:
 
   iommu-addresses: true
 
+  apple,dcp-os-log:
+    type: boolean
+    description: Reserved DCP OS log buffer supplied by the bootloader.
+
 required:
   - compatible
   - reg

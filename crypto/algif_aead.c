@@ -34,6 +34,11 @@
 #include <linux/net.h>
 #include <net/sock.h>
 
+static const struct af_alg_allowlist_entry aead_allowlist[] = {
+	{ "ccm(aes)" }, /* bluez */
+	{},
+};
+
 static inline bool aead_sufficient_data(struct sock *sk)
 {
 	struct alg_sock *ask = alg_sk(sk);
@@ -197,37 +202,14 @@ static int _aead_recvmsg(struct socket *sock, struct msghdr *msg,
 	aead_request_set_ad(&areq->cra_u.aead_req, ctx->aead_assoclen);
 	aead_request_set_tfm(&areq->cra_u.aead_req, tfm);
 
-	if (msg->msg_iocb && !is_sync_kiocb(msg->msg_iocb)) {
-		/* AIO operation */
-		sock_hold(sk);
-		areq->iocb = msg->msg_iocb;
-
-		/* Remember output size that will be generated. */
-		areq->outlen = outlen;
-
-		aead_request_set_callback(&areq->cra_u.aead_req,
-					  CRYPTO_TFM_REQ_MAY_SLEEP,
-					  af_alg_async_cb, areq);
-		err = ctx->enc ? crypto_aead_encrypt(&areq->cra_u.aead_req) :
-				 crypto_aead_decrypt(&areq->cra_u.aead_req);
-
-		/* AIO operation in progress */
-		if (err == -EINPROGRESS)
-			return -EIOCBQUEUED;
-
-		sock_put(sk);
-	} else {
-		/* Synchronous operation */
-		aead_request_set_callback(&areq->cra_u.aead_req,
-					  CRYPTO_TFM_REQ_MAY_SLEEP |
-					  CRYPTO_TFM_REQ_MAY_BACKLOG,
-					  crypto_req_done, &ctx->wait);
-		err = crypto_wait_req(ctx->enc ?
-				crypto_aead_encrypt(&areq->cra_u.aead_req) :
-				crypto_aead_decrypt(&areq->cra_u.aead_req),
-				&ctx->wait);
-	}
-
+	aead_request_set_callback(&areq->cra_u.aead_req,
+				  CRYPTO_TFM_REQ_MAY_SLEEP |
+				  CRYPTO_TFM_REQ_MAY_BACKLOG,
+				  crypto_req_done, &ctx->wait);
+	err = crypto_wait_req(ctx->enc ?
+			crypto_aead_encrypt(&areq->cra_u.aead_req) :
+			crypto_aead_decrypt(&areq->cra_u.aead_req),
+			&ctx->wait);
 
 free:
 	af_alg_free_resources(areq);
@@ -365,9 +347,15 @@ static struct proto_ops algif_aead_ops_nokey = {
 	.poll		=	af_alg_poll,
 };
 
-static void *aead_bind(const char *name, u32 type, u32 mask)
+static void *aead_bind(const char *name)
 {
-	return crypto_alloc_aead(name, type, mask);
+	int err;
+
+	err = af_alg_check_restriction(name, aead_allowlist);
+	if (err)
+		return ERR_PTR(err);
+
+	return crypto_alloc_aead(name, 0, AF_ALG_CRYPTOAPI_MASK);
 }
 
 static void aead_release(void *private)

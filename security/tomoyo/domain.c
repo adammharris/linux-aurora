@@ -903,6 +903,7 @@ force_jump_domain:
  *
  * Returns true on success, false otherwise.
  */
+#ifdef CONFIG_MM_SUBPAGE
 bool tomoyo_dump_page(struct linux_binprm *bprm, unsigned long pos,
 		      struct tomoyo_page_dump *dump)
 {
@@ -940,3 +941,42 @@ bool tomoyo_dump_page(struct linux_binprm *bprm, unsigned long pos,
 	dump->pos = pos;
 	return true;
 }
+#else
+bool tomoyo_dump_page(struct linux_binprm *bprm, unsigned long pos,
+		      struct tomoyo_page_dump *dump)
+{
+	const unsigned int offset = offset_in_page(pos);
+	const unsigned int length = PAGE_SIZE - offset;
+
+	/* dump->data is released by tomoyo_find_next_domain(). */
+	if (!dump->data) {
+		dump->data = kzalloc(PAGE_SIZE, GFP_NOFS);
+		if (!dump->data)
+			return false;
+		dump->pos = ULONG_MAX;
+	}
+	if (pos >= dump->pos && (pos & PAGE_MASK) == (dump->pos & PAGE_MASK))
+		return true;
+	/* A failed partial copy must not leave the previous cache valid. */
+	dump->pos = ULONG_MAX;
+#ifdef CONFIG_MMU
+	/*
+	 * Inspect the nascent MM's virtual bytes. Smaller userspace mappings
+	 * can use several independently retained fragments within this range.
+	 */
+	if (access_remote_vm(bprm->mm, pos, dump->data + offset, length,
+			     FOLL_FORCE) != length)
+		return false;
+#else
+	{
+		struct page *page = bprm->page[pos / PAGE_SIZE];
+		char *kaddr = kmap_local_page(page);
+
+		memcpy(dump->data + offset, kaddr + offset, length);
+		kunmap_local(kaddr);
+	}
+#endif
+	dump->pos = pos;
+	return true;
+}
+#endif

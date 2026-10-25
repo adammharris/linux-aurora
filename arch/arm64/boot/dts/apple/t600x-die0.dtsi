@@ -6,6 +6,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+&SOC_NODE {
 
 	ane_dart0: iommu@285800000 {
 		compatible = "apple,t6000-dart";
@@ -69,12 +70,9 @@
 
 	pmgr_misc: power-management@28e20c000 {
 		compatible = "apple,t6000-pmgr-misc";
-		#address-cells = <1>;
-		#size-cells = <1>;
 		reg = <0x2 0x8e20c000 0 0x400>,
 			<0x2 0x8e20c800 0 0x400>;
 		reg-names = "fabric-ps", "dcs-ps";
-		apple,dcs-min-ps = <7>;
 	};
 
 	pmp_dart: iommu@28e300000 {
@@ -288,16 +286,16 @@
 			#gpio-cells = <2>;
 		};
 
-		smc_hwmon: hwmon {
-			compatible = "apple,smc-hwmon";
-		};
-
 		smc_reboot: reboot {
 			compatible = "apple,smc-reboot";
 			nvmem-cells = <&shutdown_flag>, <&boot_stage>,
 				<&boot_error_count>, <&panic_count>, <&pm_setting>;
 			nvmem-cell-names = "shutdown_flag", "boot_stage",
 				"boot_error_count", "panic_count", "pm_setting";
+		};
+
+		smc_hwmon: hwmon {
+			compatible = "apple,smc-hwmon";
 		};
 
 		rtc {
@@ -471,22 +469,20 @@
 	disp0_dart: iommu@38b304000 {
 		compatible = "apple,t6000-dart";
 		reg = <0x3 0x8b304000 0x0 0x4000>;
-		#iommu-cells = <1>;
+		#iommu-cells = <5>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 821 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 		power-domains = <&ps_disp0_cpu0>;
-		apple,dma-range = <0x0 0x0 0x0 0xfc000000>;
 	};
 
 	dcp_dart: iommu@38b30c000 {
 		compatible = "apple,t6000-dart";
 		reg = <0x3 0x8b30c000 0x0 0x4000>;
-		#iommu-cells = <1>;
+		#iommu-cells = <5>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 821 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_disp0_cpu0>;
-		apple,dma-range = <0x1f0 0x0 0x0 0xfc000000>;
 	};
 
 	sep_dart: iommu@3952c0000 {
@@ -559,7 +555,7 @@
 		compatible = "apple,t6000-dcp", "apple,dcp";
 		mboxes = <&dcp_mbox>;
 		mbox-names = "mbox";
-		iommus = <&dcp_dart 0>;
+		iommus = <&dcp_dart 0 0x0 0x0 0x0 0xfc000000>;
 
 		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
 		reg = <0x3 0x8bc00000 0x0 0x4000>,
@@ -582,7 +578,7 @@
 		#size-cells = <2>;
 
 		disp0_piodma: piodma {
-			iommus = <&disp0_dart 4>;
+			iommus = <&disp0_dart 4 0x0 0x0 0x0 0xfc000000>;
 			phandle = <&disp0_piodma>;
 		};
 
@@ -600,7 +596,7 @@
 
 	display: display-subsystem {
 		compatible = "apple,display-subsystem";
-		iommus = <&disp0_dart 0>;
+		iommus = <&disp0_dart 0 0x0 0x0 0x0 0xfc000000>;
 		/* generate phandle explicitly for use in loader */
 		phandle = <&display>;
 	};
@@ -1082,3 +1078,4 @@
 			status = "disabled";
 		};
 	};
+};

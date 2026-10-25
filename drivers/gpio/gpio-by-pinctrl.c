@@ -5,7 +5,6 @@
 
 #include <linux/errno.h>
 #include <linux/gpio/driver.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
@@ -55,11 +54,11 @@ static int pin_control_gpio_direction_output(struct gpio_chip *chip,
 {
 	int ret;
 
-	ret = pinctrl_gpio_direction_output(chip, offset);
+	ret = pin_control_gpio_set(chip, offset, val);
 	if (ret)
 		return ret;
 
-	return pin_control_gpio_set(chip, offset, val);
+	return pinctrl_gpio_direction_output(chip, offset);
 }
 
 static int pin_control_gpio_probe(struct platform_device *pdev)

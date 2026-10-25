@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_dma.h>
+#include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/spinlock.h>
@@ -51,6 +52,7 @@
 #define REG_TX_STOP		0x0004
 #define REG_RX_START		0x0008
 #define REG_RX_STOP		0x000c
+#define REG_CTL			0x0010
 #define REG_UNK_28		0x0028
 #define REG_UNK_2C		0x002c
 #define REG_IMPRINT		0x0090
@@ -72,6 +74,8 @@
 
 #define REG_CHAN_CTL(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x00)
 #define REG_CHAN_CTL_RST_RINGS	BIT(0)
+#define REG_CHAN_CONFIG(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x04)
+#define REG_CHAN_BURST(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x30)
 
 #define REG_DESC_RING(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x70)
 #define REG_REPORT_RING(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x74)
@@ -104,6 +108,10 @@
 #define REG_GLOBAL_INTSTATE(idx)	(0x0050 + (idx) * 4)
 #define REG_CHAN_INTSTATUS(ad, ch, idx)	(REG_CHAN_BASE(ad, ch) + 0x10 + (idx) * 4)
 #define REG_CHAN_INTMASK(ad, ch, idx)	(REG_CHAN_BASE(ad, ch) + 0x20 + (idx) * 4)
+
+#define REG_CHAN_ENABLE(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0xa0)
+#define CHAN_ENABLE_MEMORY	BIT(0)
+#define CHAN_ENABLE_PERIPHERAL	BIT(1)
 
 struct admac_data;
 struct admac_tx;
@@ -152,6 +160,8 @@ struct admac_data {
 
 	bool set_unk28;
 	bool evolved_layout;
+	bool split_channels;
+	bool ctl_programmed;
 	int irq;
 	int irq_index;
 	int nchannels;
@@ -161,6 +171,8 @@ struct admac_data {
 struct admac_tx {
 	struct dma_async_tx_descriptor tx;
 	bool cyclic;
+	bool error;
+	unsigned int nperiods_outstanding;
 	dma_addr_t buf_addr;
 	dma_addr_t buf_end;
 	size_t buf_len;
@@ -175,6 +187,7 @@ struct admac_tx {
 struct admac_hw {
 	bool set_unk28;
 	bool evolved_layout;
+	bool split_channels;
 };
 
 static int admac_alloc_sram_carveout(struct admac_data *ad,
@@ -185,6 +198,11 @@ static int admac_alloc_sram_carveout(struct admac_data *ad,
 	int i, ret = 0, nblocks;
 	ad->txcache.size = readl_relaxed(ad->base + REG_TX_SRAM_SIZE);
 	ad->rxcache.size = readl_relaxed(ad->base + REG_RX_SRAM_SIZE);
+	/* T8132 reports channel metadata in the upper half of these words. */
+	if (ad->split_channels) {
+		ad->txcache.size &= GENMASK(15, 0);
+		ad->rxcache.size &= GENMASK(15, 0);
+	}
 
 	if (dir == DMA_MEM_TO_DEV)
 		sram = &ad->txcache;
@@ -194,7 +212,7 @@ static int admac_alloc_sram_carveout(struct admac_data *ad,
 	mutex_lock(&ad->cache_alloc_lock);
 
 	nblocks = sram->size / SRAM_BLOCK;
-	for (i = 0; i < nblocks; i++)
+	for (i = ad->split_channels ? 1 : 0; i < nblocks; i++)
 		if (!(sram->allocated & BIT(i)))
 			break;
 
@@ -286,8 +304,15 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 {
 	struct admac_chan *adchan = container_of(chan, struct admac_chan, chan);
 	struct admac_tx *adtx;
+	dma_addr_t buf_end;
 
 	if (direction != admac_chan_direction(adchan->no))
+		return NULL;
+
+	/* Reports advance whole periods, and residue is a u32. */
+	if (!buf_len || !period_len || period_len > buf_len ||
+	    buf_len % period_len || buf_len > U32_MAX ||
+	    check_add_overflow(buf_addr, (dma_addr_t)buf_len, &buf_end))
 		return NULL;
 
 	adtx = kzalloc_obj(*adtx, GFP_NOWAIT);
@@ -298,7 +323,7 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 
 	adtx->buf_addr = buf_addr;
 	adtx->buf_len = buf_len;
-	adtx->buf_end = buf_addr + buf_len;
+	adtx->buf_end = buf_end;
 	adtx->period_len = period_len;
 
 	adtx->submitted_pos = 0;
@@ -314,10 +339,13 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 /*
  * Write one hardware descriptor for a dmaengine cyclic transaction.
  */
-static void admac_cyclic_write_one_desc(struct admac_data *ad, int channo,
+static bool admac_cyclic_write_one_desc(struct admac_data *ad, int channo,
 					struct admac_tx *tx)
 {
 	dma_addr_t addr;
+
+	if (tx->error)
+		return false;
 
 	addr = tx->buf_addr + (tx->submitted_pos % tx->buf_len);
 
@@ -331,16 +359,19 @@ static void admac_cyclic_write_one_desc(struct admac_data *ad, int channo,
 	writel_relaxed(upper_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
 	writel_relaxed(tx->period_len,      ad->base + REG_DESC_WRITE(channo));
 	writel_relaxed(FLAG_DESC_NOTIFY,    ad->base + REG_DESC_WRITE(channo));
+	/* Include a descriptor already consumed while the ring is refilled. */
+	tx->nperiods_outstanding++;
 
 	tx->submitted_pos += tx->period_len;
 	tx->submitted_pos %= 2 * tx->buf_len;
+	return true;
 }
 
 /*
  * Write all the hardware descriptors for a dmaengine cyclic
  * transaction there is space for.
  */
-static void admac_cyclic_write_desc(struct admac_data *ad, int channo,
+static bool admac_cyclic_write_desc(struct admac_data *ad, int channo,
 				    struct admac_tx *tx)
 {
 	int i;
@@ -348,8 +379,10 @@ static void admac_cyclic_write_desc(struct admac_data *ad, int channo,
 	for (i = 0; i < 4; i++) {
 		if (readl_relaxed(ad->base + REG_DESC_RING(ad, channo)) & RING_FULL)
 			break;
-		admac_cyclic_write_one_desc(ad, channo, tx);
+		if (!admac_cyclic_write_one_desc(ad, channo, tx))
+			return false;
 	}
+	return true;
 }
 
 static int admac_ring_noccupied_slots(int ringval)
@@ -413,15 +446,23 @@ static enum dma_status admac_tx_status(struct dma_chan *chan, dma_cookie_t cooki
 	unsigned long flags;
 
 	ret = dma_cookie_status(chan, cookie, txstate);
-	if (ret == DMA_COMPLETE || !txstate)
+	if (ret == DMA_COMPLETE)
 		return ret;
 
 	spin_lock_irqsave(&adchan->lock, flags);
 	adtx = adchan->current_tx;
 
+	if (!txstate) {
+		if (adtx && adtx->tx.cookie == cookie && adtx->error)
+			ret = DMA_ERROR;
+		spin_unlock_irqrestore(&adchan->lock, flags);
+		return ret;
+	}
+
 	if (adtx && adtx->tx.cookie == cookie) {
-		ret = DMA_IN_PROGRESS;
-		residue = admac_cyclic_read_residue(ad, adchan->no, adtx);
+		ret = adtx->error ? DMA_ERROR : DMA_IN_PROGRESS;
+		residue = adtx->error ? adtx->buf_len :
+			admac_cyclic_read_residue(ad, adchan->no, adtx);
 	} else {
 		ret = DMA_IN_PROGRESS;
 		residue = 0;
@@ -524,10 +565,19 @@ static void admac_start_current_tx(struct admac_chan *adchan)
 
 	admac_reset_rings(adchan);
 	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, ch));
+	if (ad->split_channels) {
+		/* T8132 separates the memory and peripheral sides of a channel. */
+		writel_relaxed(0x29b0000, ad->base + REG_CHAN_CONFIG(ad, ch));
+		writel_relaxed(0x302, ad->base + REG_CHAN_BURST(ad, ch));
+		writel_relaxed(CHAN_ENABLE_MEMORY | CHAN_ENABLE_PERIPHERAL,
+			       ad->base + REG_CHAN_ENABLE(ad, ch));
+	}
 
-	admac_cyclic_write_one_desc(ad, ch, adchan->current_tx);
+	if (!admac_cyclic_write_one_desc(ad, ch, adchan->current_tx))
+		return;
 	admac_start_chan(adchan);
-	admac_cyclic_write_desc(ad, ch, adchan->current_tx);
+	if (!admac_cyclic_write_desc(ad, ch, adchan->current_tx))
+		admac_stop_chan(adchan);
 }
 
 static void admac_issue_pending(struct dma_chan *chan)
@@ -561,10 +611,17 @@ static int admac_pause(struct dma_chan *chan)
 static int admac_resume(struct dma_chan *chan)
 {
 	struct admac_chan *adchan = to_admac_chan(chan);
+	unsigned long flags;
+	int ret = 0;
 
-	admac_start_chan(adchan);
+	spin_lock_irqsave(&adchan->lock, flags);
+	if (adchan->current_tx && adchan->current_tx->error)
+		ret = -EIO;
+	else
+		admac_start_chan(adchan);
+	spin_unlock_irqrestore(&adchan->lock, flags);
 
-	return 0;
+	return ret;
 }
 
 static int admac_terminate_all(struct dma_chan *chan)
@@ -624,6 +681,22 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 	int ret;
 
 	dma_cookie_init(&adchan->chan);
+
+	/*
+	 * No register access at probe: on the T6040 the controller sits in a
+	 * power domain the AOP firmware manages, and it is only powered once
+	 * the audio driver has set the audio power state, before its first
+	 * channel request. The one-time CTL write is done here, before the
+	 * first carveout access.
+	 */
+	mutex_lock(&ad->cache_alloc_lock);
+	if (!ad->ctl_programmed) {
+		if (ad->split_channels)
+			writel_relaxed(0x18080001, ad->base + REG_CTL);
+		ad->ctl_programmed = true;
+	}
+	mutex_unlock(&ad->cache_alloc_lock);
+
 	ret = admac_alloc_sram_carveout(ad, admac_chan_direction(adchan->no),
 					&adchan->carveout);
 	if (ret < 0)
@@ -687,7 +760,16 @@ static int admac_drain_reports(struct admac_data *ad, int channo)
 
 static void admac_handle_status_err(struct admac_data *ad, int channo)
 {
+	struct admac_chan *adchan = &ad->channels[channo];
+	unsigned long flags;
 	bool handled = false;
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	if (adchan->current_tx) {
+		adchan->current_tx->error = true;
+		adchan->nperiod_acks = 0;
+		admac_stop_chan(adchan);
+	}
 
 	if (readl_relaxed(ad->base + REG_DESC_RING(ad, channo)) & RING_ERR) {
 		writel_relaxed(RING_ERR, ad->base + REG_DESC_RING(ad, channo));
@@ -706,6 +788,7 @@ static void admac_handle_status_err(struct admac_data *ad, int channo)
 		admac_modify(ad, REG_CHAN_INTMASK(ad, channo, ad->irq_index),
 			     STATUS_ERR, 0);
 	}
+	spin_unlock_irqrestore(&adchan->lock, flags);
 }
 
 static void admac_handle_status_desc_done(struct admac_data *ad, int channo)
@@ -723,13 +806,26 @@ static void admac_handle_status_desc_done(struct admac_data *ad, int channo)
 	if (adchan->current_tx) {
 		struct admac_tx *tx = adchan->current_tx;
 
+		/* Never turn an unowned report into a period callback. */
+		if (tx->error || (unsigned int)nreports > tx->nperiods_outstanding)
+			goto error;
+
+		tx->nperiods_outstanding -= nreports;
 		adchan->nperiod_acks += nreports;
 		tx->reclaimed_pos += nreports * tx->period_len;
 		tx->reclaimed_pos %= 2 * tx->buf_len;
 
-		admac_cyclic_write_desc(ad, channo, tx);
+		if (!admac_cyclic_write_desc(ad, channo, tx))
+			goto error;
 		tasklet_schedule(&adchan->tasklet);
+		goto out;
+error:
+		tx->error = true;
+		adchan->nperiod_acks = 0;
+		admac_stop_chan(adchan);
+		dev_err_ratelimited(ad->dev, "ch%d completion accounting error\n", channo);
 	}
+out:
 	spin_unlock_irqrestore(&adchan->lock, flags);
 }
 
@@ -798,9 +894,18 @@ static void admac_chan_tasklet(struct tasklet_struct *t)
 	tx_result.result = DMA_TRANS_NOERROR;
 	tx_result.residue = 0;
 
-	dmaengine_desc_get_callback(&adtx->tx, &cb);
-	while (nacks--)
+	while (nacks--) {
+		spin_lock_irq(&adchan->lock);
+		if (adchan->current_tx != adtx || adtx->error) {
+			spin_unlock_irq(&adchan->lock);
+			break;
+		}
+		dmaengine_desc_get_callback(&adtx->tx, &cb);
+		spin_unlock_irq(&adchan->lock);
+
+		/* The callback may terminate this cyclic transaction. */
 		dmaengine_desc_callback_invoke(&cb, &tx_result);
+	}
 }
 
 static int admac_device_config(struct dma_chan *chan,
@@ -812,11 +917,6 @@ static int admac_device_config(struct dma_chan *chan,
 	int wordsize = 0;
 	u32 bus_width = readl_relaxed(ad->base + REG_BUS_WIDTH(ad, adchan->no)) &
 		~(BUS_WIDTH_WORD_SIZE | BUS_WIDTH_FRAME_SIZE);
-
-	if (ad->set_unk28) {
-		writel_relaxed(T603X_UNK_28_VAL, ad->base + REG_UNK_28);
-		writel_relaxed(T603X_UNK_28_VAL, ad->base + REG_UNK_2C);
-	}
 
 	switch (is_tx ? config->dst_addr_width : config->src_addr_width) {
 	case DMA_SLAVE_BUSWIDTH_1_BYTE:
@@ -853,6 +953,11 @@ static int admac_device_config(struct dma_chan *chan,
 		break;
 	default:
 		return -EINVAL;
+	}
+
+	if (ad->set_unk28) {
+		writel_relaxed(T603X_UNK_28_VAL, ad->base + REG_UNK_28);
+		writel_relaxed(T603X_UNK_28_VAL, ad->base + REG_UNK_2C);
 	}
 
 	writel_relaxed(bus_width, ad->base + REG_BUS_WIDTH(ad, adchan->no));
@@ -907,6 +1012,7 @@ static int admac_probe(struct platform_device *pdev)
 	ad->nchannels = nchannels;
 	ad->set_unk28 = hw->set_unk28;
 	ad->evolved_layout = hw->evolved_layout;
+	ad->split_channels = hw->split_channels;
 	mutex_init(&ad->cache_alloc_lock);
 
 	/*
@@ -1029,6 +1135,15 @@ static const struct admac_hw admac_t8122_hw = {
 	.set_unk28 = true,
 };
 
+/*
+ * T8132 keeps the TX and RX channel blocks in separate banks, the same
+ * register layout as the T8140 "evolved" one.
+ */
+static const struct admac_hw admac_t8132_hw = {
+	.evolved_layout = true,
+	.split_channels = true,
+};
+
 static const struct admac_hw admac_t8140_hw = {
 	.set_unk28 = true,
 	.evolved_layout = true,
@@ -1036,6 +1151,7 @@ static const struct admac_hw admac_t8140_hw = {
 
 static const struct of_device_id admac_of_match[] = {
 	{ .compatible = "apple,t8140-admac", .data = &admac_t8140_hw },
+	{ .compatible = "apple,t8132-admac", .data = &admac_t8132_hw },
 	{ .compatible = "apple,t8122-admac", .data = &admac_t8122_hw },
 	{ .compatible = "apple,t8103-admac", .data = &admac_t8013_hw },
 	{ .compatible = "apple,admac", .data = &admac_t8013_hw },

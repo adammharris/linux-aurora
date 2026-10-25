@@ -6,6 +6,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+&SOC_NODE {
 	DIE_NODE(pcie_ge): pcie@1680000000 {
 		compatible = "apple,t6020-pcie-ge", "apple,t6020-pcie";
 		device_type = "pci";
@@ -85,3 +86,4 @@
 		power-domains = <&DIE_NODE(ps_apcie_ge_sys)>;
 		status = "disabled";
 	};
+};

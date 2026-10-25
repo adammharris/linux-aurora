@@ -186,7 +186,7 @@ obj-$(CONFIG_DRM_VMWGFX)+= vmwgfx/
 obj-$(CONFIG_DRM_VGEM)	+= vgem/
 obj-$(CONFIG_DRM_VKMS)	+= vkms/
 obj-$(CONFIG_DRM_NOUVEAU) +=nouveau/
-obj-$(CONFIG_DRM_NOVA) += nova/
+# nova-drm is built from drivers/gpu/Makefile together with nova-core.
 obj-$(CONFIG_DRM_EXYNOS) +=exynos/
 obj-$(CONFIG_DRM_ROCKCHIP) +=rockchip/
 obj-$(CONFIG_DRM_GMA500) += gma500/
@@ -227,6 +227,8 @@ obj-$(CONFIG_DRM_LIMA)  += lima/
 obj-$(CONFIG_DRM_PANFROST) += panfrost/
 obj-$(CONFIG_DRM_PANTHOR) += panthor/
 obj-$(CONFIG_DRM_TYR) += tyr/
+obj-$(CONFIG_DRM_APPLE_FABRIC_CORE) += apple/dcp-fabric-core.o
+obj-$(CONFIG_DRM_APPLE_FABRIC_KUNIT_TEST) += apple/dcp-fabric-test.o
 obj-$(CONFIG_DRM_APPLE) += apple/
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple/iomfb-state-test.o
 obj-$(CONFIG_DRM_ASPEED_GFX) += aspeed/

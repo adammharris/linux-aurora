@@ -1285,7 +1285,7 @@ static int snd_ftu_eff_switch_init(struct usb_mixer_interface *mixer,
 
 	err = snd_usb_ctl_msg(dev, usb_rcvctrlpipe(dev, 0), UAC_GET_CUR,
 			      USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_IN,
-			      pval & 0xff00,
+			      (pval & 0xff00) | ((pval & 0xff0000) >> 16),
 			      snd_usb_ctrl_intf(mixer->hostif) | ((pval & 0xff) << 8),
 			      value, 2);
 	if (err < 0)
@@ -1318,7 +1318,7 @@ static int snd_ftu_eff_switch_update(struct usb_mixer_elem_list *list)
 			       usb_sndctrlpipe(chip->dev, 0),
 			       UAC_SET_CUR,
 			       USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_OUT,
-			       pval & 0xff00,
+			       (pval & 0xff00) | ((pval & 0xff0000) >> 16),
 			       snd_usb_ctrl_intf(list->mixer->hostif) | ((pval & 0xff) << 8),
 			       value, 2);
 }
@@ -1738,6 +1738,44 @@ static int snd_c400_create_effect_ret_vol_ctls(struct usb_mixer_interface *mixer
 	return 0;
 }
 
+/* output gain knob selectively adjusts outputs as stereo pairs */
+/* reuses functions from FTU effect switch */
+static int snd_c400_knob_switch_info(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_info *uinfo)
+{
+	static const char *const texts[8] = {
+		"None", "1/2", "3/4", "1/2 3/4",
+		"5/6", "1/2 5/6", "3/4 5/6", "1/2 3/4 5/6"
+	};
+
+	return snd_ctl_enum_info(uinfo, 1, ARRAY_SIZE(texts), texts);
+}
+
+static int snd_c400_create_knob_switch(struct usb_mixer_interface *mixer,
+	int validx, int bUnitID)
+{
+	static struct snd_kcontrol_new template = {
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "Output Gain Knob",
+		.index = 0,
+		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+		.info = snd_c400_knob_switch_info,
+		.get = snd_ftu_eff_switch_get,
+		.put = snd_ftu_eff_switch_put
+	};
+	struct usb_mixer_elem_list *list;
+	int err;
+
+	err = add_single_ctl_with_resume(mixer, bUnitID,
+					 snd_ftu_eff_switch_update,
+					 &template, &list);
+	if (err < 0)
+		return err;
+	list->kctl->private_value = (validx << 8) | bUnitID;
+	snd_ftu_eff_switch_init(mixer, list->kctl);
+	return 0;
+}
+
 static int snd_c400_create_mixer(struct usb_mixer_interface *mixer)
 {
 	int err;
@@ -1767,6 +1805,10 @@ static int snd_c400_create_mixer(struct usb_mixer_interface *mixer)
 		return err;
 
 	err = snd_c400_create_effect_feedback_ctl(mixer);
+	if (err < 0)
+		return err;
+
+	err = snd_c400_create_knob_switch(mixer, 0x0900, 0x20);
 	if (err < 0)
 		return err;
 
@@ -3438,6 +3480,10 @@ static int snd_rme_digiface_write_reg(struct snd_kcontrol *kcontrol, int item, u
 	struct usb_device *dev = chip->dev;
 	int err;
 
+	CLASS(snd_usb_lock, pm)(chip);
+	if (pm.err < 0)
+		return -EIO;
+
 	err = snd_usb_ctl_msg(dev, usb_sndctrlpipe(dev, 0),
 			      item,
 			      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
@@ -3456,6 +3502,10 @@ static int snd_rme_digiface_read_status(struct snd_kcontrol *kcontrol, u32 statu
 	struct usb_device *dev = chip->dev;
 	__le32 buf[4] = {};
 	int err;
+
+	CLASS(snd_usb_lock, pm)(chip);
+	if (pm.err < 0)
+		return -EIO;
 
 	err = snd_usb_ctl_msg(dev, usb_rcvctrlpipe(dev, 0),
 			      RME_DIGIFACE_READ_STATUS,
@@ -3878,6 +3928,7 @@ static int snd_rme_digiface_controls_create(struct usb_mixer_interface *mixer)
 #define SND_DJM_450_IDX		0x5
 #define SND_DJM_A9_IDX		0x6
 #define SND_DJM_V10_IDX	0x7
+#define SND_DJM_S11_IDX	0x8
 
 #define SND_DJM_CTL(_name, suffix, _default_value, _windex) { \
 	.name = _name, \
@@ -4218,6 +4269,21 @@ static const struct snd_djm_ctl snd_djm_ctls_v10[] = {
 	// playback channels are fixed and controlled by hardware knobs on the mixer
 };
 
+// DJM-S11
+static const u16 snd_djm_opts_s11_cap1[] = {
+	0x0100, 0x0103, 0x0106, 0x0107, 0x0108, 0x0109, 0x010d };
+static const u16 snd_djm_opts_s11_cap2[] = {
+	0x0200, 0x0203, 0x0206, 0x0207, 0x0208, 0x0209, 0x020d };
+static const u16 snd_djm_opts_s11_cap3[] = {
+	0x0307, 0x0308, 0x0309, 0x030a, 0x030d, 0x0311, 0x0312 };
+
+static const struct snd_djm_ctl snd_djm_ctls_s11[] = {
+	SND_DJM_CTL("Master Input Level Capture Switch", cap_level, 0, SND_DJM_WINDEX_CAPLVL),
+	SND_DJM_CTL("Input 1 Capture Switch", s11_cap1, 1, SND_DJM_WINDEX_CAP),
+	SND_DJM_CTL("Input 2 Capture Switch", s11_cap2, 1, SND_DJM_WINDEX_CAP),
+	SND_DJM_CTL("Input 3 Capture Switch", s11_cap3, 3, SND_DJM_WINDEX_CAP)
+};
+
 static const struct snd_djm_device snd_djm_devices[] = {
 	[SND_DJM_250MK2_IDX] = SND_DJM_DEVICE(250mk2),
 	[SND_DJM_750_IDX] = SND_DJM_DEVICE(750),
@@ -4227,6 +4293,7 @@ static const struct snd_djm_device snd_djm_devices[] = {
 	[SND_DJM_450_IDX] = SND_DJM_DEVICE(450),
 	[SND_DJM_A9_IDX] = SND_DJM_DEVICE(a9),
 	[SND_DJM_V10_IDX] = SND_DJM_DEVICE(v10),
+	[SND_DJM_S11_IDX] = SND_DJM_DEVICE(s11),
 };
 
 static int snd_djm_controls_info(struct snd_kcontrol *kctl,
@@ -4530,6 +4597,9 @@ int snd_usb_mixer_apply_create_quirk(struct usb_mixer_interface *mixer)
 		break;
 	case USB_ID(0x2b73, 0x0034): /* Pioneer DJ DJM-V10 */
 		err = snd_djm_controls_create(mixer, SND_DJM_V10_IDX);
+		break;
+	case USB_ID(0x2b73, 0x0037): /* Pioneer DJ DJM-S11 */
+		err = snd_djm_controls_create(mixer, SND_DJM_S11_IDX);
 		break;
 	case USB_ID(0x03f0, 0x0269): /* HP TB Dock G2 */
 		err = hp_dock_mixer_create(mixer);

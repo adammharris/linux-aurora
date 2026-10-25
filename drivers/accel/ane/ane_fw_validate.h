@@ -3,28 +3,26 @@
  * ane_fw_validate.h — pinned ANE firmware images, their validator, and
  * iBoot's runtime patches.
  *
- * Single source of truth shared by the kernel loader
- * (ane_t6021_fwload.c) and the offline regression
- * (tools/h14_boot_regression.c). Strict EXACT-image assertions (no
+ * Single source of truth for the kernel loader (ane_t6021_fwload.c);
+ * it also builds in userspace. Strict EXACT-image assertions (no
  * generic Mach-O parsing).
  *
- * The images are the macOS 13.5 (22G74) payloads that iBoot preloads on
- * the stub every Omarchy install boots: selene for T6020/T6021/T6022
- * (byte-verified live at SEG0 on T6021, notebook 20260926T230146Z) and
- * bia for T8112 (receipts/2026-10-01-t8112-ane). Both have 5 load
- * commands (2 segments + LC_SYMTAB + LC_UUID + LC_UNIXTHREAD), entry 0.
+ * The images are the macOS 13.5 (22G74) payloads that iBoot preloads
+ * for a 13.5 boot stub: selene for T6020/T6021/T6022 and bia for
+ * T8112. Both have 5 load commands (2 segments + LC_SYMTAB + LC_UUID +
+ * LC_UNIXTHREAD), entry 0.
  *
  * Userspace consumers typedef u8/u32/u64/size_t/bool and provide
- * get_unaligned_le32/64, memcmp and memcpy (see that tool's source);
- * kernel consumers get these from linux/types.h + linux/string.h.
- * This header intentionally includes nothing.
+ * get_unaligned_le32/64, memcmp and memcpy; kernel consumers get these
+ * from linux/types.h + linux/string.h. This header intentionally
+ * includes nothing.
  */
 #ifndef __ANE_FW_VALIDATE_H__
 #define __ANE_FW_VALIDATE_H__
 
-/* FWIM surface size = 0x500000 bytes (Main
- * 2026-09-20, audit 751caa4, T6021). Covers the selene vmsize 0x4fc000
- * and the bia vmsize 0x4ec000; NOT derivable from the blob length.
+/* FWIM surface size = 0x500000 bytes (T6021). Covers the selene vmsize
+ * 0x4fc000 and the bia vmsize 0x4ec000; NOT derivable from the blob
+ * length.
  */
 #define ANE_FW_BUF_SIZE		0x500000
 #define ANE_FW_ENTRY_PC		0x0
@@ -252,10 +250,9 @@ ane_fw_validate_blob(const u8 *blob, size_t size,
 /*
  * iBoot runtime patches. iBoot places the image at its Mach-O vm layout
  * (TEXT vm 0, DATA vm segs[1].vmaddr) and then writes the fields below.
- * The 17 pre-Linux T6021 captures (receipts/2026-10-01-t602x-independent)
- * differ from the archive in these bytes only; only the stack guard
- * changes between boots. A driver that runs its own copy writes them
- * itself.
+ * Images captured on T6021 before Linux runs differ from the archive in
+ * these bytes only; only the stack guard changes between boots. A
+ * driver that runs its own copy writes them itself.
  *
  * Each __rtk_patch_* record is {u32 tag, u32 value length, value}.
  */
@@ -269,10 +266,9 @@ ane_fw_validate_blob(const u8 *blob, size_t size,
  * whose key <= the chip revision: header {type 1, flags 3 (20-byte
  * records), capacity 0x24, count, u32 key}, then {u32 offset, u64 mask,
  * u64 value} per record (iBoot table offsets carry flag bit 30; the
- * block does not). Source: the 25G83 iBoot's records
- * (receipts/2026-10-01-t8112-optin). On T6021 the block that the 13.5
- * iBoot leaves in the preloaded image (the captures) equals the 25G83
- * records exactly.
+ * block does not). Source: the 25G83 iBoot's records. On T6021 the
+ * block that the 13.5 iBoot leaves in the preloaded image (the
+ * captures) equals the 25G83 records exactly.
  */
 struct ane_asc_tunable {
 	u32 off;

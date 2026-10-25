@@ -63,6 +63,13 @@ struct dptx_port {
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
 	u32 trained_voltage[4], trained_pre[4];
+	/*
+	 * The sink's tile topology as DCP reports it in SetTiledDisplayHints:
+	 * tiles across and down, and this stream's tile. Valid once
+	 * tile_hint is set; cleared whenever the port (re)connects.
+	 */
+	bool tile_hint;
+	u8 tiles_h, tiles_v, tile_x, tile_y;
 };
 
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
@@ -74,5 +81,8 @@ int dptxport_release_display(struct apple_epic_service *service);
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd);
 int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 			     unsigned int timeout_ms);
+int dptxport_sink_irq(struct apple_epic_service *service);
 
+struct apple_dcp;
+int dpav_ctrl_init(struct apple_dcp *dcp);
 #endif

@@ -8,6 +8,7 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/capability.h>
 #include <crypto/if_alg.h>
 #include <linux/crypto.h>
 #include <linux/init.h>
@@ -22,9 +23,27 @@
 #include <linux/sched/signal.h>
 #include <linux/security.h>
 #include <linux/string.h>
+#include <linux/sysctl.h>
+#include <linux/user_namespace.h>
 #include <keys/user-type.h>
 #include <keys/trusted-type.h>
 #include <keys/encrypted-type.h>
+
+static int af_alg_restrict = 1;
+
+static const struct ctl_table af_alg_table[] = {
+	{
+		.procname       = "af_alg_restrict",
+		.data           = &af_alg_restrict,
+		.maxlen         = sizeof(int),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_TWO,
+	},
+};
+
+static struct ctl_table_header *af_alg_header;
 
 struct alg_type_list {
 	const struct af_alg_type *type;
@@ -110,6 +129,43 @@ int af_alg_unregister_type(const struct af_alg_type *type)
 }
 EXPORT_SYMBOL_GPL(af_alg_unregister_type);
 
+static bool af_alg_capable(void)
+{
+	return ns_capable_noaudit(&init_user_ns, CAP_NET_ADMIN) ||
+	       capable(CAP_SYS_ADMIN);
+}
+
+int af_alg_check_restriction(const char *name,
+			     const struct af_alg_allowlist_entry allowlist[])
+{
+	int level = READ_ONCE(af_alg_restrict);
+
+	if (level == 0)
+		return 0;
+	if (level == 1) {
+		for (const struct af_alg_allowlist_entry *ent = allowlist;
+		     ent->name; ent++) {
+			if (strcmp(name, ent->name) == 0) {
+				if ((ent->flags & AF_ALG_UNPRIVILEGED) ||
+				    af_alg_capable())
+					return 0;
+				/* List contains at most one entry per name. */
+				break;
+			}
+		}
+	}
+	/*
+	 * Use -ENOENT (the error code for "algorithm not found") instead of
+	 * -EACCES or -EPERM, for the highest chance of correctly triggering
+	 * fallback code paths in userspace programs.
+	 *
+	 * Don't log a warning, since it would be noisy.  iwd tries to bind a
+	 * bunch of algorithms that it never uses.
+	 */
+	return -ENOENT;
+}
+EXPORT_SYMBOL_GPL(af_alg_check_restriction);
+
 static void alg_do_release(const struct af_alg_type *type, void *private)
 {
 	if (!type)
@@ -181,7 +237,7 @@ static int alg_bind(struct socket *sock, struct sockaddr_unsized *uaddr, int add
 	if (IS_ERR(type))
 		return PTR_ERR(type);
 
-	private = type->bind(sa->salg_name, sa->salg_feat, sa->salg_mask);
+	private = type->bind(sa->salg_name);
 	if (IS_ERR(private)) {
 		module_put(type->owner);
 		return PTR_ERR(private);
@@ -505,6 +561,9 @@ static int alg_create(struct net *net, struct socket *sock, int protocol,
 {
 	struct sock *sk;
 	int err;
+
+	if (READ_ONCE(af_alg_restrict) == 2)
+		return -EAFNOSUPPORT;
 
 	if (sock->type != SOCK_SEQPACKET)
 		return -ESOCKTNOSUPPORT;
@@ -1086,35 +1145,6 @@ void af_alg_free_resources(struct af_alg_async_req *areq)
 EXPORT_SYMBOL_GPL(af_alg_free_resources);
 
 /**
- * af_alg_async_cb - AIO callback handler
- * @data: async request completion data
- * @err: if non-zero, error result to be returned via ki_complete();
- *       otherwise return the AIO output length via ki_complete().
- *
- * This handler cleans up the struct af_alg_async_req upon completion of the
- * AIO operation.
- *
- * The number of bytes to be generated with the AIO operation must be set
- * in areq->outlen before the AIO callback handler is invoked.
- */
-void af_alg_async_cb(void *data, int err)
-{
-	struct af_alg_async_req *areq = data;
-	struct sock *sk = areq->sk;
-	struct kiocb *iocb = areq->iocb;
-	unsigned int resultlen;
-
-	/* Buffer size written by crypto operation. */
-	resultlen = areq->outlen;
-
-	af_alg_free_resources(areq);
-	sock_put(sk);
-
-	iocb->ki_complete(iocb, err ? err : (int)resultlen);
-}
-EXPORT_SYMBOL_GPL(af_alg_async_cb);
-
-/**
  * af_alg_poll - poll system call handler
  * @file: file pointer
  * @sock: socket to poll
@@ -1154,8 +1184,8 @@ struct af_alg_async_req *af_alg_alloc_areq(struct sock *sk,
 	struct af_alg_ctx *ctx = alg_sk(sk)->private;
 	struct af_alg_async_req *areq;
 
-	/* Only one AIO request can be in flight. */
-	if (ctx->inflight)
+	/* Only one request can be in flight. */
+	if (WARN_ON_ONCE(ctx->inflight))
 		return ERR_PTR(-EBUSY);
 
 	areq = sock_kmalloc(sk, areqlen, GFP_KERNEL);
@@ -1251,27 +1281,32 @@ EXPORT_SYMBOL_GPL(af_alg_get_rsgl);
 
 static int __init af_alg_init(void)
 {
-	int err = proto_register(&alg_proto, 0);
+	int err;
 
+	af_alg_header = register_sysctl("crypto", af_alg_table);
+
+	err = proto_register(&alg_proto, 0);
 	if (err)
-		goto out;
+		goto out_unregister_sysctl;
 
 	err = sock_register(&alg_family);
-	if (err != 0)
+	if (err)
 		goto out_unregister_proto;
 
-out:
-	return err;
+	return 0;
 
 out_unregister_proto:
 	proto_unregister(&alg_proto);
-	goto out;
+out_unregister_sysctl:
+	unregister_sysctl_table(af_alg_header);
+	return err;
 }
 
 static void __exit af_alg_exit(void)
 {
 	sock_unregister(PF_ALG);
 	proto_unregister(&alg_proto);
+	unregister_sysctl_table(af_alg_header);
 }
 
 module_init(af_alg_init);

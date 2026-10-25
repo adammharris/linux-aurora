@@ -283,7 +283,7 @@
 			cache-unified;
 			cache-size = <0x1000000>;
 		};
-	 };
+	};
 
 	die0: soc@200000000 {
 		compatible = "simple-bus";
@@ -315,35 +315,32 @@
 	};
 };
 
-
 #define DIE
 #define DIE_NO 0
+#define SOC_NODE die0
 
-&die0 {
-	#include "t6031-die0.dtsi"
-	#include "t6031-dieX.dtsi"
-};
-
+#include "t6031-die0.dtsi"
+#include "t6031-dieX.dtsi"
 #include "t6031-pmgr.dtsi"
 #include "t6031-gpio-pins.dtsi"
 
 #undef DIE
 #undef DIE_NO
+#undef SOC_NODE
 
 #define DIE _die1
 #define DIE_NO 1
+#define SOC_NODE die1
 
-&die1 {
-	#include "t6031-dieX.dtsi"
-	#include "t6031-nvme.dtsi"
-};
-
+#include "t6031-dieX.dtsi"
+#include "t6031-nvme.dtsi"
 #include "t6031-pmgr.dtsi"
 
 /delete-node/ &ps_pmp_die1;
 
 #undef DIE
 #undef DIE_NO
+#undef SOC_NODE
 
 /* delete non-present DISP power-states */
 /delete-node/ &ps_disp_cpu;
@@ -352,6 +349,8 @@
 /delete-node/ &ps_disp_fe_die1;
 /delete-node/ &ps_disp_sys;
 /delete-node/ &ps_disp_sys_die1;
+
+/delete-node/ &pmp_report_disp;
 
 /* delete non-present ISP power-states */
 /delete-node/ &isp_dart0;
@@ -373,39 +372,66 @@
 /delete-node/ &ps_isp_sys;
 /delete-node/ &ps_isp_sys_die1;
 
+/delete-node/ &pmp_report_isp_sys;
+
+/* Disable ANS PMP reporting */
+/delete-node/ &pmp_report_ans;
+&ans_mbox_die1 {
+	power-domains = <&ps_ans_die1>;
+};
+&sart_die1 {
+	power-domains = <&ps_ans_die1>;
+};
+&nvme_die1 {
+	power-domains = <&ps_ans_die1>,
+	                <&ps_apcie_sys_st_die1>,
+	                <&ps_apcie_sys_st1_die1>;
+};
+
 &ps_afi_d2d_0 {
 	status = "okay";
 };
+
 &ps_afi_d2d_0_die1 {
 	status = "okay";
 };
+
 &ps_afi_d2d_1 {
 	status = "okay";
 };
+
 &ps_afi_d2d_1_die1 {
 	status = "okay";
 };
+
 &ps_afc_d2d_0 {
 	status = "okay";
 };
+
 &ps_afc_d2d_0_die1{
 	status = "okay";
 };
+
 &ps_afc_d2d_1 {
 	status = "okay";
 };
+
 &ps_afc_d2d_1_die1 {
 	status = "okay";
 };
+
 &ps_afr_d2d_0 {
 	status = "okay";
 };
+
 &ps_afr_d2d_0_die1 {
 	status = "okay";
 };
+
 &ps_afr_d2d_1 {
 	status = "okay";
 };
+
 &ps_afr_d2d_1_die1 {
 	status = "okay";
 };

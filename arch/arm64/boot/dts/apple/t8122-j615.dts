@@ -18,6 +18,10 @@
 	compatible = "apple,j615", "apple,t8122", "apple,arm-platform";
 	model = "Apple MacBook Air (15-inch, M3, 2024)";
 
+	aliases {
+		sep = &sep;
+	};
+
 	led-controller {
 		compatible = "pwm-leds";
 		led-0 {
@@ -29,6 +33,22 @@
 			default-state = "keep";
 		};
 	};
+};
+
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j615", "apple,panel";
+		/* 2880x1864 at 224 ppi; 64 notch rows above the desktop. */
+		width-mm = <327>;
+		height-mm = <211>;
+		adj-height-mm = <204>;
+		apple,max-brightness = <500>;
+	};
+};
+
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
 };
 
 &aop_mbox {
@@ -61,12 +81,12 @@
 };
 
 &i2c1 {
-	speaker_left_woof: codec@38 {
+	speaker_left_woof1: codec@38 {
 		compatible = "ti,sn012776", "ti,tas2764";
 		reg = <0x38>;
 		shutdown-gpios = <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
 		#sound-dai-cells = <0>;
-		sound-name-prefix = "Left Woofer";
+		sound-name-prefix = "Left Woofer 1";
 		interrupts-extended = <&pinctrl_ap 12 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <0>;
 		ti,vmon-slot-no = <2>;
@@ -82,15 +102,26 @@
 		ti,imon-slot-no = <8>;
 		ti,vmon-slot-no = <10>;
 	};
+
+	speaker_left_woof2: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		shutdown-gpios = <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 12 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
 };
 
 &i2c3 {
-	speaker_right_woof: codec@3b {
+	speaker_right_woof1: codec@3b {
 		compatible = "ti,sn012776", "ti,tas2764";
 		reg = <0x3b>;
 		shutdown-gpios = <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
 		#sound-dai-cells = <0>;
-		sound-name-prefix = "Right Woofer";
+		sound-name-prefix = "Right Woofer 1";
 		interrupts-extended = <&pinctrl_ap 12 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <4>;
 		ti,vmon-slot-no = <6>;
@@ -105,6 +136,17 @@
 		interrupts-extended = <&pinctrl_ap 12 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <12>;
 		ti,vmon-slot-no = <14>;
+	};
+
+	speaker_right_woof2: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		shutdown-gpios = <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 12 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
 	};
 
 	jack_codec: codec@4b {
@@ -125,16 +167,16 @@
 		dai-link@0 {
 			link-name = "Speakers";
 			dai-tdm-idle-mode-0 = "zero";
-			dai-tdm-idle-mode-2 = "zero";
-			dai-tdm-slot-tx-idle-mask-0 = <0x0f0f>;
-			dai-tdm-slot-tx-idle-mask-2 = <0xf0f0>;
+			dai-tdm-idle-mode-3 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0x0f0f0f>;
+			dai-tdm-slot-tx-idle-mask-3 = <0xf0f0f0>;
 
 			cpu {
 				sound-dai = <&mca 0>, <&mca 1>;
 			};
 			codec {
-				sound-dai = <&speaker_left_woof>, <&speaker_left_tweet>,
-					    <&speaker_right_woof>, <&speaker_right_tweet>;
+				sound-dai = <&speaker_left_woof1>, <&speaker_left_tweet>, <&speaker_left_woof2>,
+					    <&speaker_right_woof1>, <&speaker_right_tweet>, <&speaker_right_woof2>;
 			};
 		};
 
@@ -199,6 +241,24 @@
 &isp {
 	apple,platform-id = <18>;
 	apple,temporal-filter = <1>;
+};
+
+/*
+ * Mesa fingerprint sensor on spi2 (J615 ADT /arm-io/spi2/mesa): power on
+ * NUB GPIO 29, active high. The data-ready line (AP GPIO 199) is left out,
+ * so the driver polls until its trigger is confirmed. Native chip select only.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_nub 29 GPIO_ACTIVE_HIGH>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/* Per-device factory data from this Mac's own iBoot system container. */
+	firmware-name = "apple/mesacal-j615.bin";
 };
 
 #include "hwmon-laptop.dtsi"

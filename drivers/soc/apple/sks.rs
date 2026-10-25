@@ -331,11 +331,11 @@ impl SepData {
         self.sks_seal(&op, &body)
     }
 
-    /// Endpoint init for the 13.5 key store, which must precede any other
-    /// request: `0x4d`, whose capability word sets the IPC header version to
-    /// `min(word, 2)`, then `set_env`.
-    /// Returns false if the key store must stay closed this boot.
-    /// The T6020 path sends nothing here.
+    /// Endpoint init on the 13.5 key store, before any other request: `0x4d`,
+    /// whose capability word sets the IPC header version to `min(word, 2)`,
+    /// then `set_env`. Returns false if the key store must stay closed this
+    /// boot.
+    /// The variant-5 key store sends nothing here.
     pub(crate) fn sks_init_endpoint(&self) -> bool {
         let profile::KeyStore::Sepos13 {
             cpx_encryption_mode,
@@ -579,12 +579,11 @@ impl SepData {
         if proof.slot() != keybag::Slot::Identity {
             return Err(EINVAL);
         }
-        // The 13.5 (T8103) and T6020 enclaves encode the identity bag
-        // differently; the per-SoC profile carries the field values (see
-        // profile::KeybagCreate). On 13.5 the identity-bag create carries:
-        // secret, an empty second
-        // blob and the 16-byte identity UUID, nothing after it, so the body
-        // has exactly this length.
+        // The 13.5 and variant-5 key stores encode the identity bag
+        // differently; the profile carries the field values (see
+        // profile::KeybagCreate). On 13.5 the request is: secret, an empty
+        // second blob and the 16-byte identity UUID, nothing after it, decoded
+        // as an exact-length message.
         let enc = &self.profile.keybag_create;
         let mut body = image::Body::new();
         body.put_u32(enc.variant)?;
@@ -689,8 +688,8 @@ impl SepData {
             self.sks_mark_create_refused(slot, out.reply.status);
             return false;
         };
-        // 13.5 replies with the struct version and the handle alone;
-        // the T6020 reply adds a blob.
+        // 13.5 replies with the struct version and the handle alone; the
+        // variant-5 reply adds a blob.
         let reply_min = match self.profile.key_store {
             profile::KeyStore::Sepos13 { .. } => 8,
             profile::KeyStore::Variant5 => 12,
@@ -1098,10 +1097,10 @@ impl SepData {
                 "sks: endpoint 0x{:02x} (key store) not advertised; {} EPs up (control={} xarm={} sbio={} scrd={}); keybag/ref-key cannot run\n",
                 proto::EP_SKS,
                 self.endpoint_count(),
-                self.endpoint_present(proto::EP_CONTROL) as u8,
-                self.endpoint_present(proto::EP_XARM) as u8,
-                self.endpoint_present(proto::EP_SBIO) as u8,
-                self.endpoint_present(proto::EP_SCRD) as u8,
+                u8::from(self.endpoint_present(proto::EP_CONTROL)),
+                u8::from(self.endpoint_present(proto::EP_XARM)),
+                u8::from(self.endpoint_present(proto::EP_SBIO)),
+                u8::from(self.endpoint_present(proto::EP_SCRD)),
             );
             return false;
         }

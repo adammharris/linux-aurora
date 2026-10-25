@@ -111,7 +111,7 @@ impl VmStatus {
         {
             return Err(EINVAL);
         }
-        let base = owner.vmap()?.as_mut_ptr();
+        let base = owner.vmap()?.addr.cast::<u8>();
         // SAFETY: The checked range is inside the retained, page-aligned mapping.
         let word = unsafe { base.add(offset) }.cast::<i32>();
         let mut mirror = self.mirror.lock();

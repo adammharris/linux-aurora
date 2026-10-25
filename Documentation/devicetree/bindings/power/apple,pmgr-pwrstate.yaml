@@ -11,6 +11,22 @@ maintainers:
 
 allOf:
   - $ref: power-domain.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-pmgr-pwrstate
+      required:
+        - compatible
+        - apple,inherited-on
+    then:
+      properties:
+        apple,firmware-owned: false
+        apple,always-on: false
+        apple,min-state: false
+        apple,force-disable: false
+        apple,force-reset: false
+        apple,externally-clocked: false
 
 description: |
   Apple SoCs include PMGR blocks responsible for power management,
@@ -47,6 +63,7 @@ properties:
               - apple,t6020-pmgr-pwrstate
               - apple,t6030-pmgr-pwrstate
               - apple,t6031-pmgr-pwrstate
+              - apple,t6041-pmgr-pwrstate
               - apple,t8122-pmgr-pwrstate
               - apple,t8132-pmgr-pwrstate
               - apple,t8140-pmgr-pwrstate
@@ -81,9 +98,22 @@ properties:
 
   apple,firmware-owned:
     description:
-      The boot loader hands over the coprocessor in this domain running, and its
-      firmware owns the domain's power state; writing it faults. The OS keeps the
-      domain on and never changes its power target, automatic gating or reset.
+      The boot loader hands over active hardware whose power domain remains
+      under firmware control. Its state register may not be CPU-accessible.
+      The OS keeps the domain on and never accesses its state register,
+      including reads, power target, automatic gating and reset. Availability
+      is supplied by the firmware handoff rather than determined by probing
+      the power-state register.
+    type: boolean
+
+  apple,inherited-on:
+    description:
+      The boot loader hands over an active domain whose state register can be
+      read, but whose power and reset transitions have not been handed over.
+      Both target and actual state must already be active, with reset,
+      auto-enable, reset-state, busy and device-disable indications clear.
+      The OS verifies that state, retains an always-on domain, and refuses
+      power-off and reset operations without writing its state register.
     type: boolean
 
   apple,min-state:

@@ -251,6 +251,8 @@ pub(crate) struct VmShrinker {
 // SAFETY: shrinker core serializes registration lifetime; callback VM operations
 // use its residency/reservation locks. raw is never dereferenced after free.
 unsafe impl Send for VmShrinker {}
+// SAFETY: Shared callbacks use the VM's residency/reservation locks. The
+// registration remains live until shrinker_free has drained all callbacks.
 unsafe impl Sync for VmShrinker {}
 
 impl VmShrinker {
@@ -273,7 +275,7 @@ impl VmShrinker {
         unsafe {
             (*raw).count_objects = Some(Self::count);
             (*raw).scan_objects = Some(Self::scan);
-            (*raw).private_data = (&*owner as *const Self).cast_mut().cast();
+            (*raw).private_data = core::ptr::from_ref(&*owner).cast_mut().cast();
             (*raw).seeks = 2;
             (*raw).batch = 256;
             kernel::bindings::shrinker_register(raw);
@@ -281,23 +283,36 @@ impl VmShrinker {
         Ok(owner)
     }
 
+    /// Count reclaimable pages.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be this owner's live registered shrinker. The core must
+    /// retain its private data until the callback returns.
     unsafe extern "C" fn count(
         raw: *mut kernel::bindings::shrinker,
         _sc: *mut kernel::bindings::shrink_control,
     ) -> kernel::ffi::c_ulong {
         // SAFETY: The registration owns this stable allocation until callbacks drain.
         let owner = unsafe { &*((*raw).private_data as *const Self) };
-        owner.vm.idle_reclaim_count() as _
+        owner.vm.idle_reclaim_count()
     }
 
+    /// Reclaim idle pages.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be this owner's live registered shrinker, and `sc` must
+    /// point to the initialized control supplied by the shrinker core.
     unsafe extern "C" fn scan(
         raw: *mut kernel::bindings::shrinker,
         sc: *mut kernel::bindings::shrink_control,
     ) -> kernel::ffi::c_ulong {
         // SAFETY: Both pointers are supplied by the registered shrinker core.
         let owner = unsafe { &*((*raw).private_data as *const Self) };
-        let target = unsafe { (*sc).nr_to_scan } as usize;
-        owner.vm.reclaim_idle_pages(target) as _
+        // SAFETY: The shrinker core supplies a live initialized control.
+        let target = unsafe { (*sc).nr_to_scan };
+        owner.vm.reclaim_idle_pages(target)
     }
 }
 
@@ -348,24 +363,30 @@ impl Vm {
         if self
             .status
             .as_ref()
-            .map_or(true, |status| status.get() != 0)
+            .is_none_or(|status| status.get() != 0)
         {
             return 0;
         }
         let idle = gate.idle();
-        let Some(mut inner) = self.inner.try_lock_private() else {
+        let Some(mut inner) = self.gpuvm.try_lock_private() else {
             return 0;
         };
         let mut pages = 0usize;
         // SAFETY: Counting changes no logical mapping/list. Private BOs share
         // this reservation; linked aliases retain their borrowed BO and GEM.
         let _ = unsafe { inner.for_each_private_bo(|_, bo| {
-            let object = bo.object();
-            // Purgeable objects count on busy VMs too; idle backing only on idle ones.
-            if object.idle_reclaim_candidate()
-                && (object.madv_locked() > 0 || idle)
-                && object.sole_sg_lease_releasable_locked()
-            {
+            let object = bo.obj();
+            // Count retained backing on idle VMs, and purgeable contents even if idle
+            // reclaim already released the table. Never wait on the BO mutex under resv.
+            let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
+            let advised = object.madv_locked() > 0;
+            let releasable = if segments.is_some() {
+                object.sole_sg_lease_releasable_locked()
+            } else {
+                (advised || object.has_sg_table_locked())
+                    && object.unleased_pages_releasable_locked()
+            };
+            if object.idle_reclaim_candidate() && (advised || idle) && releasable {
                 pages = pages.saturating_add(object.size() / kernel::page::PAGE_SIZE);
             }
             Ok(true)
@@ -385,32 +406,35 @@ impl Vm {
         if self
             .status
             .as_ref()
-            .map_or(true, |status| status.get() != 0)
+            .is_none_or(|status| status.get() != 0)
         {
             return 0;
         }
-        let Some(mut inner) = self.inner.try_lock_private() else {
+        let Some(mut inner) = self.gpuvm.try_lock_private() else {
             return 0;
         };
         let uat = inner.uat_inner.clone();
         let Some(shared) = uat.shared.try_lock() else {
             return 0;
         };
-        let contexts = shared.contexts_naming_root(inner.ttb());
+        let contexts = shared.contexts_naming_root(inner.ttb(), inner.uat_inner.m4_adopted);
         let mut purged = 0usize;
         // SAFETY: The private reservation excludes binding edits and restoration.
         // Callbacks change PTEs/flags only; all aliases stay linked.
         let _ = unsafe { inner.for_each_private_bo(|inner, bo| {
             if purged >= target { return Ok(false); }
-            let object = bo.object();
+            let object = bo.obj();
             if !object.idle_reclaim_candidate() || object.madv_locked() <= 0 {
                 return Ok(true);
             }
             {
-                let Some(bo_inner) = bo.inner().inner.try_lock() else { return Ok(true); };
-                if bo_inner.sgt.is_some() && !object.sole_sg_lease_releasable_locked() {
-                    return Ok(true);
-                }
+                let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
+                let releasable = if segments.is_some() {
+                    object.sole_sg_lease_releasable_locked()
+                } else {
+                    object.unleased_pages_releasable_locked()
+                };
+                if !releasable { return Ok(true); }
             }
             // Any mutation that does not end in a completed purge leaves
             // INVALIDATED aliases with cleared PTEs while madv stays >= 0, so
@@ -432,12 +456,11 @@ impl Vm {
                 return Err(error);
             }
             {
-                let Some(mut bo_inner) = bo.inner().inner.try_lock() else {
+                let Some(mut segments) = bo.data().segments.try_lock() else {
                     gate.note_evicted();
                     return Ok(true);
                 };
-                bo_inner.sg_vec = None;
-                bo_inner.sgt = None;
+                *segments = None;
             }
             if object.purge_locked().is_ok() {
                 crate::gem::set_mapping_held(object, false);
@@ -468,7 +491,7 @@ impl Vm {
         if self
             .status
             .as_ref()
-            .map_or(true, |status| status.get() != 0)
+            .is_none_or(|status| status.get() != 0)
             || !self
                 .lifetime
                 .as_ref()
@@ -476,28 +499,33 @@ impl Vm {
         {
             return purged;
         }
-        let Some(mut inner) = self.inner.try_lock_private() else {
+        let Some(mut inner) = self.gpuvm.try_lock_private() else {
             return purged;
         };
         let uat = inner.uat_inner.clone();
         let Some(shared) = uat.shared.try_lock() else {
             return purged;
         };
-        let contexts = shared.contexts_naming_root(inner.ttb());
+        let contexts = shared.contexts_naming_root(inner.ttb(), inner.uat_inner.m4_adopted);
         let mut unpinned = 0usize;
         // SAFETY: Exclusive residency and the private reservation exclude jobs,
         // binding edits and retirement. Callbacks change PTEs/flags only; all
         // logical aliases stay linked and retain their borrowed BO/GEM.
         let _ = unsafe { inner.for_each_private_bo(|inner, bo| {
             if unpinned >= target { return Ok(false); }
-            let object = bo.object();
+            let object = bo.obj();
             if !object.idle_reclaim_candidate() { return Ok(true); }
             {
                 // Avoid inversion against preparation (VmBoInner -> resv).
-                let Some(bo_inner) = bo.inner().inner.try_lock() else { return Ok(true); };
-                if bo_inner.sgt.is_none() || !object.sole_sg_lease_releasable_locked() {
-                    return Ok(true);
-                }
+                let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
+                let releasable = if segments.is_some() {
+                    object.sole_sg_lease_releasable_locked()
+                } else {
+                    // A competing lease may have made the previous release fail after we
+                    // dropped our segments. Retry that table, but do not count empty backing.
+                    object.has_sg_table_locked() && object.unleased_pages_releasable_locked()
+                };
+                if !releasable { return Ok(true); }
             }
             // The association retains SG backing until *all* aliases have
             // been invalidated and their device translations flushed. A
@@ -512,9 +540,8 @@ impl Vm {
                 Ok(())
             })?;
             {
-                let Some(mut bo_inner) = bo.inner().inner.try_lock() else { return Ok(true); };
-                bo_inner.sg_vec = None;
-                bo_inner.sgt = None;
+                let Some(mut segments) = bo.data().segments.try_lock() else { return Ok(true); };
+                *segments = None;
             }
             // Every private GPUVA alias was removed from the device page
             // tables above. Kernel mappings and other SG owners are excluded;
@@ -542,9 +569,9 @@ impl Vm {
         let mut cursor = 0u64;
         loop {
             let map = loop {
-                if let Some(inner) = self.inner.try_lock_private() {
+                if let Some(inner) = self.gpuvm.try_lock_private() {
                     let map = inner.next_private_mapping(
-                        &mut cursor, gpuvm::GpuVaFlags::INVALIDATED,
+                        &mut cursor, GpuVaFlag::INVALIDATED.into(),
                     )?;
                     // Purged (DONTNEED) objects have no contents to restore;
                     // their mappings stay INVALIDATED until unbound.
@@ -553,7 +580,7 @@ impl Vm {
                     break (map, purged);
                 }
                 // Wait for reservation ownership without retaining a mapping.
-                drop(self.inner.exec_lock(None, true)?);
+                drop(lock_vm(&self.gpuvm, None, true)?);
             };
             // The reservation guard has dropped before pinning backing, and
             // before any returned object reference can be released on failure.
@@ -562,43 +589,49 @@ impl Vm {
                 continue;
             }
             let mut restored = 0u64;
-            let bo_owner = self.inner.find_bo(&map.object).ok_or(EFAULT)?;
+            let bo_owner = lock_vm(&self.gpuvm, None, true)?
+                .0
+                .unique_gpuvm
+                .find_bo(&map.object)
+                .ok_or(EFAULT)?;
             {
-                let needs_sgt = bo_owner.inner().inner.lock().sgt.is_none();
-                if needs_sgt {
+                let needs_segments = bo_owner.data().segments.lock().is_none();
+                if needs_segments {
                     // Preserve review1's reservation/BO lock order: the getter
                     // may acquire the object reservation; never hold BO here.
-                    let sgt = crate::gem::held_sg_table(&map.object)?;
-                    let mut bo = bo_owner.inner().inner.lock();
-                    if bo.sgt.is_none() { bo.sgt = Some(sgt); }
+                    // SAFETY: As in `Vm::bind_object()`.
+                    let dev = unsafe { self.dev.as_bound() };
+                    let segments = prefetch_sgt_segments(dev, &map.object)?;
+                    let mut bo = bo_owner.data().segments.lock();
+                    if bo.is_none() { bo.replace(segments); }
                     drop(bo);
                 }
             }
-            let mut inner = self.inner.exec_lock(None, true)?;
-            let bo = bo_owner.inner().inner.lock();
-            let sgt = bo.sgt.as_ref().ok_or(EFAULT)?;
+            let mut inner = lock_vm(&self.gpuvm, None, true)?;
+            let bo = bo_owner.data().segments.lock();
+            let sgt = bo.as_ref().ok_or(EFAULT)?;
             let result = (|| -> Result {
                 let end = map.addr.checked_add(map.range).ok_or(EOVERFLOW)?;
                 let _mutation = inner.mapping_mutation();
                 inner.page_table.discard_partial_map(map.addr..end)?;
                 inner.tlbi_contexts_naming_root(map.addr, map.range as usize);
                 let prot = map.inner.prot.ok_or(EINVAL)?;
-                let repeat = map.flags.contains(gpuvm::GpuVaFlags::REPEAT);
+                let repeat = map.flags.contains(GpuVaFlag::REPEAT);
                 let mut skip = map
                     .offset
                     .checked_add(if repeat { 0 } else { restored })
                     .ok_or(EOVERFLOW)? as usize;
                 let mut left = map.range.checked_sub(restored).ok_or(EOVERFLOW)? as usize;
-                for entry in sgt.iter() {
+                for &(dma_address, dma_len) in sgt.iter() {
                     if left == 0 {
                         break;
                     }
-                    let len = entry.dma_len() as usize;
+                    let len = dma_len as usize;
                     if skip >= len {
                         skip -= len;
                         continue;
                     }
-                    let physical = entry.dma_address() as usize + skip;
+                    let physical = dma_address as usize + skip;
                     let bytes = if repeat { left } else { left.min(len - skip) };
                     let start = map.addr.checked_add(restored).ok_or(EOVERFLOW)?;
                     let end = start.checked_add(bytes as u64).ok_or(EOVERFLOW)?;

@@ -22,9 +22,11 @@ properties:
               - apple,t6020-spmi
               - apple,t6030-spmi
               - apple,t6031-spmi
+              - apple,t6041-spmi
               - apple,t8012-spmi
               - apple,t8015-spmi
               - apple,t8122-spmi
+              - apple,t8132-spmi
               - apple,t8140-spmi
           - const: apple,t8103-spmi
       - items:
@@ -51,9 +53,25 @@ properties:
   power-domains:
     maxItems: 1
 
-required:
-  - compatible
-  - reg
+if:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t8122-spmi
+          - apple,t6030-spmi
+          - apple,t6031-spmi
+then:
+  required:
+    - compatible
+    - reg
+    - interrupt-controller
+    - "#interrupt-cells"
+    - interrupts
+else:
+  required:
+    - compatible
+    - reg
 
 unevaluatedProperties: false
 

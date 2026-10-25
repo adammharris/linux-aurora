@@ -56,15 +56,33 @@ properties:
               - apple,t6000-pcie
           - const: apple,pcie
       - items:
-          - const: apple,t8122-pcie
+          - enum:
+              - apple,t6041-pcie
+              - apple,t8122-pcie
           - const: apple,t6020-pcie
       - const: apple,t6020-pcie
       - const: apple,t8140-pcie
+      - const: apple,t8132-pcie
       - const: apple,t8103-pciec
       - items:
           - const: apple,t8112-pciec
           - const: apple,t8103-pciec
       - const: apple,t6000-pciec
+
+  apple,managed-sids:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      - const: 1
+      - const: 2
+    description: >
+      J713 radio ordinary stream ownership profile. Only these inactive
+      normal streams and their exact-RID entries may be adopted by the OS.
+      Other streams and RID entries remain inherited. The documented static
+      SID16 bypass role may be initialized only from a disabled stream with
+      no valid root; an existing bypass remains unchanged. PIODMA and other
+      reserved roles are not modified. This does not authorize a controller
+      reset or takeover of active page tables. Both the radio DART and PCI
+      host describe the same two ordinary streams.
 
   reg:
     minItems: 3

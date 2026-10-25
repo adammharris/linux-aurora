@@ -53,8 +53,11 @@ enum MatchResult {
 }
 
 // A stage is an accepted capture, not a bucket of SEP's coverage percentage.
-// Leave the final stage for the completed template.
-pub(crate) const ENROL_STAGES: u32 = 16;
+// Leave the final stage for the completed template. libfprint reports a touch
+// only when the stage rises, so there is a stage for each capture the budget
+// allows: every accepted capture short of the last raises it, and an enrolment
+// that completes sooner jumps to the total.
+pub(crate) const ENROL_STAGES: u32 = crate::ENROL_MAX_CAPTURES;
 
 const TOKEN_LIFETIME_NS: u64 = 10 * 1_000_000_000;
 
@@ -959,6 +962,9 @@ pub(crate) fn starts_capture(cmd: u32) -> bool {
 
 fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     require_admin()?;
+    if !ctx.session.op.may_start() {
+        return Err(EBUSY);
+    }
     let request: Delete = UserSlice::new(user, core::mem::size_of::<Delete>())
         .reader()
         .read()?;
@@ -988,6 +994,9 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
 fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
     require_admin()?;
+    if !ctx.session.op.may_start() {
+        return Err(EBUSY);
+    }
 
     if ctx.index.total() == 0 {
         pr_info!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");

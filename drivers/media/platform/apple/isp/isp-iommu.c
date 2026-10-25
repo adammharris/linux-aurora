@@ -181,8 +181,11 @@ struct isp_surf *__isp_alloc_surface(struct apple_isp *isp, u64 size, bool gc)
 	}
 
 	refcount_set(&surf->refcount, 1);
-	if (surf->gc)
+	if (surf->gc) {
+		mutex_lock(&isp->gc_lock);
 		list_add_tail(&surf->head, &isp->gc);
+		mutex_unlock(&isp->gc_lock);
+	}
 
 	return surf;
 
@@ -215,6 +218,35 @@ struct isp_surf *isp_alloc_surface_vmap(struct apple_isp *isp, u64 size)
 	return surf;
 }
 
+/* A surface at a fixed IOVA, outside the range the others come from. */
+struct isp_surf *isp_alloc_surface_at(struct apple_isp *isp, dma_addr_t iova,
+				      u64 size)
+{
+	struct isp_surf *surf;
+
+	surf = kzalloc_obj(*surf);
+	if (!surf)
+		return NULL;
+
+	__isp_surf_init(isp, surf, size, false);
+	surf->iova = iova;
+
+	if (isp_surf_alloc_pages(surf) < 0)
+		goto free_surf;
+
+	if (isp_surf_iommu_map(isp, surf) < 0)
+		goto free_pages;
+
+	refcount_set(&surf->refcount, 1);
+	return surf;
+
+free_pages:
+	isp_surf_free_pages(surf);
+free_surf:
+	kfree(surf);
+	return NULL;
+}
+
 void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf)
 {
 	if (refcount_dec_and_test(&surf->refcount)) {
@@ -222,9 +254,33 @@ void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf)
 		isp_surf_iommu_unmap(isp, surf);
 		isp_surf_unreserve_iova(isp, surf);
 		isp_surf_free_pages(surf);
-		if (surf->gc)
+		if (surf->gc) {
+			mutex_lock(&isp->gc_lock);
 			list_del(&surf->head);
+			mutex_unlock(&isp->gc_lock);
+		}
 		kfree(surf);
+	}
+}
+
+/*
+ * Free the SHAREDMALLOC surfaces the firmware has released. Only call this
+ * once the firmware no longer uses them: after the stream that released them
+ * has stopped, or after the firmware has stopped.
+ */
+void isp_free_released_surfaces(struct apple_isp *isp)
+{
+	struct isp_surf *surf, *tmp;
+	LIST_HEAD(released);
+
+	mutex_lock(&isp->gc_lock);
+	list_splice_init(&isp->gc_released, &released);
+	mutex_unlock(&isp->gc_lock);
+
+	list_for_each_entry_safe(surf, tmp, &released, head) {
+		isp_dbg(isp, "shared surface freed: iova %pad size 0x%llx\n",
+			&surf->iova, surf->size);
+		isp_free_surface(isp, surf);
 	}
 }
 

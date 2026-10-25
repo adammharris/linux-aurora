@@ -10,9 +10,11 @@
 
 #include <linux/types.h>
 #include <linux/netdevice.h>
+#include <linux/pci.h>
 #include <linux/etherdevice.h>
 #include <linux/ratelimit.h>
 
+#include <brcm_hw_ids.h>
 #include <brcmu_utils.h>
 #include <brcmu_wifi.h>
 
@@ -332,6 +334,32 @@ struct brcmf_msgbuf_pktids {
 static void brcmf_msgbuf_rxbuf_ioctlresp_post(struct brcmf_msgbuf *msgbuf);
 
 
+/*
+ * BCM4387 and BCM4388 firmware can read buffers posted for receive. Since
+ * the packet-ID direction is now honored, DMA_FROM_DEVICE makes those
+ * buffers write-only on permission-enforcing IOMMUs. Keep RX data, event and
+ * ioctl-response buffers readable, with the same direction used for mapping
+ * and unmapping.
+ */
+static enum dma_data_direction
+brcmf_msgbuf_rx_dma_direction(struct device *dev)
+{
+	struct pci_dev *pdev;
+
+	if (!dev_is_pci(dev))
+		return DMA_FROM_DEVICE;
+
+	pdev = to_pci_dev(dev);
+	if (pdev->vendor == PCI_VENDOR_ID_BROADCOM &&
+	    (pdev->device == BRCM_PCIE_4387_DEVICE_ID ||
+	     pdev->device == BRCM_PCIE_4388_DEVICE_ID)) {
+		dev_info(dev, "using bidirectional receive DMA\n");
+		return DMA_BIDIRECTIONAL;
+	}
+
+	return DMA_FROM_DEVICE;
+}
+
 static struct brcmf_msgbuf_pktids *
 brcmf_msgbuf_init_pktids(u32 nr_array_entries,
 			 enum dma_data_direction direction)
@@ -350,6 +378,7 @@ brcmf_msgbuf_init_pktids(u32 nr_array_entries,
 	}
 	pktids->array = array;
 	pktids->array_size = nr_array_entries;
+	pktids->direction = direction;
 
 	return pktids;
 }
@@ -529,8 +558,9 @@ static void brcmf_msgbuf_ioctl_resp_wake(struct brcmf_msgbuf *msgbuf)
 }
 
 
-static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
-				   uint cmd, void *buf, uint len, int *fwerr)
+static int brcmf_msgbuf_query_dcmd_len(struct brcmf_pub *drvr, int ifidx,
+				   uint cmd, void *buf, uint len, int *fwerr,
+				    u32 *ret_len)
 {
 	struct brcmf_msgbuf *msgbuf = (struct brcmf_msgbuf *)drvr->proto->pd;
 	struct sk_buff *skb = NULL;
@@ -539,6 +569,8 @@ static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
 
 	brcmf_dbg(MSGBUF, "ifidx=%d, cmd=%d, len=%d\n", ifidx, cmd, len);
 	*fwerr = 0;
+	if (ret_len)
+		*ret_len = 0;
 	msgbuf->ctl_completed = false;
 	err = brcmf_msgbuf_tx_ioctl(drvr, ifidx, cmd, buf, len);
 	if (err)
@@ -557,13 +589,27 @@ static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
 		if (!skb)
 			return -EBADF;
 
+		if (ret_len && msgbuf->ioctl_resp_ret_len > skb->len) {
+			brcmu_pkt_buf_free_skb(skb);
+			return -EBADMSG;
+		}
 		memcpy(buf, skb->data, (len < msgbuf->ioctl_resp_ret_len) ?
 				       len : msgbuf->ioctl_resp_ret_len);
 	}
 	brcmu_pkt_buf_free_skb(skb);
 
+	if (ret_len)
+		*ret_len = min_t(u32, len, msgbuf->ioctl_resp_ret_len);
 	*fwerr = msgbuf->ioctl_resp_status;
 	return 0;
+}
+
+
+static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
+				 uint cmd, void *buf, uint len, int *fwerr)
+{
+	return brcmf_msgbuf_query_dcmd_len(drvr, ifidx, cmd, buf, len,
+					 fwerr, NULL);
 }
 
 
@@ -584,6 +630,45 @@ static void brcmf_msgbuf_rxreorder(struct brcmf_if *ifp, struct sk_buff *skb)
 {
 }
 
+/* Free the host state of a flowring. The ring's commonring lock, which the tx
+ * flow worker holds while it uses the ring, also orders this with the tx
+ * status lookup in brcmf_msgbuf_flowring_ifidx(). A commonring that was never
+ * configured has no initialized lock; no frame was ever posted on it, so no tx
+ * status can refer to it.
+ */
+static void
+brcmf_msgbuf_flowring_delete(struct brcmf_msgbuf *msgbuf, u16 flowid)
+{
+	struct brcmf_commonring *commonring = msgbuf->flowrings[flowid];
+
+	if (!commonring->inited) {
+		brcmf_flowring_delete(msgbuf->flow, flowid);
+		return;
+	}
+
+	brcmf_commonring_lock(commonring);
+	brcmf_flowring_delete(msgbuf->flow, flowid);
+	brcmf_commonring_unlock(commonring);
+}
+
+/* The interface index the host gave a flowring, or 0 once the ring is gone. */
+static u8
+brcmf_msgbuf_flowring_ifidx(struct brcmf_msgbuf *msgbuf, u16 flowid)
+{
+	struct brcmf_commonring *commonring = msgbuf->flowrings[flowid];
+	u8 ifidx = 0;
+
+	if (!commonring->inited)
+		return 0;
+
+	brcmf_commonring_lock(commonring);
+	if (msgbuf->flow->rings[flowid])
+		ifidx = brcmf_flowring_ifidx_get(msgbuf->flow, flowid);
+	brcmf_commonring_unlock(commonring);
+
+	return ifidx;
+}
+
 static void
 brcmf_msgbuf_remove_flowring(struct brcmf_msgbuf *msgbuf, u16 flowid)
 {
@@ -597,7 +682,29 @@ brcmf_msgbuf_remove_flowring(struct brcmf_msgbuf *msgbuf, u16 flowid)
 	dma_free_coherent(msgbuf->drvr->bus_if->dev, dma_sz, dma_buf,
 			  msgbuf->flowring_dma_handle[flowid]);
 
-	brcmf_flowring_delete(msgbuf->flow, flowid);
+	brcmf_msgbuf_flowring_delete(msgbuf, flowid);
+}
+
+static bool brcmf_msgbuf_get_flowid(struct brcmf_msgbuf *msgbuf,
+				    u16 flow_ring_id, u16 *flowid)
+{
+	u32 id = flow_ring_id;
+
+	if (id < BRCMF_H2D_MSGRING_FLOWRING_IDSTART) {
+		bphy_err(msgbuf->drvr, "invalid flowring id %u\n",
+			 flow_ring_id);
+		return false;
+	}
+
+	id -= BRCMF_H2D_MSGRING_FLOWRING_IDSTART;
+	if (id >= msgbuf->max_flowrings) {
+		bphy_err(msgbuf->drvr, "invalid flowring id %u\n",
+			 flow_ring_id);
+		return false;
+	}
+
+	*flowid = id;
+	return true;
 }
 
 
@@ -640,7 +747,7 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 				     GFP_KERNEL);
 	if (!dma_buf) {
 		bphy_err(drvr, "dma_alloc_coherent failed\n");
-		brcmf_flowring_delete(msgbuf->flow, flowid);
+		brcmf_msgbuf_flowring_delete(msgbuf, flowid);
 		return BRCMF_FLOWRING_INVALID_ID;
 	}
 
@@ -931,22 +1038,21 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 	struct brcmf_if *ifp;
 	u32 idx;
 	struct sk_buff *skb;
+	u16 flow_ring_id;
 	u16 flowid;
 	u8 ring_ifidx;
 
 	tx_status = (struct msgbuf_tx_status *)buf;
 	idx = le32_to_cpu(tx_status->msg.request_id) - 1;
-	flowid = le16_to_cpu(tx_status->compl_hdr.flow_ring_id);
-	flowid -= BRCMF_H2D_MSGRING_FLOWRING_IDSTART;
+	flow_ring_id = le16_to_cpu(tx_status->compl_hdr.flow_ring_id);
 	skb = brcmf_msgbuf_get_pktid(msgbuf->drvr->bus_if->dev,
 				     msgbuf->tx_pktids, idx);
 	if (!skb)
 		return;
 
-	if (flowid >= msgbuf->max_flowrings) {
-		bphy_err(msgbuf->drvr, "txstatus for flowring %u out of range\n",
-			 flowid);
-		brcmu_pkt_buf_free_skb(skb);
+	if (!brcmf_msgbuf_get_flowid(msgbuf, flow_ring_id, &flowid)) {
+		brcmf_txfinalize(brcmf_get_ifp(msgbuf->drvr, tx_status->msg.ifidx),
+				 skb, false);
 		return;
 	}
 
@@ -965,18 +1071,20 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 	 * (0x0006 EXPIRED) after the ring was freed -- awdl0's VO multicast
 	 * never completes while the ring is open (observed as a NULL deref
 	 * here on `awdl-if destroy`). The skb and its pktid are unaffected.
+	 * Only the trace looks the ring up, under the ring's lock, so that a
+	 * ring removed from another context is not read while it is freed.
 	 */
-	ring_ifidx = msgbuf->flow->rings[flowid] ?
-		     brcmf_flowring_ifidx_get(msgbuf->flow, flowid) : 0;
-	if (ring_ifidx && READ_ONCE(brcmf_awdl_trace) &&
-	    __ratelimit(&brcmf_awdl_txs_rs))
-		pr_info("brcmfmac: awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
-			ring_ifidx, tx_status->msg.ifidx,
-			ifp ? ifp->is_awdl : -1, flowid,
-			(int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
-			le16_to_cpu(tx_status->tx_status),
-			le16_to_cpu(tx_status->metadata_len),
-			skb->len >= ETH_ALEN ? skb->data : (u8 *)"\0\0\0\0\0\0");
+	if (READ_ONCE(brcmf_awdl_trace)) {
+		ring_ifidx = brcmf_msgbuf_flowring_ifidx(msgbuf, flowid);
+		if (ring_ifidx && __ratelimit(&brcmf_awdl_txs_rs))
+			pr_info("brcmfmac: awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
+				ring_ifidx, tx_status->msg.ifidx,
+				ifp ? ifp->is_awdl : -1, flowid,
+				(int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
+				le16_to_cpu(tx_status->tx_status),
+				le16_to_cpu(tx_status->metadata_len),
+				skb->len >= ETH_ALEN ? skb->data : (u8 *)"\0\0\0\0\0\0");
+	}
 
 	brcmf_txfinalize(ifp, skb, true);
 }
@@ -1319,12 +1427,15 @@ brcmf_msgbuf_process_flow_ring_create_response(struct brcmf_msgbuf *msgbuf,
 	struct msgbuf_flowring_create_resp *flowring_create_resp;
 	u16 status;
 	u16 flowid;
+	u16 flow_ring_id;
 
 	flowring_create_resp = (struct msgbuf_flowring_create_resp *)buf;
 
-	flowid = le16_to_cpu(flowring_create_resp->compl_hdr.flow_ring_id);
-	flowid -= BRCMF_H2D_MSGRING_FLOWRING_IDSTART;
+	flow_ring_id = le16_to_cpu(flowring_create_resp->compl_hdr.flow_ring_id);
 	status =  le16_to_cpu(flowring_create_resp->compl_hdr.status);
+
+	if (!brcmf_msgbuf_get_flowid(msgbuf, flow_ring_id, &flowid))
+		return;
 
 	if (status) {
 		bphy_err(drvr, "Flowring creation failed, code %d\n", status);
@@ -1348,16 +1459,19 @@ brcmf_msgbuf_process_flow_ring_delete_response(struct brcmf_msgbuf *msgbuf,
 	struct msgbuf_flowring_delete_resp *flowring_delete_resp;
 	u16 status;
 	u16 flowid;
+	u16 flow_ring_id;
 
 	flowring_delete_resp = (struct msgbuf_flowring_delete_resp *)buf;
 
-	flowid = le16_to_cpu(flowring_delete_resp->compl_hdr.flow_ring_id);
-	flowid -= BRCMF_H2D_MSGRING_FLOWRING_IDSTART;
+	flow_ring_id = le16_to_cpu(flowring_delete_resp->compl_hdr.flow_ring_id);
 	status =  le16_to_cpu(flowring_delete_resp->compl_hdr.status);
+
+	if (!brcmf_msgbuf_get_flowid(msgbuf, flow_ring_id, &flowid))
+		return;
 
 	if (status) {
 		bphy_err(drvr, "Flowring deletion failed, code %d\n", status);
-		brcmf_flowring_delete(msgbuf->flow, flowid);
+		brcmf_msgbuf_flowring_delete(msgbuf, flowid);
 		return;
 	}
 	brcmf_dbg(MSGBUF, "Flowring %d Delete response status %d\n", flowid,
@@ -1711,6 +1825,7 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 
 	drvr->proto->hdrpull = brcmf_msgbuf_hdrpull;
 	drvr->proto->query_dcmd = brcmf_msgbuf_query_dcmd;
+	drvr->proto->query_dcmd_len = brcmf_msgbuf_query_dcmd_len;
 	drvr->proto->set_dcmd = brcmf_msgbuf_set_dcmd;
 	drvr->proto->tx_queue_data = brcmf_msgbuf_tx_queue_data;
 	drvr->proto->configure_addr_mode = brcmf_msgbuf_configure_addr_mode;
@@ -1743,7 +1858,7 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 	if (!msgbuf->tx_pktids)
 		goto fail;
 	msgbuf->rx_pktids = brcmf_msgbuf_init_pktids(NR_RX_PKTIDS,
-						     DMA_FROM_DEVICE);
+			brcmf_msgbuf_rx_dma_direction(drvr->bus_if->dev));
 	if (!msgbuf->rx_pktids)
 		goto fail;
 

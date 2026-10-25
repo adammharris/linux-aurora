@@ -29,17 +29,20 @@ struct IIOAopLasDriver {
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     (),
     [(of::DeviceId::new(c_str!("apple,aop-las")), ())]
 );
 
 impl platform::Driver for IIOAopLasDriver {
     type IdInfo = ();
+    type Data<'bound> = IIOAopLasDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(pdev: &platform::Device<Core>, _info: Option<&()>) -> impl PinInit<Self, Error> {
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        _info: Option<&'bound ()>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev = pdev.as_ref();
         // SAFETY: This driver binds only to the service devices the AOP core
         // registers, and `pdev` is being probed.
@@ -58,14 +61,14 @@ impl platform::Driver for IIOAopLasDriver {
         let listener = FakehidRegistration::new(adata, service, data.clone())?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_RAW;
         let iio =
-            IIORegistration::<MsgProc>::new(data, c"aop-sensors-las", ty, info_mask, &THIS_MODULE)?;
+            IIORegistration::<MsgProc>::new(data, c"aop-sensors-las", ty, info_mask, kernel::module::this_module::<crate::LocalModule>())?;
         Ok(IIOAopLasDriver {
             listener,
             _iio: iio,
         })
     }
 
-    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         this.listener.unregister();
     }
 }

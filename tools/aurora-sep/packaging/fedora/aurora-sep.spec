@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        5%{?dist}
+Release:        8%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -26,6 +26,7 @@ Source9:        aurora-sep-greeter-fingerprint
 Source10:       aurora-sep-greeter-fingerprint.service
 Source11:       aurora_sep.te
 Source12:       aurora_sep.fc
+Source13:       OS-IDENTITY.md
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
@@ -64,7 +65,7 @@ fprintd may not open, so fprintd lists no fingerprint reader.
 
 %prep
 %setup -q -c -T
-cp -p %{SOURCE3} %{SOURCE4} %{SOURCE11} %{SOURCE12} .
+cp -p %{SOURCE3} %{SOURCE4} %{SOURCE11} %{SOURCE12} %{SOURCE13} .
 
 %build
 make -f %{_datadir}/selinux/devel/Makefile %{modulename}.pp
@@ -126,7 +127,7 @@ if selinuxenabled 2>/dev/null && [ -c /dev/sep-bio ]; then
 fi
 
 %files
-%doc README.md XART-SAFETY.md
+%doc README.md XART-SAFETY.md OS-IDENTITY.md
 %{_libexecdir}/aurora-sep-load
 %{_libexecdir}/aurora-sep-ready
 %{_libexecdir}/aurora-sep-greeter-fingerprint
@@ -144,11 +145,19 @@ fi
 %ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
-* Fri Oct 16 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-5
+* Mon Oct 19 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-7
+- XART-SAFETY.md: what the xART guard allows for restore, use, setup and
+  recovery, per platform, and what a rollback does to its list
+
+* Mon Oct 19 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-6
 - Log the authselect command when PAM does not use fingerprints
 
-* Fri Oct 16 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-4
+* Mon Oct 19 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-5
 - Add aurora-sep-selinux, which labels /dev/sep-bio for fprintd
+
+* Sun Oct 18 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-4
+- Report Touch ID ready only once the sensor attached and the
+  fingerprints were restored, and the reason when it is not
 
 * Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-3
 - libfprint with the aurora driver is now built in aurora-sep-userspace

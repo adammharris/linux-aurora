@@ -101,6 +101,7 @@
 #include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/err.h>
+#include <linux/fwnode.h>
 #include <linux/i2c.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -108,7 +109,7 @@
 #include <linux/hwmon.h>
 #include <linux/kstrtox.h>
 #include <linux/module.h>
-#include <linux/of.h>
+#include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
@@ -295,7 +296,7 @@ static const struct i2c_device_id lm90_id[] = {
 };
 MODULE_DEVICE_TABLE(i2c, lm90_id);
 
-static const struct of_device_id __maybe_unused lm90_of_match[] = {
+static const struct of_device_id lm90_of_match[] = {
 	{
 		.compatible = "adi,adm1032",
 		.data = (void *)adm1032
@@ -1226,13 +1227,8 @@ static int lm90_update_alarms_locked(struct lm90_data *data, bool force)
 
 static int lm90_update_alarms(struct lm90_data *data, bool force)
 {
-	int err;
-
-	hwmon_lock(data->hwmon_dev);
-	err = lm90_update_alarms_locked(data, force);
-	hwmon_unlock(data->hwmon_dev);
-
-	return err;
+	guard(hwmon_lock)(data->hwmon_dev);
+	return lm90_update_alarms_locked(data, force);
 }
 
 static void lm90_alert_work(struct work_struct *__work)
@@ -2598,16 +2594,15 @@ static void lm90_stop_work(void *_data)
 {
 	struct lm90_data *data = _data;
 
-	hwmon_lock(data->hwmon_dev);
-	data->shutdown = true;
-	hwmon_unlock(data->hwmon_dev);
+	scoped_guard(hwmon_lock, data->hwmon_dev) {
+		data->shutdown = true;
+	}
 	cancel_delayed_work_sync(&data->alert_work);
 	cancel_work_sync(&data->report_work);
 }
 
 static int lm90_init_client(struct i2c_client *client, struct lm90_data *data)
 {
-	struct device_node *np = client->dev.of_node;
 	int config, convrate;
 
 	if (data->flags & LM90_HAVE_CONVRATE) {
@@ -2631,7 +2626,7 @@ static int lm90_init_client(struct i2c_client *client, struct lm90_data *data)
 
 	/* Check Temperature Range Select */
 	if (data->flags & LM90_HAVE_EXTENDED_TEMP) {
-		if (of_property_read_bool(np, "ti,extended-range-enable"))
+		if (device_property_read_bool(&client->dev, "ti,extended-range-enable"))
 			config |= 0x04;
 		if (!(config & 0x04))
 			data->flags &= ~LM90_HAVE_EXTENDED_TEMP;
@@ -2697,36 +2692,41 @@ static irqreturn_t lm90_irq_thread(int irq, void *dev_id)
 		return IRQ_NONE;
 }
 
-static int lm90_probe_channel_from_dt(struct i2c_client *client,
-				      struct device_node *child,
-				      struct lm90_data *data)
+static int lm90_probe_channel(struct i2c_client *client,
+			      struct fwnode_handle *child,
+			      struct lm90_data *data)
 {
 	u32 id;
 	s32 val;
 	int err;
 	struct device *dev = &client->dev;
 
-	err = of_property_read_u32(child, "reg", &id);
+	err = fwnode_property_read_u32(child, "reg", &id);
 	if (err) {
-		dev_err(dev, "missing reg property of %pOFn\n", child);
+		dev_err(dev, "missing reg property of %pfw\n", child);
 		return err;
 	}
 
 	if (id >= MAX_CHANNELS) {
-		dev_err(dev, "invalid reg property value %d in %pOFn\n", id, child);
+		dev_err(dev, "invalid reg property value %d in %pfw\n", id, child);
 		return -EINVAL;
 	}
 
-	err = of_property_read_string(child, "label", &data->channel_label[id]);
+	err = fwnode_property_read_string(child, "label", &data->channel_label[id]);
 	if (err == -ENODATA || err == -EILSEQ) {
-		dev_err(dev, "invalid label property in %pOFn\n", child);
+		dev_err(dev, "invalid label property in %pfw\n", child);
 		return err;
 	}
 
 	if (data->channel_label[id])
 		data->channel_config[id] |= HWMON_T_LABEL;
 
-	err = of_property_read_s32(child, "temperature-offset-millicelsius", &val);
+	/*
+	 * fwnode_property_read_u32() has no signed equivalent.
+	 * temperature-offset-millicelsius is signed, so read and reinterpret it as s32 to
+	 * preserve negative offsets values (same behavior as the old of_property_read_s32()).
+	 */
+	err = fwnode_property_read_u32(child, "temperature-offset-millicelsius", (u32 *)&val);
 	if (!err) {
 		if (id == 0) {
 			dev_err(dev, "temperature-offset-millicelsius can't be set for internal channel\n");
@@ -2744,18 +2744,17 @@ static int lm90_probe_channel_from_dt(struct i2c_client *client,
 	return 0;
 }
 
-static int lm90_parse_dt_channel_info(struct i2c_client *client,
-				      struct lm90_data *data)
+static int lm90_parse_channel_info(struct i2c_client *client,
+				   struct lm90_data *data)
 {
 	int err;
 	struct device *dev = &client->dev;
-	const struct device_node *np = dev->of_node;
 
-	for_each_child_of_node_scoped(np, child) {
-		if (strcmp(child->name, "channel"))
+	device_for_each_child_node_scoped(dev, child) {
+		if (!fwnode_name_eq(child, "channel"))
 			continue;
 
-		err = lm90_probe_channel_from_dt(client, child, data);
+		err = lm90_probe_channel(client, child, data);
 		if (err)
 			return err;
 	}
@@ -2892,12 +2891,10 @@ static int lm90_probe(struct i2c_client *client)
 	/* Set maximum conversion rate */
 	data->max_convrate = lm90_params[data->kind].max_convrate;
 
-	/* Parse device-tree channel information */
-	if (client->dev.of_node) {
-		err = lm90_parse_dt_channel_info(client, data);
-		if (err)
-			return err;
-	}
+	/* Parse channel information */
+	err = lm90_parse_channel_info(client, data);
+	if (err)
+		return err;
 
 	/* Initialize the LM90 chip */
 	err = lm90_init_client(client, data);
@@ -2923,10 +2920,8 @@ static int lm90_probe(struct i2c_client *client)
 		err = devm_request_threaded_irq(dev, client->irq,
 						NULL, lm90_irq_thread,
 						IRQF_ONESHOT, "lm90", client);
-		if (err < 0) {
-			dev_err(dev, "cannot request IRQ %d\n", client->irq);
+		if (err < 0)
 			return err;
-		}
 	}
 
 	return 0;
@@ -2946,17 +2941,17 @@ static void lm90_alert(struct i2c_client *client, enum i2c_alert_protocol type,
 		 */
 		struct lm90_data *data = i2c_get_clientdata(client);
 
-		hwmon_lock(data->hwmon_dev);
-		if (!data->shutdown && (data->flags & LM90_HAVE_BROKEN_ALERT) &&
-		    (data->current_alarms & data->alert_alarms)) {
-			if (!(data->config & 0x80)) {
-				dev_dbg(&client->dev, "Disabling ALERT#\n");
-				lm90_update_confreg(data, data->config | 0x80);
+		scoped_guard(hwmon_lock, data->hwmon_dev) {
+			if (!data->shutdown && (data->flags & LM90_HAVE_BROKEN_ALERT) &&
+			    (data->current_alarms & data->alert_alarms)) {
+				if (!(data->config & 0x80)) {
+					dev_dbg(&client->dev, "Disabling ALERT#\n");
+					lm90_update_confreg(data, data->config | 0x80);
+				}
+				schedule_delayed_work(&data->alert_work,
+					max_t(int, HZ, msecs_to_jiffies(data->update_interval)));
 			}
-			schedule_delayed_work(&data->alert_work,
-				max_t(int, HZ, msecs_to_jiffies(data->update_interval)));
 		}
-		hwmon_unlock(data->hwmon_dev);
 	} else {
 		dev_dbg(&client->dev, "Everything OK\n");
 	}
@@ -2990,7 +2985,7 @@ static struct i2c_driver lm90_driver = {
 	.class		= I2C_CLASS_HWMON,
 	.driver = {
 		.name	= "lm90",
-		.of_match_table = of_match_ptr(lm90_of_match),
+		.of_match_table = lm90_of_match,
 		.pm	= pm_sleep_ptr(&lm90_pm_ops),
 	},
 	.probe		= lm90_probe,

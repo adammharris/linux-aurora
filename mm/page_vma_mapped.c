@@ -41,7 +41,7 @@ again:
 	if (!pvmw->pte)
 		return false;
 
-	ptent = ptep_get(pvmw->pte);
+	ptent = ptep_get_lockless(pvmw->pte);
 
 	if (pte_none(ptent)) {
 		return false;
@@ -107,7 +107,25 @@ again:
 static bool check_pte(struct page_vma_mapped_walk *pvmw, unsigned long pte_nr)
 {
 	unsigned long pfn;
-	pte_t ptent = ptep_get(pvmw->pte);
+	pte_t ptent;
+
+	if (is_vm_hugetlb_page(pvmw->vma))
+		ptent = huge_ptep_get(pvmw->vma->vm_mm, pvmw->address,
+				      pvmw->pte);
+	else
+		ptent = ptep_get(pvmw->pte);
+
+#ifdef CONFIG_MM_SUBPAGE
+	if (pvmw->flags & PVMW_SUBPAGE) {
+		if (!(pvmw->flags & PVMW_MIGRATION))
+			return pte_present(ptent) &&
+				pte_phys_mm(pvmw->vma->vm_mm, ptent) ==
+				PFN_PHYS(pvmw->pfn) + pvmw->subpage_offset;
+		if (pte_swp_subpage_offset(ptent) != pvmw->subpage_offset)
+			return false;
+		/* The common migration check below validates the native PFN. */
+	}
+#endif
 
 #ifdef CONFIG_MM_SUBPAGE
 	if (pvmw->flags & PVMW_SUBPAGE) {
@@ -195,6 +213,7 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long end;
 	spinlock_t *ptl;
+	pte_t pteval;
 	pgd_t *pgd;
 	p4d_t *p4d;
 	pud_t *pud;
@@ -343,7 +362,11 @@ next_pte:
 				goto restart;
 			}
 			pvmw->pte++;
-		} while (pte_none(ptep_get(pvmw->pte)));
+			if (!pvmw->ptl)
+				pteval = ptep_get_lockless(pvmw->pte);
+			else
+				pteval = ptep_get(pvmw->pte);
+		} while (pte_none(pteval));
 
 		if (!pvmw->ptl) {
 			spin_lock(ptl);
@@ -375,6 +398,7 @@ unsigned long page_mapped_in_vma(const struct page *page,
 		struct vm_area_struct *vma)
 {
 	const struct folio *folio = page_folio(page);
+	const pgoff_t pgoff = page_pgoff(folio, page);
 	unsigned long address;
 	struct page_vma_mapped_walk pvmw = {
 		.pfn = page_to_pfn(page),
@@ -382,9 +406,13 @@ unsigned long page_mapped_in_vma(const struct page *page,
 		.nr_pages = 1,
 		.vma = vma,
 		.flags = PVMW_SYNC,
+		.pgoff_is_anon = folio_test_anon(folio),
 	};
 
-	address = vma_address(vma, pvmw.pgoff, 1);
+	if (folio_test_anon(folio))
+		address = vma_anon_address(vma, pgoff, 1);
+	else
+		address = vma_filebacked_address(vma, pgoff, 1);
 	pvmw.address = address;
 	if (pvmw.address == -EFAULT)
 		goto out;

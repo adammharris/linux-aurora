@@ -49,7 +49,7 @@ static const struct drm_crtc_helper_funcs resume_test_crtc_helpers = {
 
 /* Scanout itself is not under test; the plane helpers require an update. */
 static void resume_test_plane_update(struct drm_plane *plane,
-				     struct drm_atomic_state *state)
+				     struct drm_atomic_commit *state)
 {
 }
 
@@ -84,13 +84,69 @@ static void resume_test_teardown(void *data)
 	drm_framebuffer_put(&priv->fb);
 }
 
-static struct resume_test *resume_test_init(struct kunit *test)
+/* Finish the acquire context before an assertion can abort the KUnit thread. */
+static int resume_test_commit(struct resume_test *priv,
+			      struct drm_display_mode *mode, bool active)
 {
 	struct drm_modeset_acquire_ctx ctx;
 	struct drm_connector_state *conn_state;
 	struct drm_plane_state *plane_state;
 	struct drm_crtc_state *crtc_state;
-	struct drm_atomic_state *state;
+	struct drm_atomic_commit *state;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+retry:
+	state = drm_atomic_commit_alloc(&priv->drm);
+	if (!state) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	state->acquire_ctx = &ctx;
+	crtc_state = drm_atomic_get_crtc_state(state, priv->crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto put;
+	}
+	crtc_state->active = active;
+	if (mode) {
+		conn_state = drm_atomic_get_connector_state(state, &priv->connector);
+		if (IS_ERR(conn_state)) {
+			ret = PTR_ERR(conn_state);
+			goto put;
+		}
+		plane_state = drm_atomic_get_plane_state(state, priv->plane);
+		if (IS_ERR(plane_state)) {
+			ret = PTR_ERR(plane_state);
+			goto put;
+		}
+		ret = drm_atomic_set_crtc_for_connector(conn_state, priv->crtc) ?:
+		      drm_atomic_set_mode_for_crtc(crtc_state, mode) ?:
+		      drm_atomic_set_crtc_for_plane(plane_state, priv->crtc);
+		if (ret)
+			goto put;
+		drm_atomic_set_fb_for_plane(plane_state, &priv->fb);
+		plane_state->crtc_w = 1920;
+		plane_state->crtc_h = 1080;
+		plane_state->src_w = 1920 << 16;
+		plane_state->src_h = 1080 << 16;
+	}
+	ret = drm_atomic_commit(state);
+put:
+	drm_atomic_commit_put(state);
+	if (ret == -EDEADLK) {
+		ret = drm_modeset_backoff(&ctx);
+		if (!ret)
+			goto retry;
+	}
+out:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return ret;
+}
+
+static struct resume_test *resume_test_init(struct kunit *test)
+{
 	struct drm_display_mode *mode;
 	struct resume_test *priv;
 	struct drm_device *drm;
@@ -135,30 +191,7 @@ static struct resume_test *resume_test_init(struct kunit *test)
 	mode = drm_kunit_display_mode_from_cea_vic(test, drm, 16);
 	KUNIT_ASSERT_NOT_NULL(test, mode);
 
-	/* Put by hand: a state kept to the end of the test pins old scanout. */
-	drm_modeset_acquire_init(&ctx, 0);
-	state = drm_atomic_state_alloc(drm);
-	KUNIT_ASSERT_NOT_NULL(test, state);
-	state->acquire_ctx = &ctx;
-	conn_state = drm_atomic_get_connector_state(state, &priv->connector);
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, conn_state);
-	KUNIT_ASSERT_EQ(test, drm_atomic_set_crtc_for_connector(conn_state, priv->crtc), 0);
-	crtc_state = drm_atomic_get_crtc_state(state, priv->crtc);
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, crtc_state);
-	KUNIT_ASSERT_EQ(test, drm_atomic_set_mode_for_crtc(crtc_state, mode), 0);
-	crtc_state->active = true;
-	plane_state = drm_atomic_get_plane_state(state, priv->plane);
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, plane_state);
-	KUNIT_ASSERT_EQ(test, drm_atomic_set_crtc_for_plane(plane_state, priv->crtc), 0);
-	drm_atomic_set_fb_for_plane(plane_state, &priv->fb);
-	plane_state->crtc_w = 1920;
-	plane_state->crtc_h = 1080;
-	plane_state->src_w = 1920 << 16;
-	plane_state->src_h = 1080 << 16;
-	ret = drm_atomic_commit(state);
-	drm_atomic_state_put(state);
-	drm_modeset_drop_locks(&ctx);
-	drm_modeset_acquire_fini(&ctx);
+	ret = resume_test_commit(priv, mode, true);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	KUNIT_ASSERT_TRUE(test, priv->crtc->state->active);
 
@@ -181,7 +214,7 @@ static void resume_stale_crtc_disabled_test(struct kunit *test)
 	struct resume_test *priv = resume_test_init(test);
 	struct drm_connector_state *conn_state;
 	struct drm_crtc_state *crtc_state;
-	struct drm_atomic_state *state;
+	struct drm_atomic_commit *state;
 
 	KUNIT_ASSERT_EQ(test, drm_mode_config_helper_suspend(&priv->drm), 0);
 	priv->admissible = false;
@@ -236,23 +269,8 @@ static void resume_admissible_crtc_restored_test(struct kunit *test)
 static void resume_stale_dpms_off_crtc_disabled_test(struct kunit *test)
 {
 	struct resume_test *priv = resume_test_init(test);
-	struct drm_modeset_acquire_ctx ctx;
-	struct drm_crtc_state *crtc_state;
-	struct drm_atomic_state *state;
-	int ret;
 
-	drm_modeset_acquire_init(&ctx, 0);
-	state = drm_atomic_state_alloc(&priv->drm);
-	KUNIT_ASSERT_NOT_NULL(test, state);
-	state->acquire_ctx = &ctx;
-	crtc_state = drm_atomic_get_crtc_state(state, priv->crtc);
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, crtc_state);
-	crtc_state->active = false;
-	ret = drm_atomic_commit(state);
-	drm_atomic_state_put(state);
-	drm_modeset_drop_locks(&ctx);
-	drm_modeset_acquire_fini(&ctx);
-	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_EQ(test, resume_test_commit(priv, NULL, false), 0);
 
 	KUNIT_ASSERT_EQ(test, drm_mode_config_helper_suspend(&priv->drm), 0);
 	priv->admissible = false;

@@ -20,6 +20,8 @@ properties:
           - apple,j274-macaudio
           - apple,j293-macaudio
           - apple,j314-macaudio
+          - apple,j616-macaudio
+          - apple,j616-macaudio-jack
           - apple,j700-macaudio
       - const: apple,macaudio
 
@@ -91,6 +93,24 @@ patternProperties:
 
         required:
           - sound-dai
+
+    patternProperties:
+      "^dai-tdm-idle-mode-[0-7]$":
+        description: |
+          How the CODEC at this index of the codec sound-dai list drives the
+          TDM transmit slots it leaves idle. The index counts the CODECs of
+          the link in list order, across both CPU-side DAIs.
+        $ref: /schemas/types.yaml#/definitions/string
+        enum:
+          - zero
+          - pulldown
+
+      "^dai-tdm-slot-tx-idle-mask-[0-7]$":
+        description: |
+          Transmit slots of the CODEC at the same index that are idle and
+          driven as dai-tdm-idle-mode-<n> says, one bit per slot with slot 0
+          in the LSB. Only used together with dai-tdm-idle-mode-<n>.
+        $ref: /schemas/types.yaml#/definitions/uint32
 
     required:
       - reg

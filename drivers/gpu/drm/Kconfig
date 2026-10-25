@@ -218,6 +218,13 @@ config DRM_GPUVM
 	  GPU-VM representation providing helpers to manage a GPUs virtual
 	  address space
 
+config RUST_DRM_GPUVM
+	bool
+	depends on DRM
+	select DRM_GPUVM
+	help
+	  Choose this if you need GPUVM functions in Rust
+
 config DRM_GPUSVM
 	tristate
 	depends on DRM
@@ -361,6 +368,8 @@ source "drivers/gpu/drm/xen/Kconfig"
 source "drivers/gpu/drm/xlnx/Kconfig"
 
 endif
+
+source "drivers/gpu/drm/apple/Kconfig.tests"
 
 # Separate option because drm_panel_orientation_quirks.c is shared with fbdev
 config DRM_PANEL_ORIENTATION_QUIRKS

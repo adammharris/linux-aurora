@@ -16,6 +16,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/spi/spi.h>
+#include <linux/spinlock.h>
 
 #define APPLE_SPI_CTRL			0x000
 #define APPLE_SPI_CTRL_RUN		BIT(0)
@@ -143,6 +144,20 @@ struct apple_spi {
 	void __iomem      *regs;        /* MMIO register address */
 	struct clk        *clk;         /* bus clock */
 	struct completion done;         /* wake-up from interrupt */
+	int               irq;
+
+	/*
+	 * An interrupt-driven transfer in flight. The interrupt handler moves
+	 * the data, so a refill does not wait for this thread to be scheduled.
+	 */
+	spinlock_t        lock;         /* protects the state below and IE */
+	bool              active;
+	const void        *tx_ptr;
+	void              *rx_ptr;
+	u32               remaining_tx;
+	u32               remaining_rx;
+	u32               xfer_flags;   /* completions still awaited */
+	unsigned int      bytes_per_word;
 };
 
 static inline void reg_write(struct apple_spi *spi, int offset, u32 value)
@@ -326,53 +341,19 @@ static bool apple_spi_prep_transfer(struct apple_spi *spi, struct spi_transfer *
 	return (200000 * t->bits_per_word * fifo_threshold) <= t->speed_hz;
 }
 
-static irqreturn_t apple_spi_irq(int irq, void *dev_id)
+static int apple_spi_poll(struct apple_spi *spi, u32 fifo_bit, u32 xfer_bit)
 {
-	struct apple_spi *spi = dev_id;
-	u32 fifo = reg_read(spi, APPLE_SPI_IF_FIFO) & reg_read(spi, APPLE_SPI_IE_FIFO);
-	u32 xfer = reg_read(spi, APPLE_SPI_IF_XFER) & reg_read(spi, APPLE_SPI_IE_XFER);
+	unsigned long timeout = jiffies + APPLE_SPI_TIMEOUT_MS * HZ / 1000;
+	u32 fifo, xfer;
 
-	if (fifo || xfer) {
-		/* Disable interrupts until next transfer */
-		reg_write(spi, APPLE_SPI_IE_XFER, 0);
-		reg_write(spi, APPLE_SPI_IE_FIFO, 0);
-		complete(&spi->done);
-		return IRQ_HANDLED;
-	}
+	do {
+		fifo = reg_read(spi, APPLE_SPI_IF_FIFO);
+		xfer = reg_read(spi, APPLE_SPI_IF_XFER);
+		if (time_after(jiffies, timeout))
+			return -ETIMEDOUT;
+	} while (!((fifo & fifo_bit) || (xfer & xfer_bit)));
 
-	return IRQ_NONE;
-}
-
-static int apple_spi_wait(struct apple_spi *spi, u32 fifo_bit, u32 xfer_bit, int poll)
-{
-	int ret = 0;
-
-	if (poll) {
-		u32 fifo, xfer;
-		unsigned long timeout = jiffies + APPLE_SPI_TIMEOUT_MS * HZ / 1000;
-
-		do {
-			fifo = reg_read(spi, APPLE_SPI_IF_FIFO);
-			xfer = reg_read(spi, APPLE_SPI_IF_XFER);
-			if (time_after(jiffies, timeout)) {
-				ret = -ETIMEDOUT;
-				break;
-			}
-		} while (!((fifo & fifo_bit) || (xfer & xfer_bit)));
-	} else {
-		reinit_completion(&spi->done);
-		reg_write(spi, APPLE_SPI_IE_XFER, xfer_bit);
-		reg_write(spi, APPLE_SPI_IE_FIFO, fifo_bit);
-
-		if (!wait_for_completion_timeout(&spi->done,
-						 msecs_to_jiffies(APPLE_SPI_TIMEOUT_MS)))
-			ret = -ETIMEDOUT;
-
-		reg_write(spi, APPLE_SPI_IE_XFER, 0);
-		reg_write(spi, APPLE_SPI_IE_FIFO, 0);
-	}
-
-	return ret;
+	return 0;
 }
 
 static void apple_spi_tx(struct apple_spi *spi, const void **tx_ptr, u32 *left,
@@ -465,17 +446,77 @@ static void apple_spi_rx(struct apple_spi *spi, void **rx_ptr, u32 *left,
 	*rx_ptr = ((u8 *)*rx_ptr) + bytes_per_word * read;
 }
 
+static u32 apple_spi_fifo_flags(struct apple_spi *spi)
+{
+	u32 flags = 0;
+
+	if (spi->remaining_tx)
+		flags |= APPLE_SPI_FIFO_TXTHRESH;
+	if (spi->remaining_rx)
+		flags |= APPLE_SPI_FIFO_RXTHRESH;
+	return flags;
+}
+
+/* Moves what the FIFOs allow and notes the halves that completed. */
+static void apple_spi_service(struct apple_spi *spi)
+{
+	spi->xfer_flags &= ~reg_read(spi, APPLE_SPI_IF_XFER);
+	apple_spi_tx(spi, &spi->tx_ptr, &spi->remaining_tx, spi->bytes_per_word);
+	apple_spi_rx(spi, &spi->rx_ptr, &spi->remaining_rx, spi->bytes_per_word);
+}
+
+/*
+ * The FIFOs are refilled and drained here, in the interrupt handler, not by
+ * the waiting thread. The FIFO is 16 words deep and the threshold interrupt
+ * fires with 8 left, so at 8 MHz the refill has about 8 us before the
+ * transmit FIFO runs dry; the controller then stops the clock with chip
+ * select still asserted until it is refilled. A thread woken to refill
+ * waits for the scheduler, which under load takes hundreds of
+ * microseconds, and a Mesa fingerprint sensor drops or misreads a frame
+ * that stalls that long.
+ */
+static irqreturn_t apple_spi_irq(int irq, void *dev_id)
+{
+	struct apple_spi *spi = dev_id;
+	u32 fifo, xfer;
+
+	spin_lock(&spi->lock);
+	fifo = reg_read(spi, APPLE_SPI_IF_FIFO) & reg_read(spi, APPLE_SPI_IE_FIFO);
+	xfer = reg_read(spi, APPLE_SPI_IF_XFER) & reg_read(spi, APPLE_SPI_IE_XFER);
+	if (!fifo && !xfer) {
+		spin_unlock(&spi->lock);
+		return IRQ_NONE;
+	}
+
+	if (spi->active)
+		apple_spi_service(spi);
+	reg_write(spi, APPLE_SPI_IF_FIFO,
+		  fifo & (APPLE_SPI_FIFO_TXTHRESH | APPLE_SPI_FIFO_RXTHRESH));
+
+	if (spi->active && spi->xfer_flags) {
+		reg_write(spi, APPLE_SPI_IE_XFER, spi->xfer_flags);
+		reg_write(spi, APPLE_SPI_IE_FIFO, apple_spi_fifo_flags(spi));
+	} else {
+		reg_write(spi, APPLE_SPI_IE_XFER, 0);
+		reg_write(spi, APPLE_SPI_IE_FIFO, 0);
+		if (spi->active) {
+			spi->active = false;
+			complete(&spi->done);
+		}
+	}
+	spin_unlock(&spi->lock);
+
+	return IRQ_HANDLED;
+}
+
 static int apple_spi_transfer_one(struct spi_controller *ctlr, struct spi_device *device,
 				  struct spi_transfer *t)
 {
 	struct apple_spi *spi = spi_controller_get_devdata(ctlr);
 	bool poll = apple_spi_prep_transfer(spi, t);
-	const void *tx_ptr = t->tx_buf;
-	void *rx_ptr = t->rx_buf;
 	unsigned int bytes_per_word;
-	u32 words, remaining_tx, remaining_rx;
-	u32 xfer_flags = 0;
-	u32 fifo_flags;
+	unsigned long flags;
+	u32 words, fifo_flags;
 	int retries = 100;
 	int ret = 0;
 
@@ -487,8 +528,11 @@ static int apple_spi_transfer_one(struct spi_controller *ctlr, struct spi_device
 		bytes_per_word = 1;
 
 	words = t->len / bytes_per_word;
-	remaining_tx = tx_ptr ? words : 0;
-	remaining_rx = rx_ptr ? words : 0;
+	spi->tx_ptr = t->tx_buf;
+	spi->rx_ptr = t->rx_buf;
+	spi->remaining_tx = t->tx_buf ? words : 0;
+	spi->remaining_rx = t->rx_buf ? words : 0;
+	spi->bytes_per_word = bytes_per_word;
 
 	/* Reset FIFOs */
 	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_RX_RESET | APPLE_SPI_CTRL_TX_RESET);
@@ -498,61 +542,78 @@ static int apple_spi_transfer_one(struct spi_controller *ctlr, struct spi_device
 	reg_write(spi, APPLE_SPI_IF_FIFO, ~0);
 
 	/* Determine transfer completion flags we wait for */
-	if (tx_ptr)
-		xfer_flags |= APPLE_SPI_XFER_TXCOMPLETE;
-	if (rx_ptr)
-		xfer_flags |= APPLE_SPI_XFER_RXCOMPLETE;
+	spi->xfer_flags = 0;
+	if (t->tx_buf)
+		spi->xfer_flags |= APPLE_SPI_XFER_TXCOMPLETE;
+	if (t->rx_buf)
+		spi->xfer_flags |= APPLE_SPI_XFER_RXCOMPLETE;
 
 	/* Set transfer length */
-	reg_write(spi, APPLE_SPI_TXCNT, remaining_tx);
-	reg_write(spi, APPLE_SPI_RXCNT, remaining_rx);
+	reg_write(spi, APPLE_SPI_TXCNT, spi->remaining_tx);
+	reg_write(spi, APPLE_SPI_RXCNT, spi->remaining_rx);
 
 	/* Prime transmit FIFO */
-	apple_spi_tx(spi, &tx_ptr, &remaining_tx, bytes_per_word);
+	apple_spi_tx(spi, &spi->tx_ptr, &spi->remaining_tx, bytes_per_word);
 
 	/* Start transfer */
 	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_RUN);
 
 	/* TX again since a few words get popped off immediately */
-	apple_spi_tx(spi, &tx_ptr, &remaining_tx, bytes_per_word);
+	apple_spi_tx(spi, &spi->tx_ptr, &spi->remaining_tx, bytes_per_word);
 
-	while (xfer_flags) {
-		fifo_flags = 0;
+	if (poll) {
+		while (spi->xfer_flags) {
+			/* Wait for anything to happen */
+			ret = apple_spi_poll(spi, apple_spi_fifo_flags(spi),
+					     spi->xfer_flags);
+			if (ret)
+				break;
 
-		if (remaining_tx)
-			fifo_flags |= APPLE_SPI_FIFO_TXTHRESH;
-		if (remaining_rx)
-			fifo_flags |= APPLE_SPI_FIFO_RXTHRESH;
-
-		/* Wait for anything to happen */
-		ret = apple_spi_wait(spi, fifo_flags, xfer_flags, poll);
-		if (ret) {
-			dev_err(&ctlr->dev, "transfer timed out (remaining %d tx, %d rx)\n",
-				remaining_tx, remaining_rx);
-			goto err;
+			/* Transmit and receive everything we can */
+			apple_spi_service(spi);
 		}
+	} else {
+		/* Allow for the transfer itself on top of the usual timeout. */
+		unsigned long ms = APPLE_SPI_TIMEOUT_MS +
+			DIV_ROUND_UP_ULL((u64)words * t->bits_per_word * 1000,
+					 max(t->speed_hz, 1U));
 
-		/* Stop waiting on transfer halves once they complete */
-		xfer_flags &= ~reg_read(spi, APPLE_SPI_IF_XFER);
+		reinit_completion(&spi->done);
+		spin_lock_irqsave(&spi->lock, flags);
+		spi->active = true;
+		reg_write(spi, APPLE_SPI_IE_XFER, spi->xfer_flags);
+		reg_write(spi, APPLE_SPI_IE_FIFO, apple_spi_fifo_flags(spi));
+		spin_unlock_irqrestore(&spi->lock, flags);
 
-		/* Transmit and receive everything we can */
-		apple_spi_tx(spi, &tx_ptr, &remaining_tx, bytes_per_word);
-		apple_spi_rx(spi, &rx_ptr, &remaining_rx, bytes_per_word);
+		if (!wait_for_completion_timeout(&spi->done, msecs_to_jiffies(ms))) {
+			spin_lock_irqsave(&spi->lock, flags);
+			spi->active = false;
+			reg_write(spi, APPLE_SPI_IE_XFER, 0);
+			reg_write(spi, APPLE_SPI_IE_FIFO, 0);
+			spin_unlock_irqrestore(&spi->lock, flags);
+			synchronize_irq(spi->irq);
+			ret = -ETIMEDOUT;
+		}
+	}
+	if (ret) {
+		dev_err(&ctlr->dev, "transfer timed out (remaining %d tx, %d rx)\n",
+			spi->remaining_tx, spi->remaining_rx);
+		goto err;
 	}
 
 	/*
 	 * Sometimes the transfer completes before the last word is in the RX FIFO.
 	 * Normally one retry is all it takes to get the last word out.
 	 */
-	while (remaining_rx && retries--)
-		apple_spi_rx(spi, &rx_ptr, &remaining_rx, bytes_per_word);
+	while (spi->remaining_rx && retries--)
+		apple_spi_rx(spi, &spi->rx_ptr, &spi->remaining_rx, bytes_per_word);
 
-	if (remaining_tx)
+	if (spi->remaining_tx)
 		dev_err(&ctlr->dev, "transfer completed with %d words left to transmit\n",
-			remaining_tx);
-	if (remaining_rx)
+			spi->remaining_tx);
+	if (spi->remaining_rx)
 		dev_err(&ctlr->dev, "transfer completed with %d words left to receive\n",
-			remaining_rx);
+			spi->remaining_rx);
 
 err:
 	fifo_flags = reg_read(spi, APPLE_SPI_IF_FIFO);
@@ -578,6 +639,7 @@ static int apple_spi_probe(struct platform_device *pdev)
 
 	spi = spi_controller_get_devdata(ctlr);
 	init_completion(&spi->done);
+	spin_lock_init(&spi->lock);
 
 	spi->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(spi->regs))
@@ -591,6 +653,7 @@ static int apple_spi_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
+	spi->irq = irq;
 
 	ret = devm_request_irq(&pdev->dev, irq, apple_spi_irq, 0,
 			       dev_name(&pdev->dev), spi);
@@ -648,6 +711,10 @@ static struct platform_driver apple_spi_driver = {
 	},
 };
 module_platform_driver(apple_spi_driver);
+
+#if IS_ENABLED(CONFIG_SPI_APPLE_KUNIT_TEST)
+#include "spi-apple-test.c"
+#endif
 
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_DESCRIPTION("Apple SoC SPI driver");

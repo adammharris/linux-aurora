@@ -272,6 +272,13 @@ struct effect_job {
  * @haptics: Haptic device state of an MTP trackpad, NULL otherwise.
  * @taptic_hdev: Actuator HID device of an MTP trackpad, if resolved.
  * @haptic_effects: Uploaded haptic effects of an MTP trackpad.
+ * @haptic_press_work: Plays the press waveform of a host-driven click.
+ * @haptic_release_work: Plays the release waveform, or hands the actuator back.
+ * @haptic_deep_work: Plays the waveform of a deep click.
+ * @haptic_deep_release_work: Plays the release waveform on leaving a deep click.
+ * @force_input: Input device for the deep-click key, NULL if none.
+ * @haptic_button_down: The host-derived button is pressed.
+ * @haptic_deep_down: The host-derived click is in its deep stage.
  * @hdev: Pointer to the underlying HID device.
  * @work: Workqueue to handle initialization retry for quirky devices.
  * @battery_timer: Timer for obtaining battery level information.
@@ -347,7 +354,7 @@ static int magicmouse_open(struct input_dev *dev)
 		ret = magicmouse_enable_multitouch(hdev);
 		if (ret != -EIO && ret < 0) {
 			hid_err(hdev, "unable to request touch data (%d)\n", ret);
-			return ret;
+			goto err_close;
 		}
 		if (ret == -EIO && (hdev->product == USB_DEVICE_ID_APPLE_MAGICMOUSE2 ||
 				hdev->product == USB_DEVICE_ID_APPLE_MAGICMOUSE2_USBC)) {
@@ -373,15 +380,31 @@ static int magicmouse_open(struct input_dev *dev)
 			__le16 max_x;
 			__le16 max_y;
 		} dim;
-		uint32_t x_span, y_span;
+		int x_span, y_span;
+		u32 x_res, y_res;
 
 		ret = hid_hw_raw_request(hdev, SENSOR_DIMENSIONS_REPORT_ID, buf, sizeof(buf), HID_FEATURE_REPORT, HID_REQ_GET_REPORT);
 		if (ret < (int)(1 + sizeof(dim))) {
 			hid_err(hdev, "unable to request dimensions (%d)\n", ret);
-			return ret;
+			ret = ret < 0 ? ret : -EPROTO;
+			goto err_close;
 		}
 
 		memcpy(&dim, buf + 1, sizeof(dim));
+
+		x_span = le16_to_int(dim.max_x) - le16_to_int(dim.min_x);
+		y_span = le16_to_int(dim.max_y) - le16_to_int(dim.min_y);
+
+		/* Validate both axes before publishing any new geometry. */
+		if (buf[0] != SENSOR_DIMENSIONS_REPORT_ID ||
+		    x_span <= 0 || y_span <= 0 ||
+		    !le32_to_cpu(dim.width) || !le32_to_cpu(dim.height))
+			goto err_dimensions;
+
+		x_res = 100 * x_span / le32_to_cpu(dim.width);
+		y_res = 100 * y_span / le32_to_cpu(dim.height);
+		if (!x_res || !y_res)
+			goto err_dimensions;
 
 		/* finger position */
 		input_set_abs_params(input, ABS_MT_POSITION_X,
@@ -389,12 +412,10 @@ static int magicmouse_open(struct input_dev *dev)
 		/* Y axis is inverted */
 		input_set_abs_params(input, ABS_MT_POSITION_Y,
 				     -le16_to_int(dim.max_y), -le16_to_int(dim.min_y), 0, 0);
-		x_span = le16_to_int(dim.max_x) - le16_to_int(dim.min_x);
-		y_span = le16_to_int(dim.max_y) - le16_to_int(dim.min_y);
 
 		/* X/Y resolution */
-		input_abs_set_res(input, ABS_MT_POSITION_X, 100 * x_span / le32_to_cpu(dim.width) );
-		input_abs_set_res(input, ABS_MT_POSITION_Y, 100 * y_span / le32_to_cpu(dim.height) );
+		input_abs_set_res(input, ABS_MT_POSITION_X, x_res);
+		input_abs_set_res(input, ABS_MT_POSITION_Y, y_res);
 
 		/* copy info, as input_mt_init_slots() does */
 		dev->absinfo[ABS_X] = dev->absinfo[ABS_MT_POSITION_X];
@@ -404,6 +425,13 @@ static int magicmouse_open(struct input_dev *dev)
 	}
 
 	return 0;
+
+err_dimensions:
+	hid_err(hdev, "invalid touchpad dimensions\n");
+	ret = -EPROTO;
+err_close:
+	hid_hw_close(hdev);
+	return ret;
 }
 
 static void magicmouse_close(struct input_dev *dev)
@@ -1268,6 +1296,7 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 
 	__set_bit(INPUT_PROP_BUTTONPAD, input->propbit);
+	/* The C1FE controller reports no force: it is not a pressure pad. */
 	if (!msc->mtp_c1fe)
 		__set_bit(INPUT_PROP_PRESSUREPAD, input->propbit);
 	__clear_bit(BTN_0, input->keybit);
@@ -2203,6 +2232,13 @@ static int magicmouse_init_haptics(struct magicmouse_sc *msc, struct hid_device 
 	 */
 	if ((trackpad_hdev->bus != BUS_HOST && trackpad_hdev->bus != BUS_SPI) ||
 	    trackpad_hdev->type != HID_TYPE_SPI_MOUSE)
+		return 0;
+
+	/*
+	 * The C1FE trackpad reports no force, so the button cannot be derived
+	 * while the host holds an actuator: offer no force feedback there.
+	 */
+	if (msc->mtp_c1fe)
 		return 0;
 
 	haptics = devm_kzalloc(&trackpad_hdev->dev, sizeof(*haptics), GFP_KERNEL);

@@ -26,8 +26,12 @@ def check(root, output):
                            'assert(afk_service_get(old)==old);old->cmd_tag=1;old->cmd_map[0]=1;')
     corrected=corrected.replace('    old->cmd_tag=1;\n','')
 
-    sender=extract((root/'drivers/gpu/drm/apple/afk.c').read_text(),
-                   'static int afk_send_command_timeout_len(')
+    afk=(root/'drivers/gpu/drm/apple/afk.c').read_text()
+    sender=extract(afk,'static int afk_send_command_timeout_len(')
+    # The legacy reply-length variant moved the sender body into
+    # afk_send_command_common(); afk_send_command_timeout_len() wraps it.
+    if 'static int afk_send_command_common(' in afk:
+        sender=extract(afk,'static int afk_send_command_common(')+'\n'+sender
     unit=unit[:unit.index('int main(void)')]
     unit=unit.replace('static unsigned int dma_frees,opens;',r'''
     static unsigned int dma_frees,opens;
@@ -239,6 +243,21 @@ def check(root, output):
     '''
     unit=unit.replace('bool hpd_mutex,quiescing,typec_cable_connected;',
                       'bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;')
+    if 'afk_reply_size_valid(' in sender:
+        # The legacy reply-length path checks its size with the real helper; the
+        # T6030 dcpext (dcp->external) timeout diagnostic never runs for H17P.
+        unit=unit.replace('struct apple_dcp_afkep { u8 *command_tags;',
+                          'struct apple_dcp_afkep { struct { bool ready;u32 *rptr,*wptr; } txbfr,rxbfr;u8 *command_tags;',1)
+        unit=unit.replace('bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;',
+                          'bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;bool external;void *rtk;',1)
+        sender='''#include "afk_reply.h"
+    #define U32_MAX UINT32_MAX
+    #ifndef EOVERFLOW
+    #define EOVERFLOW 75
+    #endif
+    static bool apple_rtkit_is_running(void *r) { (void)r;assert(!"T6030 dcpext diagnostic on H17P");return false; }
+    static bool apple_rtkit_is_crashed(void *r) { (void)r;assert(!"T6030 dcpext diagnostic on H17P");return false; }
+    '''+sender
     unit+=sender+'\n'+tests
 
     out.mkdir(parents=True,exist_ok=True)
@@ -293,8 +312,13 @@ def check(root, output):
     #define RBEP_RECV 0x85
     #define complete_all(p) complete(p)
     ''')
+    afh=(root/'drivers/gpu/drm/apple/afk.h').read_text()
+    # The actual RX loop uses the real ring buffers instead of the diagnostic mock.
+    queued=queued.replace('struct apple_dcp_afkep { struct { bool ready;u32 *rptr,*wptr; } txbfr,rxbfr;u8 *command_tags;',
+                          'struct apple_dcp_afkep { u8 *command_tags;',1)
     queued=queued.replace('struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;',
-                          'struct apple_dcp_afkep { u8 *command_tags;int started,stopped,txbfr;struct { u32 bufsz,stride,*rptr,*wptr;bool ready; } rxbfr;void *debugfs_entry;bool lock,stopping;')
+                          'typedef u32 __le32;\n'+extract(afh,'struct afk_ringbuffer {')+';\n'
+                          'struct apple_dcp_afkep { u8 *command_tags;int started,stopped;struct afk_ringbuffer txbfr,rxbfr;void *debugfs_entry;bool lock,stopping;')
     queued=queued.replace('bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;',
                           'bool retain_dma,external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;')
     queued=queued.replace('static void run_retries(void) { assert(!ep.lock);if(ep.service_work.pending) { ep.service_work.pending=false;afk_service_worker(&ep.service_work); } }',
@@ -305,9 +329,9 @@ def check(root, output):
     queued+=r'''
     struct afk_receive_message_work { struct apple_dcp_afkep *ep;u64 message;struct work_struct work; };
     static void afk_getbuf(struct apple_dcp_afkep *e,u64 m) { (void)e;(void)m;assert(!"unexpected GETBUF"); }
-    static void afk_init_rxtx(struct apple_dcp_afkep *e,u64 m,void *r) { (void)e;(void)m;(void)r;assert(!"unexpected INIT"); }
-    static unsigned int rx_step;static bool close_pending;
-    #define dev_warn_ratelimited(...) ((void)0)
+    static void afk_init_rxtx(struct apple_dcp_afkep *e,u64 m,struct afk_ringbuffer *r) { (void)e;(void)m;(void)r;assert(!"unexpected INIT"); }
+    static unsigned int rx_step,drain_warnings;static bool close_pending;static __le32 rx_rptr,rx_wptr;
+    #define dev_warn_ratelimited(...) (drain_warnings++)
     static bool afk_recv(struct apple_dcp_afkep *e) {
         assert(e==&ep);rx_running=true;
         if(rx_step==0) closed(13,0x6a01,0);
@@ -319,16 +343,15 @@ def check(root, output):
     }
     '''
     af=(root/'drivers/gpu/drm/apple/afk.c').read_text()
-    ah=(root/'drivers/gpu/drm/apple/afk.h').read_text()
-    # RECV drains the ring through the production budget helpers.
     for signature in ['static inline unsigned int afk_ring_drain_budget(', 'static inline unsigned int afk_ring_drain(']:
-        queued+=extract(ah,signature)+'\n'
-    for signature in ['static bool afk_recv_entry(', 'static void afk_recv_drain(', 'static void afk_receive_message_worker(', 'int afk_receive_message(', 'void afk_quiesce(', 'static void afk_release_context(']:
+        queued+=extract(afh,signature)+'\n'
+    for signature in ['static bool afk_recv_entry(', 'static void afk_recv_drain(',
+                      'static void afk_receive_message_worker(', 'int afk_receive_message(', 'void afk_quiesce(', 'static void afk_release_context(']:
         queued+=extract(af,signature)+'\n'
     queued+=r'''
     int main(int argc,char **argv) {
         assert(argc==2);setup();reuse_dma=true;INIT_WORK(&ep.service_work,afk_service_worker);
-        ep.rxbfr.bufsz=0x1000;ep.rxbfr.stride=0x40;
+        ep.rxbfr=(struct afk_ringbuffer){.ready=true,.rptr=&rx_rptr,.wptr=&rx_wptr,.bufsz=0x1000,.stride=0x40};
         announce(13,name,native_class,13);struct apple_epic_service *old=d.dcpavserv.service;assert(old);
         assert(send_actual(old,false,false)==-ETIMEDOUT);save_ack();run_retries();
         unsigned int before=opens;
@@ -356,6 +379,7 @@ def check(root, output):
             afk_release_context(empty);
             cleanup();
         }
+        assert(!drain_warnings);
         printf("PASS actual RX worker/quiesce: %s\n",argv[1]);
     }
     '''
@@ -381,7 +405,9 @@ def check(root, output):
         if(read_action==4) { dpavservep_detach(&d);d.quiescing=true; }
         struct drm_edid *edid=malloc(sizeof(*edid));assert(edid);edid->marker=1;edid_allocations++;return edid;
     }
-    static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_service *service) { return dcpavserv_read_edid_inline(service); }
+    static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_service *service) { return dcpavserv_read_edid_inline(service); }    /* The 14.7 open-before-EDID handshake is for T6030 external processors only. */
+    static int __attribute__((unused)) afk_service_call(struct apple_epic_service *s,u16 group,u32 command,const void *data,size_t data_len,size_t data_pad,void *output,size_t output_len,size_t output_pad)
+{ (void)s;(void)group;(void)command;(void)data;(void)data_len;(void)data_pad;(void)output;(void)output_len;(void)output_pad;assert(!"14.7 open-before-EDID on H17P");return -ENODEV; }
     '''
     dpav=(root/'drivers/gpu/drm/apple/epic/dpavservep.c').read_text()
     for signature in ['bool dcpavserv_edid_current(', 'bool dcpavserv_edid_service_current(', 'const struct drm_edid *dcpavserv_copy_edid(']:

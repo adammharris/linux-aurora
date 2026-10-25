@@ -25,21 +25,15 @@
 
 /* Creating a usable AWDL interface requires interface_create flags
  * MAC_USE | IF_INDEX_USE | BSSID_USE together with an explicit BSSID and
- * an interface index; brcmfmac otherwise sends MAC_USE alone, which the
- * firmware accepts but leaves the AWDL iovars unusable. These parameters
- * exist so the three values can be swept without rebuilding the module.
+ * an interface index (BRCMF_AWDL_CREATE_FLAGS, BRCMF_AWDL_IF_INDEX);
+ * brcmfmac otherwise sends MAC_USE alone, which the firmware accepts but
+ * leaves the AWDL iovars unusable. The default BSSID is the fixed one that
+ * every AWDL node uses, so peers accept the interface's frames; awdl_bssid
+ * can override it at module load only.
  */
-static uint brcmf_awdl_create_flags = 0x1a;
-module_param_named(awdl_create_flags, brcmf_awdl_create_flags, uint, 0644);
-MODULE_PARM_DESC(awdl_create_flags, "interface_create flags for AWDL");
-
-static uint brcmf_awdl_if_index = 2;
-module_param_named(awdl_if_index, brcmf_awdl_if_index, uint, 0644);
-MODULE_PARM_DESC(awdl_if_index, "interface_create if_index for AWDL");
-
 static char *brcmf_awdl_bssid = "00:25:00:ff:94:73";
-module_param_named(awdl_bssid, brcmf_awdl_bssid, charp, 0644);
-MODULE_PARM_DESC(awdl_bssid, "interface_create BSSID for AWDL");
+module_param_named(awdl_bssid, brcmf_awdl_bssid, charp, 0444);
+MODULE_PARM_DESC(awdl_bssid, "interface_create BSSID for AWDL (default: the fixed AWDL BSSID)");
 
 #define BRCMF_INTERFACE_CREATE_VER_1 1
 #define BRCMF_INTERFACE_CREATE_VER_2 2
@@ -63,6 +57,12 @@ MODULE_PARM_DESC(awdl_bssid, "interface_create BSSID for AWDL");
 
 #define BRCMF_INTERFACE_BSSID_DONT_USE (0 << 4)
 #define BRCMF_INTERFACE_BSSID_USE (1 << 4)
+
+/* interface_create flags and interface index of an AWDL interface */
+#define BRCMF_AWDL_CREATE_FLAGS (BRCMF_INTERFACE_MAC_USE | \
+				 BRCMF_INTERFACE_IF_INDEX_USE | \
+				 BRCMF_INTERFACE_BSSID_USE)
+#define BRCMF_AWDL_IF_INDEX 2
 
 /*
  * From revision >= 2 Bit 0 of flags field will not be used  for STA or AP interface creation.
@@ -204,16 +204,15 @@ static int brcmf_cfg80211_request_if_internal(struct brcmf_if *ifp, u32 version,
 							  iface_v3.mac_addr);
 		}
 		if (awdl) {
-			flags = brcmf_awdl_create_flags;
+			flags = BRCMF_AWDL_CREATE_FLAGS;
 			/* brcmf_awdl_add_vif() passes NULL, so derive a MAC
 			 * here rather than send MAC_USE with an all-zero
 			 * address.
 			 */
-			if ((flags & BRCMF_INTERFACE_MAC_USE) &&
-			    is_zero_ether_addr(iface_v3.mac_addr))
+			if (is_zero_ether_addr(iface_v3.mac_addr))
 				brcmf_set_vif_sta_macaddr(ifp,
 							  iface_v3.mac_addr);
-			iface_v3.if_index = brcmf_awdl_if_index;
+			iface_v3.if_index = BRCMF_AWDL_IF_INDEX;
 			if (mac_pton(brcmf_awdl_bssid, iface_v3.bssid)) {
 				brcmf_info("awdl interface_create: flags 0x%x, if_index %u, bssid %pM, mac %pM\n",
 					   flags, iface_v3.if_index,
@@ -245,6 +244,17 @@ static int brcmf_cfg80211_request_if(struct brcmf_if *ifp,
 	iface_create_ver = 0;
 	err = brcmf_fil_bsscfg_int_query(ifp, "interface_create",
 					 &iface_create_ver);
+	/* Only the version 3 request can describe an AWDL interface. Refuse it
+	 * on older firmware, including firmware too old to report a version,
+	 * rather than send a request that does not say what is asked for.
+	 */
+	if (if_type == BRCMF_INTERFACE_TYPE_AWDL &&
+	    (err || iface_create_ver != BRCMF_INTERFACE_CREATE_VER_3)) {
+		bphy_err(ifp->drvr,
+			 "AWDL needs interface_create version 3 (firmware: %d)\n",
+			 err ? -1 : (int)iface_create_ver);
+		return -EOPNOTSUPP;
+	}
 	if (!err) {
 		err = brcmf_cfg80211_request_if_internal(ifp, iface_create_ver,
 							 if_type, macaddr);

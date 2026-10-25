@@ -1,131 +1,90 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * ane_t6021_boot.c — T6021 boot state reporter (W15).
+ * ane_t6021_boot.c — T6021 boot sequencer: the kernel io backend, the
+ * boot sources and the preflight gates for ane_t6021_boot_run(). The
+ * sequence and its pure helpers (entry fold, latch/entry decode,
+ * SCRATCH u64 split, init-structure fill) live in ane_t6021_boot.h.
  *
- * READ-ONLY. Main review 2026-09-20: the unresolved pre-CPU power and
- * config-table prerequisites BLOCK every boot write, so this unit
- * performs no MMIO write at all — it resolves the boot-input state,
- * reports it with per-read whitelist provenance, and names the exact
- * missing lifecycle datum. The write path (RVBAR entry fold + CPU RUN
- * release + first-alive ack) lands only after the prerequisites below
- * are pinned; its pure contract units (entry fold, latch/entry decode,
- * SCRATCH u64 split, init-structure fill) live in ane_t6021_boot.h and
- * are regression-tested host-side (tools/h14_boot_regression.c).
- *
- * Blocked boot writes, with the blocking prerequisite each one waits on:
+ * Boot writes, with the prerequisite each one depends on:
  *   - RVBAR entry fold (ENTRY_BASE | fw DVA & ADDR_MASK; single u64
- *     store; the read and the write are both 64-bit, per width_proof):
- *     semantics of the observed RVBAR read 0x1 are unresolved
- *     (see the rvbar lifecycle fork) AND the pre-CPU block
- *     below applies regardless.
- *   - CPU_CONTROL write32 0 then 0x10 (rvbar-width local order): waits
- *     on the same pre-CPU block; releasing RUN with an unresolved
- *     entry state is the exact blind start the lane forbids.
- *   - SCRATCH0/1 publication + SCRATCH7 wake: init-structure fields
- *     [0x08] and [0x10,0x38) have no pinned firmware consumer
- *     read-set; zero-filling unknown fields and calling the structure
- *     valid is forbidden (Main 2026-09-20).
+ *     store; the read and the write are both 64-bit): skipped while
+ *     the RVBAR read has bit0 set (see the RVBAR lifecycle below).
+ *   - CPU_CONTROL write32 0 then 0x10: only once the entry state is
+ *     decided; releasing RUN with an unresolved entry state would be a
+ *     blind start.
+ *   - SCRATCH0/1 publication + SCRATCH7 wake: every init-structure
+ *     field the firmware reads needs a Linux source; zero-filling
+ *     unknown fields and calling the structure valid is not allowed.
  *
- * Pre-CPU prerequisites, updated for pass4 (receipts 2026-09-20
- * pass4 + tools/check_power_anchors.py 33/33, commit
- * 04630ef):
- *   RESOLVED (pass4): the CPU-power branch — the h14g configuration
- *     selects the PLAIN branch (the same configuration that puts
- *     CPU_CONTROL at 0x01400044), so the CPU island is powered with
- *     write32(PMGR+0x2e0, 0x0000000f), validate 0xff —
- *     AUTO_ENABLE bit28 never set. On Linux this END STATE is exactly
- *     what the first_resume stage-2/3 gate verifies (act=0xf,
- *     AUTO_ENABLE clear) before any of this code runs — the write is
- *     therefore not replicated (ps-word writes are forbidden by the
- *     standing rule and froze the box 2026-09-19); the gate IS the
- *     equivalence check.
- *   STILL OPEN (each blocks its write below):
- *   1. CLOSED (pass5 c364f24): the pre-CPU engine table writels
- *      eng+0xb38/0xb98/0xbf8 <- 0x01ff01ff are REQUIRED every time
- *      the ANE clocks and power are enabled — they are written
- *      unconditionally, before the CPU start; the
- *      order-vs-start question is moot. Receiver PROVEN pass4
- *      (the engine register window, reg[0]); count =
- *      3. Armed below; the first live firing must ride netconsole
- *      behind the seam logs.
- *   2. Provider first-enable of the device clock and power: the
- *      set of clock and power gates it enables is only known at run
- *      time (open). Linux
- *      substitutes the genpd raise + supplier links (islands verified
- *      ACTUAL=0xf by the gate); the equivalence datum is the open
- *      half.
- *   3. RVBAR lifecycle — RESOLVED (M2ResetLifecycle,
- *     rvbar-lifecycle-evidence.json, anchors 38/38
- *     check_rvbar_lifecycle_anchors.py): live bit0-set + entry 0 is
- *     the STALE state; the valid transition is power_off
- *     (de-init, then PMGR ps 0x2e0 ← 0x00000000 through the PMGR
- *     window) → power_on → re-init, NEVER an
- *     RVBAR write while bit0 is set. RVBAR (engine window,
- *     0x1050000, u64) is written only after a read64 with bit0 == 0;
- *     CPU_CONTROL write32 0 then 0x10 runs on BOTH paths; success =
- *     SCRATCH7 read32 == 0x08042006. Open edge:
- *     whether ps-off clears bit0 — one live read-only read64 after a
- *     domain-off answers it. IMPLEMENTATION CAVEAT: the ps-word write
- *     is the class that froze this host from kernel context
- *     (2026-09-19 receipt) and the W3 gate demands act=0xf +
- *     AUTO_ENABLE clear afterwards — the reset vehicle (userspace
- *     stage vs in-kernel) is a Main decision, so the fold+start path
- *     stays behind the itemized preflight gates.
- *   3. Ack model — TWO-PHASE, SINGLE REGISTER, TRANSITION-BASED
- *      (rvbar-lifecycle receipt 6288b0b, 57/57 anchors; supersedes the
- *      pass6 SCRATCH0-beacon reading): pre-CPU, SCRATCH cells are
- *      cleared and SCRATCH7 is PULSED 1 -> 0 (stale READY/wake
- *      cleared); after CPU_CONTROL 0 -> 0x10, poll A demands a FRESH
- *      SCRATCH7 READY 0x08042006 (fw alive; fw_alive). Publication
- *      (init suballoc DVA -> SCRATCH0/1, dsb st) happens ONLY after
- *      poll A; then wake 0xf7fbdff9 -> SCRATCH7 releases the fw; poll
- *      B awaits SCRATCH7 DONE 0x08042006 (booted) and reads back
- *      SCRATCH0/1. Because of the pulse, a post-CPU READY is
- *      unambiguous — no stale-ack hazard. The SCRATCH0 marker
- *      is not a gate.
+ * Pre-CPU prerequisites:
+ *   CPU power: the h14g configuration selects the PLAIN branch (the
+ *     same configuration that puts CPU_CONTROL at 0x01400044), so the
+ *     CPU island is powered with write32(PMGR+0x2e0, 0x0000000f),
+ *     validate 0xff — AUTO_ENABLE bit28 never set. On Linux genpd
+ *     raises the island before any of this code runs, and probe checks
+ *     its ACTUAL state before the first engine read; the write is
+ *     therefore not replicated (a direct ps-word write from kernel
+ *     context has hung the machine).
+ *   1. The pre-CPU engine table writels eng+0xb38/0xb98/0xbf8 <-
+ *      0x01ff01ff (three, into the engine register window, reg[0]) are
+ *      REQUIRED every time the ANE clocks and power are enabled, before
+ *      the CPU start. They have also wedged the machine here, so
+ *      fw_start_table_mode decides whether they run.
+ *   2. Provider first-enable of the device clock and power: the set of
+ *      clock and power gates it enables is only known at run time.
+ *      Linux substitutes the genpd raise + supplier links.
+ *   3. RVBAR lifecycle: bit0 set + entry 0 is the STALE state; the
+ *      valid transition is power_off (de-init, then PMGR ps 0x2e0 ←
+ *      0x00000000 through the PMGR window) → power_on → re-init, NEVER
+ *      an RVBAR write while bit0 is set. RVBAR (engine window,
+ *      0x1050000, u64) is written only after a read64 with bit0 == 0;
+ *      CPU_CONTROL write32 0 then 0x10 runs on BOTH paths; success =
+ *      SCRATCH7 read32 == 0x08042006. Whether ps-off clears bit0 is not
+ *      known. The ps-word write of that reset is the class that hangs
+ *      the machine from kernel context, so this driver never performs
+ *      it: with bit0 set, the ASC starts at the latched entry.
+ *   4. Ack model — TWO-PHASE, SINGLE REGISTER, TRANSITION-BASED:
+ *      pre-CPU, SCRATCH cells are cleared and SCRATCH7 is PULSED 1 -> 0
+ *      (stale READY/wake cleared); after CPU_CONTROL 0 -> 0x10, poll A
+ *      demands a FRESH SCRATCH7 READY 0x08042006 (fw alive; fw_alive).
+ *      Publication (init suballoc DVA -> SCRATCH0/1, dsb st) happens
+ *      ONLY after poll A; then wake 0xf7fbdff9 -> SCRATCH7 releases the
+ *      fw; poll B awaits SCRATCH7 DONE 0x08042006 (booted) and reads
+ *      back SCRATCH0/1. Because of the pulse, a post-CPU READY is
+ *      unambiguous — no stale-ack hazard. The SCRATCH0 marker is not a
+ *      gate.
  *      On the firmware side: it writes READY (0x08042006) to
  *      SCRATCH7, then polls SCRATCH7 every 1 ms until it reads the
  *      wake word 0xf7fbdff9, and writes DONE (0x08042006 again) once
  *      it has booted; the host's poll B waits for that second
  *      0x08042006.
- *   4. Linux allocation map (legacy branch sizes): FWIM surface =
- *      0x500000 bytes (Main, audit 751caa4);
- *      Linux fw_buf is ANE_FW_BUF_SIZE = 0x500000 — the semantic is
- *      honored directly, covering the image vmsize 0x36c000. 'IPC '
- *      surface = a configured size, capped
- *      — the numeric cap needs the h14g config field map
- *      (open prerequisite). Init suballoc = 0x174 from a Linux-owned
- *      pool (pool
- *      total size open). RTBuddy FW_INIT sizes (64K…) are the OTHER
+ *   5. Linux allocation map (legacy branch sizes): FWIM surface =
+ *      0x500000 bytes; Linux fw_buf is ANE_FW_BUF_SIZE = 0x500000,
+ *      covering the image vmsize 0x36c000. 'IPC ' surface = a
+ *      configured size, capped. Init suballoc = 0x174 from a
+ *      Linux-owned pool. RTBuddy FW_INIT sizes (64K…) are the OTHER
  *      branch — never used here.
- *   5. Init publication: the fw consumes [0x08]..[0x68] (pass5) and
- *      the Linux sources of those fields are not pinned ([0x08] =
- *      the 'IPC ' surface DVA — the surface
- *      itself is CLOSED (pass5c/5d), its Linux allocation size open
- *      per item 4; [0x10]/[0x18] = config-size terms with
- *      the image byte-count closed; [0x30] = the
- *      load-progress word) — publication cannot fire until every
- *      fw-read field has a pinned Linux source.
+ *   6. Init publication: the fw consumes [0x08]..[0x68] ([0x08] = the
+ *      'IPC ' surface DVA; [0x10]/[0x18] = config-size terms; [0x30] =
+ *      the load-progress word) — publication cannot fire until every
+ *      fw-read field has a Linux source.
  *
  * Read whitelist — every MMIO read below, individually:
- *   - RVBAR eng+0x01050000: read64 width-proven (rvbar-width
- *     width_proof); W8 and W10 live Linux reads, value 0x1 each.
- *   - CPU_STATUS eng+0x1400048: phase-1 S2 whitelist; polled while
- *     the CPU starts; W10 live read
- *     0x2a.
- *   - ASC mailbox controls eng+0x1408110/0x1408114: W10 live reads
- *     (both 0x00020001; 600 polls / 30 s, zero changes, zero aborts).
- *     The FATAL mailbox-class reads were the +0x1608xxx h16g analog —
+ *   - RVBAR eng+0x01050000: read64 (the register is 64 bits wide);
+ *     Linux reads have returned 0x1.
+ *   - CPU_STATUS eng+0x1400048: polled while the CPU starts; reads
+ *     0x2a before it does.
+ *   - ASC mailbox controls eng+0x1408110/0x1408114: both read
+ *     0x00020001; polling them neither changes them nor aborts.
+ *     The FATAL mailbox-class reads are the +0x1608xxx h16g analog —
  *     a different address never touched here; the 0x1854000..0x1c04000
  *     fabric-fatal window is likewise never touched.
- *   - SCRATCH eng+0x1840048..0x1840064: phase-1 S2 whitelist
- *     (all-zero pre-attach), W5 pre-read log clean, first_resume
- *     re-reads all eight on every load.
+ *   - SCRATCH eng+0x1840048..0x1840064: all zero before the driver
+ *     attaches.
  *   - TICK eng+0x1160008 (PROGRESS dump only): 24 MHz domain tick,
- *     proven readable post-release (2026-09-25 handshake receipt);
- *     two reads 20 ms apart for a delta. engine+0x1140008 is
- *     deliberately NOT read (readability/width/reset semantics
- *     unproven, no pre-release baseline — Main review 2026-09-26).
+ *     readable once the CPU is released; two reads 20 ms apart for a
+ *     delta. engine+0x1140008 is deliberately NOT read (readability,
+ *     width and reset semantics unknown, no pre-release baseline).
  */
 
 #include <linux/device.h>
@@ -142,86 +101,67 @@
 #include "ane_t6021_boot.h"
 
 /* Retain the firmware nap-prevention counter via the init resource bit
- * (lab boot_prevent_nap=1, the proven add-path value).
+ * (default on).
  */
 static bool boot_prevent_nap = true;
 module_param(boot_prevent_nap, bool, 0444);
 MODULE_PARM_DESC(boot_prevent_nap,
-		 "Retain firmware nap-prevention counter via init resource bit (default on: proven add-path value)");
+		 "Retain firmware nap-prevention counter via init resource bit (default on)");
 
 /* Boot-write gates — ITEMIZED, each a HARD gate: the ENTIRE write
  * sequence (preboot engine table, scratch clear + pulse, RVBAR
  * resolution, CPU release, publication, wake) runs start-to-finish
- * only when EVERY gate below is true, checked BEFORE any write (Main
- * 2026-09-20: no partial boot; remaining semantics stay hard gates,
- * not comments). Each flips only with cited proof in a Main-reviewed
- * commit that also populates the sources and adds the kernel io
- * backend — never a runtime knob.
+ * only when EVERY gate below is true, checked BEFORE any write (no
+ * partial boot; remaining semantics stay hard gates, not comments).
+ * Each is a compile-time constant — never a runtime knob.
  */
-/* Provider equivalence — CLOSED (Main provider review 2026-09-20):
- * Linux genpd attachment + supplier links accepted INSTEAD of
- * reproducing Apple runtime index arrays, CONDITIONAL on the live
- * first_resume verifying all 8 islands ACTUAL=0xf, BUSY=0, CPU
- * AUTO_ENABLE clear before the sequence — that verification runs on
- * every probe and the driver performs no direct kernel PMGR writes.
+/* Provider equivalence: Linux genpd attachment + supplier links stand
+ * in for Apple's runtime power index arrays, provided all 8 islands
+ * are on (ACTUAL=0xf, BUSY=0, CPU AUTO_ENABLE clear) before the
+ * sequence; probe checks the ane_cpu island before the first engine
+ * read, and the driver performs no direct kernel PMGR writes.
  */
 static const bool pf_provider_genpd_strategy = true;
-static const bool pf_pool_word0_proven = true;	/* CONFIRMED (Reset
-						 * 183fd50, traced through
-						 * the firmware's pool
-						 * setup): DDM Params
-						 * word0 = requested bytes =
-						 * 0x40000 — sourced, not
-						 * synthesized
+static const bool pf_pool_word0_proven = true;	/* DDM Params word0 =
+						 * requested bytes =
+						 * 0x40000, traced
+						 * through the firmware's
+						 * pool setup
 						 */
-static const bool pf_heap_floor_pinned = true;	/* CLOSED: floor =
-						 * the DART page size =
-						 * 0x4000 (the dart-ane0
-						 * node's page-size
-						 * property is 0x4000,
-						 * pass6h);
+static const bool pf_heap_floor_pinned = true;	/* floor = the DART
+						 * page size = 0x4000
+						 * (the dart-ane0 node's
+						 * page-size property);
 						 * sourced in boot_sources
 						 */
-static const bool pf_dart_page_floor = true;	/* CLOSED (
-						 * pass6h + exact-node
-						 * linkage): dtree-j414c.txt
-						 * sha256 dd2955…d504, ane0
-						 * iommu-parent 363 (line
-						 * 11499), dart-ane0
-						 * page-size 0x4000 (line
-						 * 11510), child mapper-ane0
-						 * phandle 363 (line 11527).
-						 * Runnable linkage check:
-						 * ane-linux-experiments
-						 * tools/
-						 * check_dart_ane_pagesize_linkage.py
+static const bool pf_dart_page_floor = true;	/* j414c ADT: ane0's
+						 * iommu-parent is the
+						 * dart-ane0 child
+						 * mapper-ane0, and
+						 * dart-ane0's page-size
+						 * is 0x4000
 						 */
-static const bool pf_rvbar_lifecycle = true;	/* 6288b0b, 57/57 anchors */
-static const bool pf_pass6_init_contract = true; /* cd25b46, 87/87 */
+static const bool pf_rvbar_lifecycle = true;
+static const bool pf_pass6_init_contract = true;
 
-/* FINAL authorization gate — CLOSED (Main provider review + pass6h
- * numeric closure + 183fd50 word0 confirmation + netconsole Wi-Fi
- * marker m2-wifi-check-1789937086 @ 15:44:47.121595Z). Source
- * contract closure complete; live attempt authorized by user
- * override (autonomous boot/recovery loop).
- */
-/* Table-block mode selection (2026-09-20 16:23:07 wedge):
+/* Table-block mode selection (the table writes have wedged the
+ * machine):
  *   mode 0 = ABORT before any write (accidental-repeat prevention),
  *   mode 1 = write the table (as on macOS; selected per-run via the
  *            rtclient fw_start_table_mode param),
- *   mode 2 = SKIP the table (default: the shipped diagnostic).
- * W8 write-grant tunables are mode-independent (proven no-abort
- * class, w8-run.out: APERTURE_UNLOCKED) and run in every armed mode.
+ *   mode 2 = SKIP the table (default: diagnostic).
+ * The write-grant tunables are mode-independent (a write class that
+ * does not abort) and run in every armed mode.
  */
 
 static const bool pf_main_lifetime_review = true;
 
 static bool ane_t6021_boot_preflight_complete(void)
 {
-	/* pf_preboot_table_safe is INTENTIONALLY NOT in this product:
-	 * mode 2 (table skip) is the authorized diagnostic state —
-	 * the preflight covers the source contract, the mode selector
-	 * covers the live-fault table gating.
+	/* The pre-CPU table block is INTENTIONALLY NOT in this product:
+	 * mode 2 (table skip) is a valid diagnostic state — the
+	 * preflight covers the boot sources, the mode selector covers
+	 * the table gating.
 	 */
 	return pf_provider_genpd_strategy && pf_pool_word0_proven &&
 	       pf_heap_floor_pinned && pf_dart_page_floor &&
@@ -229,47 +169,37 @@ static bool ane_t6021_boot_preflight_complete(void)
 	       pf_main_lifetime_review;
 }
 
-/* STATIC boot sources — populated per the pinned contract (Main
- * authorization 2026-09-20). The 'DDM ' pool (size 0x40000) and the
- * memory manager built on top of it are separate objects, which
- * audit 018abdb had confused; the pool's first word is its
- * requested size (see pool_word0 below).
+/* STATIC boot sources. The 'DDM ' pool (size 0x40000) and the
+ * memory manager built on top of it are separate objects; the pool's
+ * first word is its requested size (see pool_word0 below).
  *
  * Runtime fields (fw_dva, ipc_dva, pool_dma) are
- * filled by ane_t6021_boot_prepare() at sequence time (after poll A,
- * per "dynamic allocations occur after READY"); heap_floor stays 0
- * here and is supplied together with pf_heap_floor_pinned — NEVER
- * used unpinned (the gate above keeps the whole sequence unrun until
- * then).
+ * filled by ane_t6021_boot_prepare() at sequence time (after poll A:
+ * dynamic allocations occur after READY).
  */
 static const struct ane_t6021_init_sources boot_sources = {
 	.cfg_size = 0x500000,		/* FWIM surface size */
 	.prev_fw_len = 0,		/* first boot; static per reload */
-	.heap_floor = 0x4000,		/* DART page size; node
-					 * authority: the dart-ane0
-					 * page-size property, 0x4000
-					 * (exact linkage check
-					 * passing)
+	.heap_floor = 0x4000,		/* DART page size: the
+					 * dart-ane0 page-size
+					 * property, 0x4000
 					 */
 	.pool_word0 = 0x40000,		/* DDM Params word0 = requested
-					 * bytes (CONFIRMED, 183fd50)
+					 * bytes
 					 */
 };
 
 /* Poll A/B bound: up to 1000 polls with a 1 ms sleep, the same bound
- * the firmware's own handshake loop uses (rvbar-lifecycle step 6/10).
+ * the firmware's own handshake loop uses.
  */
 #define ANE_BOOT_ACK_POLL_US	1000
 #define ANE_BOOT_POLL_MS	1000
 
 /* The COMPLETE resolved legacy-boot sequence is implemented ONCE in
- * ane_t6021_boot.h (ane_t6021_boot_run) against an io backend, so the
- * fake-MMIO trace check exercises the exact code the device will run
- * (Main: runnable trace check; implement the device wiring only after
- * ALL sources close — until then this file performs no boot write).
- * The kernel backend (readl/writeq/udelay wrappers + prepare hook
- * doing the pool/IPC allocations and the sourced fill) is the small
- * reviewed increment that lands with the gate flip.
+ * ane_t6021_boot.h (ane_t6021_boot_run) against an io backend, so a
+ * fake-MMIO trace test can exercise the exact code the device runs.
+ * The kernel backend below is the readl/writeq/udelay wrappers plus
+ * the prepare hook doing the pool/IPC allocations and the sourced fill.
  */
 
 /* ---- kernel io backend for ane_t6021_boot_run() ---- */
@@ -331,22 +261,20 @@ static void ane_boot_phase(void *ctx, const char *what)
 	/* bounded phase marker: one line per block boundary (never
 	 * per-poll), for crash attribution. It is a debug message: turn
 	 * it on with dynamic debug, and raise the console loglevel to
-	 * see it there. The short drain lets the line reach
-	 * tty0/netconsole/ssh BEFORE the risky write it announces
-	 * (fw-start-debug 2026-09-22: fwstart#2 died with zero capture —
-	 * the marker must beat the write).
+	 * see it there. The short drain lets the line reach a local or
+	 * remote console BEFORE the risky write it announces: if the
+	 * write kills the machine, the marker must already be out.
 	 */
 	dev_dbg(mm->ane->dev, "BOOT-PHASE %s\n", what);
 	msleep(30);
 }
 
 /* S5 prepare — runs strictly AFTER poll A (fw alive), BEFORE the
- * SCRATCH0/1 publish. Dynamic allocations occur here per "dynamic
- * allocations occur after READY" (Main): the 'DDM ' pool, the 'IPC '
- * surface, and the trust-bounded fw-requested HEAP surface. Every
- * allocation is wedged-pin owned from here on (held while
- * cpu_started; reboot reclaims). Publishes the pool DVA (suballoc at
- * offset 0) as the SCRATCH0/1 halves.
+ * SCRATCH0/1 publish. Dynamic allocations occur here, after READY:
+ * the 'DDM ' pool, the 'IPC ' surface, and the trust-bounded
+ * fw-requested HEAP surface. Every allocation is wedged-pin owned from
+ * here on (held while cpu_started; reboot reclaims). Publishes the
+ * pool DVA (suballoc at offset 0) as the SCRATCH0/1 halves.
  */
 static void *ane_boot_alloc(void *ctx, u64 size, u64 *iova)
 {
@@ -368,7 +296,7 @@ static void *ane_boot_alloc(void *ctx, u64 size, u64 *iova)
 
 /* Kernel prepare: live SCRATCH3/SCRATCH1 reads feed the SHARED
  * assembly (ane_t6021_boot_prepare_publish) with the dma_alloc hook —
- * the same path the fake-MMIO trace test exercises. Allocations are
+ * the same path a fake-MMIO trace test can exercise. Allocations are
  * wedged-pin owned from creation (held while cpu_started).
  */
 static int ane_t6021_boot_prepare(void *ctx, u32 *lo, u32 *hi)
@@ -402,10 +330,10 @@ static int ane_t6021_boot_prepare(void *ctx, u32 *lo, u32 *hi)
 					     lo, hi);
 	if (!err && boot_prevent_nap) {
 		((u8 *)a.pool)[ANE_T6021_INIT_TEMPLATE_OFF + 0x84] |= 1;
-		dev_info(ane->dev, "LAB init resource[0x84] bit0=1: prevent nap\n");
+		dev_info(ane->dev, "init resource[0x84] bit0=1: prevent nap\n");
 	}
-	/* OWNERSHIP TRANSFER on EVERY path (Main lifetime review): an
-	 * error after the pool/ipc allocations must NOT lose them — a
+	/* OWNERSHIP TRANSFER on EVERY path: an error after the
+	 * pool/ipc allocations must NOT lose them — a
 	 * started CPU may already be fetching, so partial allocations
 	 * are RETAINED (wedged-pin holds them; reboot reclaims), never
 	 * freed on this path.
@@ -427,16 +355,15 @@ static int ane_t6021_boot_prepare(void *ctx, u32 *lo, u32 *hi)
  * (wedged-pin cleanup refuses to free under a started CPU) and the
  * probe binds fenced.
  */
-/* Poll-A-timeout progress dump — PROVEN-readable observables ONLY
- * (Main review 2026-09-26): all eight SCRATCH cells (pulse-cleared to 0
- * pre-release, so any nonzero word with SCRATCH7 != READY/WAKE is a
- * candidate firmware store), RVBAR, CPU_STATUS, and the 24 MHz domain
- * tick at engine+0x1160008 (watched advancing post-release in the
- * 2026-09-25 handshake receipt; a static tick separates "ASC domain
- * unclocked" from "clocked but silent").
+/* Poll-A-timeout progress dump — observables known to be safe to read
+ * ONLY: all eight SCRATCH cells (pulse-cleared to 0 pre-release, so any
+ * nonzero word with SCRATCH7 != READY/WAKE is a candidate firmware
+ * store), RVBAR, CPU_STATUS, and the 24 MHz domain tick at
+ * engine+0x1160008 (it advances once the CPU is released; a static
+ * tick separates "ASC domain unclocked" from "clocked but silent").
  *
  * Deliberately NOT read: engine+0x1140008 (a word the 13.5 stub
- * writes). Its readability, width and reset value are unproven
+ * writes). Its readability, width and reset value are unknown
  * and no pre-release baseline exists, so an after-value would not
  * locate PC (could be preexisting iBoot state, write-only, or
  * normalized).
@@ -484,8 +411,8 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode, 
 	u64 sres = 0;
 	int r;
 
-	/* Wedged-pin module lifetime (Main lifetime review): the ref is
-	 * acquired BEFORE the first write — a started CPU can never
+	/* Wedged-pin module lifetime: the ref is acquired
+	 * BEFORE the first write — a started CPU can never
 	 * outlive the pin, and a dying module refuses the boot before
 	 * any write happens. Retained on CPU start (never released:
 	 * intentional); released only if no CPU start occurred.
@@ -509,8 +436,7 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode, 
 
 	/* Released CPU without READY (poll-A timeout, either transport
 	 * mode): capture the 13.5 execution-progress observables NOW,
-	 * while the islands are powered — this is the exact-progress
-	 * datum the next pre-Linux capture cross-checks.
+	 * while the islands are powered.
 	 */
 	if (cs && !fa)
 		ane_t6021_boot_progress_dump(ane);
@@ -549,4 +475,3 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode, 
 			 sres);
 	return r;
 }
-

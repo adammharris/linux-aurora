@@ -2,8 +2,8 @@
 # Copyright 2026 Ryan Murray
 """Actual parser, bounded rate admission, catalog replacement and HPD."""
 from pathlib import Path
-import copy, struct
-from common import block, source_defines
+import copy, re, struct
+from common import block, source_defines, apple_function, internal_inline
 
 def parser_fixture(root):
 
@@ -120,6 +120,9 @@ typedef u32 __le32;
 #undef static_assert
 #define static_assert(c) _Static_assert(c, #c)
 #define IS_ENABLED(x) 0
+/* <kunit/visibility.h> without CONFIG_KUNIT, as IS_ENABLED() above */
+#define VISIBLE_IF_KUNIT static
+#define EXPORT_SYMBOL_IF_KUNIT(symbol)
 #define U32_MAX UINT32_MAX
 #define U16_MAX UINT16_MAX
 #define S64_MAX INT64_MAX
@@ -377,13 +380,13 @@ struct apple_connector {
     u64 drm_edid_generation, drm_edid_service_epoch;
     const struct drm_edid *drm_edid;
     struct { int registration_state; } base;
-    struct work_struct hotplug_wq;
+    struct work_struct hotplug_wq, bl_sync_wq;
 };
 struct apple_epic { struct apple_dcp *dcp; unsigned endpoint; bool wire_v2; };
 struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled; };
 struct dptx_port { u32 lane_count, link_rate; bool enabled, closed, connected; void *atcphy; struct apple_epic_service *service; };
 struct apple_dcp {
-    struct { int iomfb_method_profile; } hw;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw;
     struct { bool lock, attributes_valid, timing_valid, hpd_seen; struct dcp_metadata_epoch epoch; struct dcp_metadata_ticket catalog_ticket;
         u64 catalog_connection_sequence; } metadata;
     struct { bool lock, enabled; void *service; u64 epoch; } dcpavserv;
@@ -395,6 +398,7 @@ struct apple_dcp {
     u64 typec_generation; unsigned int nr_modes;
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
+    bool ext_backlight, has_panel;
 };
 struct rate_guard { bool *lock; };
 static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }
@@ -402,6 +406,7 @@ static void rate_unlock(struct rate_guard *g) { assert(*g->lock);*g->lock=false;
 #define guard(kind) struct rate_guard __attribute__((cleanup(rate_unlock))) _guard = rate_lock
 static bool dcp_is_usb4_output(struct apple_dcp *d) { return d->usb4; }
 static void schedule_work(struct work_struct *w) { w->scheduled++; }
+static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return d->has_panel; }
 static const struct edid *drm_edid_raw(const struct drm_edid *e) { return (const void *)e->data; }
 static bool dcpavserv_edid_current(struct apple_dcp *d, u64 generation) {
     assert(d->hpd_mutex);return d->typec_cable_connected&&generation==d->typec_generation&&!d->quiescing;
@@ -554,11 +559,16 @@ struct apple_connector {''')
     state = state.replace('struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled; };', '''struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled,torndown;
     unsigned users,channel; struct { u64 generation,epoch; } admission;
 };''')
-    state = state.replace('struct { bool lock, enabled; void *service; u64 epoch; } dcpavserv;', 'struct { bool lock, enabled; void *service; u64 epoch; int enable_completion; } dcpavserv;')
+    state = state.replace('struct { bool lock, enabled; void *service; u64 epoch; } dcpavserv;', 'struct { bool lock, enabled; void *service, *opened; u64 epoch; int enable_completion; } dcpavserv;')
+    # Catalogue/EDID ownership: modes are admitted per attachment under modes_lock.
+    state = state.replace('    struct work_struct hotplug_wq, bl_sync_wq;\n};', '    struct work_struct hotplug_wq, bl_sync_wq;\n    bool edid_live; unsigned hotplug_reasons;\n};', 1)
     state = state.replace('u64 typec_generation; unsigned int nr_modes;', '''u64 typec_generation; unsigned int nr_modes;
     struct apple_epic *dcpavservep;
     int fw_compat,width_mm,height_mm,fixed_connector_type; unsigned notch_height;
-    struct { size_t length,received; void *data; bool contiguous,payload_complete;
+    bool modes_lock,modes_admitted,modes_provisional,placeholder_retried; int external_held;
+    u64 modes_generation,dimensions_generation; struct work_struct dimensions_wq;
+    struct { int width_mm,height_mm; } panel;
+    struct { size_t length,received; void *data; bool contiguous,payload_complete; u64 modes_generation;
         u64 av_service_epoch,automatic_connection_sequence; bool automatic_service_pending;
         struct dcp_metadata_ticket metadata_ticket,mode_ticket;
     } chunks;''')
@@ -567,6 +577,10 @@ struct apple_connector {''')
     state = state[:start]
 
     stubs = r'''
+/* The rate/HPD fixture is an external H17P sink; it never selects M4. */
+#define iomfb_is_v26_6(dcp) false
+#define iomfb_v26_6_get_mode(dcp,mode) (-ENODEV)
+#define of_property_read_u32(node,name,value) (-EINVAL)
 #define WRITE_ONCE(p,v) ((p)=(v))
 #define platform_device apple_dcp
 #define platform_get_drvdata(p) ((struct apple_dcp *)(p))
@@ -640,8 +654,25 @@ static void dcp_firmware_metadata_begin(struct apple_dcp *d) {
 }
 static void dcp_firmware_metadata_timing(struct apple_dcp *d) { (void)d; }
 static void dcp_firmware_metadata_attributes(struct apple_dcp *d,const struct dcp_display_metadata *m) { (void)d; (void)m; }
-static void dcp_set_dimensions(struct apple_dcp *d) { (void)d; }
+/* Deferred to dimensions_wq since the catalogue ownership change. */
+static void __attribute__((unused)) dcp_set_dimensions(struct apple_dcp *d) { (void)d; }
 struct dcp_set_dcpav_prop_end_req { char key[64]; };
+static void rate_scoped_unlock(struct rate_guard *g) { if(g->lock) rate_unlock(g); }
+#define scoped_guard(kind,l) for(struct rate_guard _scoped __attribute__((cleanup(rate_scoped_unlock)))=rate_lock(l);_scoped.lock;rate_unlock(&_scoped),_scoped.lock=NULL)
+#define atomic_read(p) (*(p))
+#define atomic_or(v,p) (*(p)|=(v))
+#define SZ_16M (16*1024*1024)
+#ifndef BIT
+#define BIT(n) (1UL << (n))
+#endif
+static void *kmemdup_array(const void *src,size_t n,size_t size,int gfp) { (void)gfp;void *p=malloc(n*size);if(p)memcpy(p,src,n*size);return p; }
+static void disable_work_sync(struct work_struct *w) { (void)w; }
+#ifndef DCP_FIRMWARE_V_14_7
+#define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
+#define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
+#endif
+'''+internal_inline(root,'dcp_fw_is_14_7')+r'''/* Off T6030 machines the direct crossbar output is not clocked separately. */
+static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,bool up) { (void)d;(void)up;return 0; }
 '''
     transport = '\n'.join(block(av,marker) for marker in [
         'static void dcpavserv_notify_edid(', 'static bool dcpavserv_identity(',
@@ -651,7 +682,17 @@ struct dcp_set_dcpav_prop_end_req { char key[64]; };
         'bool dcpavserv_edid_current(', 'bool dcpavserv_edid_service_current(',
     ])
     mode_helpers = iomfb[iomfb.index('static struct dcp_display_mode *dcp_modes_snapshot('):iomfb.index('int dcp_get_modes(')]
-    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+block(iomfb,'int dcp_get_modes(')+block(iomfb,'struct dcp_display_mode *lookup_mode(')
+    # The catalogue owner check, hotplug queueing, connector EDID helpers and
+    # property bounds the catalogue helpers use, all actual.
+    property_header = base/'dcp-property.h'
+    reasons = re.search(r'^enum dcp_hotplug_reason \{', iomfb, re.M)
+    mode_helpers = (''.join(line+'\n' for line in (property_header.read_text().splitlines() if property_header.exists() else ())
+                            if not line.startswith('#include')).replace('static inline ', 'static inline __attribute__((unused)) ')
+                    + (block(iomfb, reasons.start())+';\n' if reasons else '')
+                    + ''.join(apple_function(root, name) for name in ('dcp_queue_hotplug', 'dcp_modes_for_connector',
+                              'apple_connector_invalidate_edid', 'apple_connector_edid_set_live'))
+                    + mode_helpers)
+    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+block(iomfb,'int dcp_get_modes(')+block(iomfb,re.search(r'^[^\n;]*\blookup_mode\(',iomfb,re.M).start())
     # Drive malformed replacements through the same chunk/end ingress as firmware.
     # The dictionary cache is a boundary substitute and takes ownership of the blob.
     receipt = r'''
@@ -674,7 +715,8 @@ static void reset(void) {
     assert(!raw_allocations);
     d=(struct apple_dcp){.dev=&d,.phy=&transport_edid,.active_typec_route=&con,.typec_cable_connected=true,.typec_generation=7,.fw_compat=2,.width_mm=600,.height_mm=330};
     drm=(struct drm_device){};
-    con=(struct apple_connector){.dcp=&d,.connected=true,.base={.dev=&drm,.registration_state=1}};
+    /* Bound to its pipeline, so its EDID is live (apple_connector_set_pipeline()). */
+    con=(struct apple_connector){.dcp=&d,.connected=true,.edid_live=true,.base={.dev=&drm,.registration_state=1}};
     ep=(struct apple_epic){.dcp=&d,.endpoint=0x2c,.wire_v2=true};
     av_ep=(struct apple_epic){.dcp=&d,.endpoint=0x2a,.wire_v2=true};
     s=(struct apple_epic_service){.ep=&ep,.cookie=&d.dptxport[0],.enabled=true};
@@ -883,6 +925,10 @@ static void failed_replacements(void) {
 '''
     unit=unit.replace('int main(int argc,char **argv) {',failed_receipts+'int main(int argc,char **argv) {')
     unit=unit.replace('    permutations();conflicting_receipts();','    permutations();conflicting_receipts();failed_replacements();')
+    # Catalogue ownership: lookup_mode() copies the matched mode out and only
+    # reports whether one matched; the fixtures only ask whether one did.
+    if re.search(r'^bool lookup_mode\(', iomfb, re.M):
+        unit=re.sub(r'\blookup_mode\((&d,&[\w.\[\]]+)\)', r'lookup_mode(\1,NULL)', unit)
     return {**locals(), "block": block}
 
 def hotplug(root):
@@ -894,7 +940,7 @@ def hotplug(root):
     training = (base / 'dptx-j700-training.h').read_text()
     unit = unit.replace('struct dptx_port { u32 lane_count, link_rate;', '''
 union phy_configure_opts { struct { unsigned lanes,link_rate; bool set_lanes,set_rate,set_voltages; } dp; };
-struct dptx_port { union phy_configure_opts phy_ops; int linkcfg_completion; u32 pending_link_rate;
+struct dptx_port { union phy_configure_opts phy_ops; int linkcfg_completion; u32 pending_link_rate, unit;
 u32 lane_count, link_rate;''')
     unit = unit.replace('int fw_compat,width_mm,height_mm,fixed_connector_type;', 'unsigned dptx_phy; int fw_compat,width_mm,height_mm,fixed_connector_type;')
     real_handlers = r'''
@@ -919,9 +965,13 @@ static int phy_configure(void *phy,union phy_configure_opts *o) {
     if(o->dp.set_rate)hardware_rate=o->dp.link_rate;
     return 0;
 }
-static void dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,unsigned rate) {
-    (void)d;(void)phy;(void)rate;assert(false);
+/* Varargs: the DPTX unit argument came with the T6030 tunnel clocks. */
+static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,...) {
+    (void)d;(void)phy;assert(false);return 0;
 }
+/* The T6030 14.7 backend never matches this H17P display. */
+#define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
+#define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
 '''
     real_handlers += block(training, 'static int dptx_j700_validate_lanes(') + '\n'
     real_handlers += block(dptx, 'static int dptxport_call_set_active_lane_count(') + '\n'
@@ -936,7 +986,7 @@ static void dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,unsigned rate) {
     struct { bool valid,changing; } mode_state;
     struct work_struct external_stop_work,vblank_wq;
     bool external_physically_absent,main_display,typec_crtc_off,external_cable,external_error,external_power_attempted,external_stopped;
-    bool external_hotplug_pending,external_hotplug_connected;
+    bool external_hotplug_pending,external_hotplug_connected,typec_poweron_hpd;
     u64 external_stop_generation,external_rx_generation,external_crtc_generation;
     unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready;''')
     stubs = r'''
@@ -947,6 +997,7 @@ static void complete_all(int *p) { (*p)++; }
 #define dcp_mode_invalidate(s) ((s)->valid=false)
 #define dcp_mode_hotplug(s,c,p) __extension__ ({ (void)(s);if(p)*(p)=(c);1u; })
 static void dcp_handle_hotplug_actions(struct apple_dcp *d,unsigned action) { (void)d;(void)action; }
+static bool dcp_typec_relink(struct apple_dcp *d) { (void)d;return false; }
 '''
     dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     template = (root / 'drivers/gpu/drm/apple/iomfb_template.c').read_text()
@@ -997,6 +1048,8 @@ static void dcp_handle_hotplug_actions(struct apple_dcp *d,unsigned action) { (v
     puts("PASS: actual RX HPD loss immediately denies getter/lookup before deferred work; 24 fresh-proof recovery orders need only one rate/lane callback; bootstrap/power/paused suppression preserved");
 }""".replace('MAIN_PREFIX',n['main_prefix'])
     unit=unit.replace(block(unit,'int main(int argc,char **argv) {'),functions+'\n'+main)
+    if re.search(r'^bool lookup_mode\(', (base / 'iomfb.c').read_text(), re.M):
+        unit=re.sub(r'\blookup_mode\((&d,&[\w.\[\]]+)\)', r'lookup_mode(\1,NULL)', unit)
     return unit
 
 

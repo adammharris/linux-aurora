@@ -11,6 +11,7 @@
 enum brcmf_vndr_cmds {
 	BRCMF_VNDR_CMDS_UNSPEC,
 	BRCMF_VNDR_CMDS_DCMD,
+	/* Last in brcmf_vendor_cmds[]: not registered with awdl=0. */
 	BRCMF_VNDR_CMDS_AWDL,
 	BRCMF_VNDR_CMDS_LAST
 };

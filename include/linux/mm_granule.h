@@ -18,6 +18,17 @@ static inline unsigned int arch_mm_page_shift(const struct mm_struct *mm)
 }
 #endif
 
+/*
+ * Whether this boot may create an mm with a non-native user granule. An
+ * architecture with a boot-time switch fixes it before mm initialisation.
+ */
+#ifndef arch_mm_alt_granule_enabled
+static inline bool arch_mm_alt_granule_enabled(void)
+{
+	return IS_ENABLED(CONFIG_MM_SUBPAGE);
+}
+#endif
+
 static inline unsigned int mm_page_shift(const struct mm_struct *mm)
 {
 	return arch_mm_page_shift(mm);

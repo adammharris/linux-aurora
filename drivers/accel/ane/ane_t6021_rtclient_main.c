@@ -4,51 +4,45 @@
  *
  * One module, two surfaces:
  *   - boot/transport: fenced Linux-context firmware start (fw_start=1
- *     default — the proven add-path config), shared boot/fwload
- *     contract units, then the legacy 13.5 ChMan transport for the
- *     three load-time commands (LOAD_PROGRAM 0x200, CREATE_PROCESS
- *     0x202, PROCEDURE_CALL 0x204) driven through the ioctls in this
- *     file;
+ *     default), shared boot/fwload helpers, then the legacy 13.5 ChMan
+ *     transport for the three load-time commands (LOAD_PROGRAM 0x200,
+ *     CREATE_PROCESS 0x202, PROCEDURE_CALL 0x204) driven through the
+ *     ioctls in this file;
  *   - DRM accel: BO_INIT/BO_FREE plus PROG_LOAD/PROC_CREATE/EXEC per
  *     include/uapi/drm/ane_accel.h (ABI 2). Sections ride BOs the
  *     user supplies; one global mutex serializes every firmware
  *     command; completion = the legacy exchange's reply PLUS the
  *     firmware's finish event on the IO_T2H ring. EXEC also returns the
- *     fw's target-to-host slots (the sequencer's per-step drain).
+ *     fw's target-to-host slots (drained after every exchange).
  *
- * Compiled defaults are the load-run.sh parameter list — a bare
- * `insmod ane_t6021.ko` is the proven add-path configuration on
- * boot 3ab812a3 (fw_load=1 fw_start=1 fw_start_dapf=0 legacy_only=1
- * legacy_query=1 scratch3_ack=1 poll_rx=1 ...) — except hello_wait_ms,
- * 1000 in that list and 0 here (see its definition).
+ * The compiled defaults are the configuration that boots the firmware:
+ * a bare `insmod ane_t6021.ko` runs the whole sequence (fw_load=1
+ * fw_start=1 legacy_only=1 legacy_query=1 scratch3_ack=1 poll_rx=1 ...).
  * Remaining parameters are overridable from sysfs for bisection only.
  *
- * Division of labor (receipts/2026-09-22-t6021-rtkit-port):
- *  - CPU start: kernel-context start is the proven-safe route on this
- *    box — m1n1 RTBuddy path is dormant (W5/W6 MGMT session wall) and
- *    the 13.5 (22G74) selene image brings up the legacy ChMan
- *    transport after DONE without RTKit. Boot is fenced in
- *    ane_t6021_boot.c (entry fold, RVBAR skip-or-fold, scratch,
- *    RUN, poll A/B, publish/wake) and audited in
- *    tools/h14_boot_regression.c.
+ * Division of labor:
+ *  - CPU start: from kernel context — the m1n1 RTBuddy path stays
+ *    dormant (no MGMT session comes up) and the 13.5 (22G74) selene
+ *    image brings up the legacy ChMan transport after DONE without
+ *    RTKit. Boot is fenced in ane_t6021_boot.c (entry fold, RVBAR
+ *    skip-or-fold, scratch, RUN, poll A/B, publish/wake).
  *  - genpd/pmgr: Runtime PM + the DT power-domains binding owns the
  *    raise; probe verifies ACTUAL on ane_cpu (pmgr window) before
  *    the first engine read (G1 gate). The pre-CPU engine table block
- *    is intentionally NOT written (preboot_table_mode = 2 = SKIP, the
- *    2026-09-20-era live-fault discriminator). macOS-form mpm_off is
- *    skipped: with fw_start_mpm_off=0 (the proven config) the
- *    boot-raised ane_sys_mpm stays on; the boot writes do not depend
- *    on it.
+ *    is NOT written by default (preboot_table_mode = 2 = SKIP: the
+ *    block has wedged the machine). The macOS-form mpm_off step is
+ *    skipped: the boot-raised ane_sys_mpm stays on; the boot writes do
+ *    not depend on it.
  *  - mailbox: ane_rtclient_validate_chman sees the 'IPC ' surface the
  *    fw published during boot; the three load-time commands travel
  *    the IO ring (channel 1) over ane_rtclient_legacy_exchange. Each
  *    command advances the cursor on the next 64-byte slot — resending
- *    to slot 0 wedges the ring (sequencer rule).
+ *    to slot 0 wedges the ring.
  *  - non-posted MMIO (DT "nonposted-mmio" -> IORESOURCE_MEM_NONPOSTED)
- *    is mandatory throughout the ANE aperture; posted writel froze the
- *    box.
- *  - Firmware alias: the staged copy (own memory, default) or, with the
- *    lab option fw_alias_reserved=1, the iBoot-reserved SEG0/SEGi phys
+ *    is mandatory throughout the ANE aperture; posted writel hangs the
+ *    machine.
+ *  - Firmware alias: the staged copy (own memory, default) or, with
+ *    fw_alias_reserved=1, the iBoot-reserved SEG0/SEGi phys
  *    is aliased at the latched RVBAR entry; the subsequent kernel writes
  *    into the entry region translate through dart-ane0 instead of
  *    faulting.
@@ -104,7 +98,7 @@
 
 /* Doorbell (IPI) block, engine + 0x1844000: set +0, pending +0x8000,
  * ack +0xc000 (an interrupt is handled by reading +0x184c000 and writing
- * +0x1850000, with no SoC difference, receipts/2026-10-01-t8112-ane).
+ * +0x1850000, with no SoC difference).
  */
 #define ANE_IPI_OFF			0x1844000
 
@@ -112,10 +106,9 @@
 #define ANE_ASC_CPU_STATUS_RUNNING	BIT(0)
 #define ANE_ASC_CPU_STATUS_STOPPED	BIT(1)
 
-/* Boot-time module parameters — defaults are the proven add-path
- * parameter list (boot 3ab812a3 / load-run.sh), except fw_alias_reserved,
- * which defaults to own memory (receipts/2026-10-01-t602x-independent,
- * "Boot B"). fw_load, fw_extra_ram and fw_alias_reserved live in
+/* Boot-time module parameters — defaults are the configuration that
+ * boots the firmware, with fw_alias_reserved defaulting to own memory.
+ * fw_load, fw_extra_ram and fw_alias_reserved live in
  * ane_t6021_fwload.c and boot_prevent_nap in ane_t6021_boot.c (single
  * registration each). Remaining knobs are overridable from sysfs for
  * bisection only.
@@ -123,12 +116,12 @@
 static bool fw_start = true;
 module_param(fw_start, bool, 0444);
 MODULE_PARM_DESC(fw_start,
-		 "Fenced Linux-context firmware start: stage + alias, then the boot sequence; default on (proven add-path config).");
+		 "Fenced Linux-context firmware start: stage + alias, then the boot sequence; default on.");
 
 static int fw_start_table_mode = 2;
 module_param(fw_start_table_mode, int, 0444);
 MODULE_PARM_DESC(fw_start_table_mode,
-		 "Pre-CPU engine table block: 0 abort, 1 write, 2 skip (default, proven config).");
+		 "Pre-CPU engine table block: 0 abort, 1 write, 2 skip (default).");
 
 static bool fw_start_rtb_mode;
 module_param(fw_start_rtb_mode, bool, 0444);
@@ -136,16 +129,16 @@ MODULE_PARM_DESC(fw_start_rtb_mode,
 		 "RTBuddy/RTKit-app-endpoint select; default off (legacy ChMan transport).");
 
 /* Drive RX by apple_rtkit_poll from a workqueue even though a recv
- * IRQ exists (lab poll_rx=1, the proven add-path value: the raw recv
- * line is unproven, so the worker is what services HELLO/EPMAP).
+ * IRQ exists (default on: the raw recv line is not relied on, so the
+ * worker is what services HELLO/EPMAP).
  */
 static bool poll_rx = true;
 module_param(poll_rx, bool, 0444);
 MODULE_PARM_DESC(poll_rx,
-		 "Drive RX by apple_rtkit_poll from a workqueue (default on, proven config).");
+		 "Drive RX by apple_rtkit_poll from a workqueue (default on).");
 
 /* STARTEP every fw-announced app endpoint (>= 0x20) after a successful
- * RTKit handshake (lab start_app_eps=1 default).
+ * RTKit handshake (default on).
  */
 static bool start_app_eps = true;
 module_param(start_app_eps, bool, 0444);
@@ -160,18 +153,17 @@ MODULE_PARM_DESC(scratch3_ack,
 static bool legacy_only = true;
 module_param(legacy_only, bool, 0444);
 MODULE_PARM_DESC(legacy_only,
-		 "Use the pinned 13.5 legacy ChMan transport (default on, proven add-path config).");
+		 "Use the pinned 13.5 legacy ChMan transport (default on).");
 
 static bool legacy_query = true;
 module_param(legacy_query, bool, 0444);
 MODULE_PARM_DESC(legacy_query,
-		 "Service bounded startup allocations and CONFIG_GET; default on (proven config).");
+		 "Service bounded startup allocations and CONFIG_GET; default on.");
 
 /* 0 (default) skips RTKit in legacy mode, so the ANE mailbox never
- * starts. Measured 2026-09-30 (receipts/2026-09-30-t6021-stock-mailbox):
- * the 13.5 firmware sent no HELLO on any recorded boot (-ETIME after
+ * starts: the 13.5 firmware sends no HELLO (-ETIME after
  * 1000 ms), and starting the mailbox enables AIC2 884, a level line
- * that then fired ~700,000 times/s (one CPU of hardirq time). A
+ * that then fires ~700,000 times/s (one CPU of hardirq time). A
  * firmware that speaks RTKit needs hello_wait_ms=1000.
  */
 static unsigned int hello_wait_ms;
@@ -208,7 +200,7 @@ struct ane_rtclient {
 	struct reset_control *cpu_rst;
 	struct delayed_work poll_work;
 
-	/* fw_start=1 view over the shared boot/fwload contract units. */
+	/* fw_start=1 view over the shared boot/fwload helpers. */
 	struct ane_t6021 *fw;
 
 	/* A CPU we released is (or may be) running: state HELD — surfaces,
@@ -229,7 +221,7 @@ struct ane_rtclient {
 	/* One reusable 16 KiB command buffer for every host command
 	 * (CONFIG_GET + the three ioctls). Protocol-legal to reuse: an
 	 * exchange returns 0 only after the IO slot flipped back to
-	 * host-owned with a zero status (the lab's own completion
+	 * host-owned with a zero status (the completion
 	 * predicate), so the firmware has fully consumed the previous
 	 * command. The legacy_buffers table stays for fw MALLOC replies,
 	 * which the firmware may reference forever (held until reboot).
@@ -261,14 +253,14 @@ struct ane_t6021_fd {
  * for reuse (see ane_t6021_bo_release). Every other BO frees at its last
  * reference.
  *
- * Per-BO cap raised 2026-09-30: the 256 KiB Qwen-class matvec weights seen
- * by the H14 compiler are bounded by `reduction * columns * 2`, which
- * reaches 20 MiB at (K,N)=(2048,5120). The same cap serves the
- * Qwen4-attention (K,N)=(4096,4096) constant at 32 MiB and any H14
- * softmax/reduction with an 8 MiB table. Total BO bytes across all fds are
- * capped separately (bo_total_max_mb) by an atomic counter, enforced at
- * alloc and released when the memory is really freed. Program sections stay
- * held until reboot, and the 38 Qwen programs alone hold about 2.6 GiB.
+ * Per-BO cap: matvec weights emitted by the H14 compiler are bounded by
+ * `reduction * columns * 2`, which reaches 20 MiB at (K,N)=(2048,5120).
+ * The same cap serves an attention constant at (K,N)=(4096,4096), 32 MiB,
+ * and any H14 softmax/reduction with an 8 MiB table. Total BO bytes
+ * across all fds are capped separately (bo_total_max_mb) by an atomic
+ * counter, enforced at alloc and released when the memory is really
+ * freed. Program sections stay held until reboot, and one large model's
+ * programs alone can hold gigabytes.
  * A cap of 0 refuses every BO_INIT with -ENOSPC; there is no unlimited
  * value. Every BO also needs IOVA below 4 GiB (32-bit DMA mask), so
  * allocations fail with -ENOMEM near that bound whatever the cap.
@@ -333,8 +325,8 @@ static atomic_t ane_t6021_quarantined = ATOMIC_INIT(0);
 static LIST_HEAD(ane_t6021_bo_pool);
 static DEFINE_SPINLOCK(ane_t6021_bo_pool_lock);
 
-/* Final put: the last handle or mapping is gone. The firmware never sees
- * a freed IOVA (lab rule), so a fw_ref BO is never freed: a program
+/* Final put: the last handle or mapping is gone. The firmware must never
+ * see a freed IOVA, so a fw_ref BO is never freed: a program
  * section stays held, because a cached firmware program keeps reading
  * it; an io BO goes to the pool, unless a quarantined firmware may still
  * write it. Every other BO frees here, so the BO cap bounds only the
@@ -410,7 +402,7 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 				       unsigned int channel,
 				       unsigned int timeout_ms);
 
-/* ---- boot-contract helpers (shared with boot.c / fwload.c) ---- */
+/* ---- boot helpers (shared with boot.c / fwload.c) ---- */
 
 static int ane_rtclient_legacy_alloc(struct ane_rtclient *ane, u64 size)
 {
@@ -549,7 +541,7 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 				dma_rmb();
 				size = READ_ONCE(slot[1]);
 				tag = READ_ONCE(slot[2]);
-				/* Lab rule: a valid MALLOC slot carries
+				/* A valid MALLOC slot carries
 				 * header 0 and a u32 tag; anything else
 				 * is a malformed ring and we stop.
 				 */
@@ -585,8 +577,8 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 				ane_t6021_chman_layout[channel].size;
 			goto out;
 		}
-		/* legacy_fast_poll=1 (the proven add-path cadence): poll
-		 * the rings every 50 us instead of sleeping 1-2 ms.
+		/* Fast poll: check the rings every 50 us instead of
+		 * sleeping 1-2 ms.
 		 */
 		udelay(50);
 	}
@@ -597,17 +589,32 @@ out:
 	return result;
 }
 
-/* Time to let the output writes land after the completion signal.
- * Measured 2026-09-29 on some boots: the fw ack, the TD counter and the
- * TQ words all report done ~0.13 ms before the output reaches DRAM (the
- * output read as zeros in about 1 of 5 calls). The finish event arrives
- * at the same time for short programs. No signal for "output landed" is
- * known, so the wait is a fixed margin of about 8x the lag.
+/*
+ * Extra sleep after a CALL's finish event. 0 by default: the finish event
+ * already marks the output in DRAM (ane_rtclient_call_wait). The 1 ms
+ * default it replaces dated from a wait on dispatch signals; set it only
+ * to test a suspected late output write.
  */
-static unsigned int call_settle_us = 1000;
+static unsigned int call_settle_us;
 module_param(call_settle_us, uint, 0644);
 MODULE_PARM_DESC(call_settle_us,
-		 "Microseconds to wait after a CALL completes so its output lands (default 1000, 0 = none)");
+		 "Microseconds to sleep after a CALL's finish event (default 0: the event marks the output in DRAM)");
+
+/*
+ * The finish-event wait polls the coherent IO_T2H ring, so the poll cadence is
+ * the whole detection lag: a uniform 50..100 us sleep adds 0..100 us of pure
+ * wait to every CALL. call_poll_us is how long the head of the wait sleeps
+ * only 1..2 us between looks (the real period is the hrtimer wake latency)
+ * before it falls back to the 50..100 us sleep, which keeps long programs (the
+ * Parakeet encoder, about 254 ms) from spending the wait on hrtimer wakeups.
+ * 0 restores the uniform 50..100 us cadence. A very large value makes the
+ * whole wait 1..2 us sleeps. Writable at run time (0644), so both cadences can
+ * be compared in one boot.
+ */
+static unsigned int call_poll_us = 1000;
+module_param(call_poll_us, uint, 0644);
+MODULE_PARM_DESC(call_poll_us,
+		 "Microseconds at the head of the CALL finish-event wait that sleep only 1..2 us between looks, then 50..100 us (default 1000; 0 = uniform 50..100 us; a very large value makes the whole wait 1..2 us sleeps)");
 
 /* trace_td: a read-only timeline of each CALL for performance work. Off
  * by default; switch it at runtime with
@@ -616,20 +623,15 @@ MODULE_PARM_DESC(call_settle_us,
  * and also reads the last-committed-TD word. It reads that word only
  * while the seven ANE pmgr PS words read 0x3ff. No register is written.
  *
- * Provenance (omarchy-ane commits):
  * - The TD word: engine + ane_t602x_soc.trace_td_off; on T602x TM
- *   0x285c00000 + TD window 0x20400 + 0x58, the word the CALL wait polled
- *   from be2cf130d761ed675ad86f12b21ac1d53d906e1d until
- *   3a942d6cf6278526fbc02bf0c4743c5c1b276cdb. 3a942d6 measured its
- *   layout: the call's nid in bits 23:16 (+1 per call), the index of the
- *   last task taken in bits 15:0 (receipts/2026-09-30-t6021-call-wait).
- *   Not known on T8112, so trace_td records nothing there.
+ *   0x285c00000 + TD window 0x20400 + 0x58. Its layout: the call's nid
+ *   in bits 23:16 (+1 per call), the index of the last task taken in
+ *   bits 15:0. Not known on T8112, so trace_td records nothing there.
  * - The seven ANE power-state words at ane_t602x_soc.pmu_pa + ps_off
  *   (T602x: DT power-domains ane_sys_mpm 0x4000 .. ane_set4 0x4030 of
- *   the pmgr at 0x28e080000). The guard "PS words 0x3ff before any TM
- *   read; a TM read while the compute domains are off hangs the SoC" is
- *   ane_rtclient_pm_pwrstate_ok in 27e996a6de544a803a71d7a5c4ed11d828d4d049,
- *   and the CALL wait applied it until 3a942d6.
+ *   the pmgr at 0x28e080000). The guard: PS words 0x3ff before any TM
+ *   read, since a TM read while the compute domains are off hangs the
+ *   SoC.
  *
  * Each record has a ktime_get_ns() stamp: CALL before the exchange, ACK
  * when the firmware acked it, TD for each new TD word value (word = the
@@ -747,13 +749,11 @@ static void ane_t6021_trace_free(void)
  */
 #define ANE_CALL_COOKIE		0xADD0
 
-/* IO_T2H event of a PROCEDURE_CALL, 0x28 bytes (measured 2026-09-30,
- * receipts/2026-09-30-t6021-call-wait): u32 sequence, u32 0x300, u64
- * cookie, u32 program id, u32 process id, u32 0, u32 state. The firmware
- * posts two per call: state 0 about 0.2-0.5 ms after the ack whatever the
- * program length (a 3,597-task program takes its last task 252 ms later;
- * receipts/2026-10-01-t6021-trace-td), and state 1 when the procedure has
- * finished.
+/* IO_T2H event of a PROCEDURE_CALL, 0x28 bytes: u32 sequence, u32 0x300,
+ * u64 cookie, u32 program id, u32 process id, u32 0, u32 state. The
+ * firmware posts two per call: state 0 about 0.2-0.5 ms after the ack
+ * whatever the program length (a long program can take its last task
+ * hundreds of ms later), and state 1 when the procedure has finished.
  */
 #define ANE_T2H_CALL_COOKIE_OFF		0x08
 #define ANE_T2H_CALL_STATE_OFF		0x1c
@@ -780,12 +780,11 @@ static const void *ane_rtclient_fw_cpu(struct ane_rtclient *ane, u64 iova,
 	return NULL;
 }
 
-/* Return every firmware-owned slot on a target-to-host ring to the fw
- * (legacy_t2h_ack=1, the lab default): the fw publishes by writing the
- * DMA address with bit0 clear; the host returns the slot by setting
- * bit0 and ringing the channel's doorbell bit, as the allocation ring
- * does. The sequencer drained channels 4/6 after every step; the
- * ioctls drain them after every completed exchange. Returns true when
+/* Return every firmware-owned slot on a target-to-host ring to the fw:
+ * the fw publishes by writing the DMA address with bit0 clear; the host
+ * returns the slot by setting bit0 and ringing the channel's doorbell
+ * bit, as the allocation ring does. The ioctls drain channels 4/6 after
+ * every completed exchange. Returns true when
  * an IO_T2H slot held the finish event of a CALL.
  */
 static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
@@ -878,20 +877,20 @@ static int ane_rtclient_call_wait_traced(struct ane_rtclient *ane,
 	return ret;
 }
 
-/* Completion wait for one PROCEDURE_CALL: the finish event on IO_T2H
- * (channel 6). The ack, the eight TQ status words and the last-committed
- * TD word (TM +0x20458: the call's nid in bits 23:16 and the index of the
- * last task taken in bits 15:0) all report done once the last task has
- * been dispatched, not when it has run: measured 2026-09-30, Qwen program
- * 20 (20 tasks) showed its last task index 0.22 ms after the ack, posted
- * its finish event 3.5 ms after the ack, and a caller that returned at
- * the first signal read an all-zero output. Returns 0 when the event
- * arrived, -ETIMEDOUT else.
+/*
+ * Wait for the PROCEDURE_CALL finish event on IO_T2H channel 6.
+ * Acknowledgment, TQ status and the last-committed TD word indicate
+ * dispatch rather than execution completion. The finish event marks
+ * completion and output visibility, so no extra settle delay is needed.
+ * Return zero on the event, or -ETIMEDOUT.
  */
 static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 				  unsigned int timeout_ms)
 {
 	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	unsigned int poll_us = READ_ONCE(call_poll_us);
+	ktime_t tight_end = ktime_add_ns(ktime_get(),
+					 (u64)poll_us * NSEC_PER_USEC);
 
 	if (ane_t6021_tracing)
 		return ane_rtclient_call_wait_traced(ane, deadline);
@@ -899,7 +898,10 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 	do {
 		if (ane_rtclient_drain_t2h(ane, 6))
 			return 0;
-		usleep_range(50, 100);
+		if (poll_us && ktime_before(ktime_get(), tight_end))
+			usleep_range(1, 2);
+		else
+			usleep_range(50, 100);
 	} while (time_before(jiffies, deadline));
 	return ane_rtclient_drain_t2h(ane, 6) ? 0 : -ETIMEDOUT;
 }
@@ -920,7 +922,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		ane_t6021_trace->calls++;
 		ane_t6021_trace_add(ANE_TR_CALL, 0);
 	}
-	/* Producer contract hot path (ane_stats.h): record submit at
+	/* Producer-side stats hot path (ane_stats.h): record submit at
 	 * command enqueue, completion after the call returns, one
 	 * begin/complete pair per engine submission. Only
 	 * CSNE_CMD_PROCEDURE_CALL is engine work; the control-plane
@@ -971,8 +973,9 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						   stats_ticket,
 						   ktime_get_ns(),
 						   (u32)ret, 0);
-			dev_info(ane->dev, "call completion wait failed %d\n",
-				 ret);
+			dev_err(ane->dev,
+				"call completion wait failed %d: no finish event in %u ms\n",
+				ret, timeout_ms);
 			atomic_set(&ane_t6021_quarantined, 1);
 			return ret;
 		}
@@ -981,8 +984,8 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		ane_stats_complete(&ane->stats_ctrs, &ane->stats_ring,
 				   stats_ticket, ktime_get_ns(), 0, 0);
 	/* The fw talks back on the target-to-host rings (fwlog, perf);
-	 * hand those slots back so the rings never fill (the sequencer
-	 * did this per step; same ack, channels 4 and 6).
+	 * hand those slots back so the rings never fill (channels 4
+	 * and 6).
 	 */
 	ane_rtclient_drain_t2h(ane, 4);
 	ane_rtclient_drain_t2h(ane, 6);
@@ -995,8 +998,8 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 /* ---- LOAD / CREATE / CALL wrappers ---- */
 
 /* The firmware never frees a program or a process, and its program table
- * holds 256 entries: measured 2026-09-29, the 257th LOAD_PROGRAM on one
- * boot answered with a protocol error and quarantined the device. Two
+ * holds 256 entries: the 257th LOAD_PROGRAM after a boot is answered
+ * with a protocol error, which quarantines the device. Two
  * loads of byte-identical sections therefore share one firmware program
  * and one process. The key is SHA-256 over every section's id, size and
  * bytes, so a client can only reach a program whose bytes it also
@@ -1088,9 +1091,9 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 		}
 	}
 
-	/* Lab contract: the record slot IS the section identity (slot =
-	 * id - 1; tdprop id 7 lands at slot 6 and slot 5 stays empty,
-	 * exactly the proven add-path image). Reject out-of-range and
+	/* The record slot IS the section identity (slot =
+	 * id - 1; tdprop id 7 lands at slot 6 and slot 5 stays empty
+	 * when id 6 is not supplied). Reject out-of-range and
 	 * duplicate ids before building the wire image.
 	 */
 	for (i = 0; i < user->section_count; i++) {
@@ -1179,7 +1182,7 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	memset(command->cpu, 0, SZ_16K);
 	/* One 0x30-byte section record per supplied section, placed at
 	 * its IDENTITY slot: slot = id - 1 (tdprop id 7 lands at slot
-	 * 6, slot 5 stays empty — exactly the proven add-path image:
+	 * 6, slot 5 stays empty — e.g. an image with
 	 * six populated records, ids 1,2,3,4,5 then 7). Unsupplied
 	 * slots stay zero-filled (flags = 0). flags bit0 = 1, id at
 	 * +0x04, iova at +0x18, size at +0x20.
@@ -1226,8 +1229,8 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	}
 	/* Generic binds are accepted for ABI compatibility and unused:
 	 * the LOAD record already carries iova + size, and the generic
-	 * section image is prepared by userspace (the proven add path
-	 * ships it inside the section bytes, generic.bin).
+	 * section image is prepared by userspace (it ships inside the
+	 * section bytes, generic.bin).
 	 */
 
 	/* ProgramId placeholder; the firmware writes the assigned id
@@ -1239,11 +1242,10 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 		*(u32 *)(cmd + 0x1b8) = cpu_to_le32(U32_MAX);
 	}
 
-	/* The proven add-path LOAD command is 0x1C0 bytes: the nine
+	/* The LOAD command is 0x1C0 bytes: the nine
 	 * 0x30 records end at 0x1b8, ProgramId at +0x1b8, 8 bytes of
 	 * zero tail. sizeof(struct ane_csne_cmd_load_program) is only
-	 * 0x1b8, so the length is pinned here (h14_seq_first_add.py
-	 * load_step).
+	 * 0x1b8, so the length is pinned here.
 	 */
 	BUILD_BUG_ON(sizeof(struct ane_csne_cmd_load_program) != 0x1b8);
 	ret = ane_rtclient_command(ane, command,
@@ -1484,8 +1486,8 @@ static int ane_t6021_bo_init_ioctl(struct drm_device *drm, void *data,
 		return -ENOMEM;
 	}
 	/* Every fw-visible DMA surface must be 16 KiB aligned and clear
-	 * of the firmware entry alias (receipt 2026-09-20-t6021-entry-alias:
-	 * the same invariant ane_rtclient_legacy_alloc enforces).
+	 * of the firmware entry alias (the same invariant
+	 * ane_rtclient_legacy_alloc enforces).
 	 */
 	if (!IS_ALIGNED(bo->dma, SZ_16K) ||
 	    (ane->fw && !ane_t6021_fw_alias_iova_ok(ane->fw, bo->dma,
@@ -1672,9 +1674,8 @@ static int ane_t6021_prog_load_ioctl(struct drm_device *drm, void *data,
 }
 
 /* Firmware perf mode: CSNE_CMD_CH_PROPERTY_WRITE (0x1f), channel 0,
- * property 0x10aa, value 1. macOS sends it once during power-on (see
- * the omarchy-ane perf-mode receipt); the 13.5 firmware treats it as
- * its engine perf-mode switch. It is a runtime
+ * property 0x10aa, value 1. macOS sends it once during power-on; the
+ * 13.5 firmware treats it as its engine perf-mode switch. It is a runtime
  * switch (write 1 to /sys/module/ane_t6021/parameters/fw_perf_mode) so
  * its effect on call time can be measured on one boot. Only 1 is
  * accepted: no other value is known to be safe.
@@ -1872,8 +1873,8 @@ static const struct apple_rtkit_ops ane_rtclient_rtkit_ops = {
 	.shmem_destroy = ane_rtclient_shmem_destroy,
 };
 
-/* ---- poll worker: RX fallback while the recv line is unproven ----
- * (lab poll_rx=1). Runs every 10 ms until the handshake completes,
+/* ---- poll worker: RX fallback, the recv line is not relied on ----
+ * Runs every 10 ms until the handshake completes,
  * then every second while poll_rx stays on. Armed BEFORE the host ack
  * so the fw's HELLO is never missed.
  */
@@ -1896,7 +1897,7 @@ static void ane_rtclient_post_boot(struct work_struct *w)
 
 /* STARTEP every fw-announced app endpoint (>= 0x20; the fw mgmt
  * dispatcher starts an endpoint on flag bit 1). Same call every Asahi
- * RTKit client makes; the lab ran it with start_app_eps=1.
+ * RTKit client makes.
  */
 static void ane_rtclient_start_app_eps(struct ane_rtclient *ane)
 {
@@ -1925,6 +1926,8 @@ struct ane_rtclient_pd {
 static LIST_HEAD(ane_rtclient_pd_list);
 static DEFINE_MUTEX(ane_rtclient_pd_lock);
 static bool ane_rtclient_pinned;
+static bool ane_rtclient_probe_failed_dirty;
+static DEFINE_MUTEX(ane_rtclient_probe_guard_lock);
 
 static void ane_rtclient_pd_free(struct ane_rtclient_pd *pd)
 {
@@ -2009,7 +2012,38 @@ out:
 	return err;
 }
 
-static int ane_rtclient_probe(struct platform_device *pdev)
+static void ane_rtclient_detach_genpd(struct device *dev)
+{
+	struct ane_rtclient_pd *pd, *tmp;
+	int count, i;
+
+	count = of_count_phandle_with_args(dev->of_node, "power-domains",
+					   "#power-domain-cells");
+	if (count <= 1)
+		return;
+
+	mutex_lock(&ane_rtclient_pd_lock);
+	list_for_each_entry_safe(pd, tmp, &ane_rtclient_pd_list, list) {
+		if (pd->dev != dev)
+			continue;
+		for (i = count - 1; i >= 0; i--) {
+			if (pd->pd_link[i])
+				device_link_del(pd->pd_link[i]);
+			if (pd->pd_dev[i])
+				dev_pm_domain_detach(pd->pd_dev[i], true);
+		}
+		ane_rtclient_pd_free(pd);
+		if (list_empty(&ane_rtclient_pd_list) && ane_rtclient_pinned) {
+			module_put(THIS_MODULE);
+			ane_rtclient_pinned = false;
+		}
+		break;
+	}
+	mutex_unlock(&ane_rtclient_pd_lock);
+}
+
+static int ane_rtclient_probe_inner(struct platform_device *pdev,
+				    bool *hardware_touched)
 {
 	struct device *dev = &pdev->dev;
 	struct resource *res;
@@ -2033,7 +2067,7 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 
 	/* Early, BEFORE any allocation/power: legacy_only must never be
 	 * rejected after the CPU release, where an unwind could drop
-	 * domains under a running ASC (lab probe order).
+	 * domains under a running ASC.
 	 */
 	if (legacy_only && (!fw_start || fw_start_rtb_mode)) {
 		dev_err(dev,
@@ -2043,6 +2077,11 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 	if (legacy_query && !legacy_only) {
 		dev_err(dev, "legacy_query requires legacy_only=1\n");
 		return -EINVAL;
+	}
+	if (fw_start && ane_t6021_fwload_requested()) {
+		ret = ane_t6021_fwload_check(dev);
+		if (ret)
+			return dev_err_probe(dev, ret, "firmware preflight failed\n");
 	}
 
 	ane = devm_kzalloc(dev, sizeof(*ane), GFP_KERNEL);
@@ -2075,13 +2114,16 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	*hardware_touched = true;
 	ret = ane_rtclient_attach_genpd(ane);
 	if (ret)
 		return dev_err_probe(dev, ret, "extra genpd attach\n");
 	pm_runtime_enable(dev);
 	ret = pm_runtime_resume_and_get(dev);
-	if (ret)
+	if (ret) {
+		pm_runtime_disable(dev);
 		return dev_err_probe(dev, ret, "genpd raise failed\n");
+	}
 
 	ane->pmgr = devm_of_iomap(dev, dev->of_node, 1, NULL);
 	if (IS_ERR(ane->pmgr)) {
@@ -2132,7 +2174,7 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 			return -EPROBE_DEFER;
 		}
 
-		/* Lab fw_start order: staging requires fw_load and an
+		/* fw_start order: staging requires fw_load and an
 		 * IOMMU-mapped device BEFORE any allocation/staging.
 		 */
 		if (!ane_t6021_fwload_requested()) {
@@ -2225,8 +2267,7 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 				ANE_T6021_BOOT_ACK);
 			/* hello_wait_ms > 0 only: init rtkit and arm the RX
 			 * poll worker BEFORE writing the ack, so a HELLO
-			 * after the ack is not missed. The 13.5 fw sent none
-			 * on any recorded boot.
+			 * after the ack is not missed. The 13.5 fw sends none.
 			 */
 			if (hello_wait_ms && !ane->rtk) {
 				ane->rtk = devm_apple_rtkit_init(dev, ane,
@@ -2289,7 +2330,7 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		if (!cfg_err && legacy_query && ane->chman_ok) {
 			/* CONFIG_GET (opcode 0x03) keeps the legacy ChMan
 			 * transport armed for the ioctls; the reply's
-			 * word +0x08 must be nonzero (lab rule). The
+			 * word +0x08 must be nonzero. The
 			 * boot heap + 'IPC ' allocations stay HELD until
 			 * reboot.
 			 */
@@ -2342,7 +2383,7 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 			goto err_pm_or_hold;
 		}
 		/* RX fallback worker first: the fw's HELLO must not be
-		 * missed while the recv line is unproven.
+		 * missed, and the recv line is not relied on.
 		 */
 		schedule_delayed_work(&ane->poll_work, msecs_to_jiffies(10));
 		deadline = jiffies + msecs_to_jiffies(hello_wait_ms);
@@ -2411,13 +2452,13 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 			drm_debugfs_add_file(&adrm->drm, "ane_timeline",
 					     ane_timeline_show,
 					     &ane->stats_ring);
-		WRITE_ONCE(ane_t6021_perf_ane, ane);
 		drmret = drm_dev_register(&adrm->drm, 0);
 		if (drmret) {
 			dev_err_probe(dev, drmret, "drm_dev_register\n");
 			ret = drmret;
 			goto err_pm_or_hold;
 		}
+		WRITE_ONCE(ane_t6021_perf_ane, ane);
 		dev_info(dev,
 			 "loaded ane_t6021 (DRM major %d minor %d; ABI 2; legacy_only=%u chman_ok=%u booted=%u; state %s; BO cap %u MiB)\n",
 			 DRM_ANE_ABI_V2, 0,
@@ -2437,6 +2478,37 @@ err_pm_or_hold:
 		pm_runtime_put_sync_suspend(dev);
 		pm_runtime_disable(dev);
 	}
+	return ret;
+}
+
+static int ane_rtclient_probe(struct platform_device *pdev)
+{
+	bool hardware_touched = false;
+	int ret;
+
+	mutex_lock(&ane_rtclient_probe_guard_lock);
+	if (ane_rtclient_probe_failed_dirty) {
+		mutex_unlock(&ane_rtclient_probe_guard_lock);
+		dev_err(&pdev->dev,
+			"previous probe failed after touching the hardware: reboot required\n");
+		return -EBUSY;
+	}
+
+	ret = ane_rtclient_probe_inner(pdev, &hardware_touched);
+	if (ret) {
+		struct ane_rtclient *ane = platform_get_drvdata(pdev);
+
+		if (ane)
+			cancel_delayed_work_sync(&ane->poll_work);
+		if (hardware_touched) {
+			ane_rtclient_probe_failed_dirty = true;
+			dev_err(&pdev->dev,
+				"probe failed after hardware access; reboot required before retry\n");
+		}
+		if (!ane || !ane->held)
+			ane_rtclient_detach_genpd(&pdev->dev);
+	}
+	mutex_unlock(&ane_rtclient_probe_guard_lock);
 	return ret;
 }
 
@@ -2516,7 +2588,10 @@ static struct platform_driver ane_rtclient_driver = {
 
 static int __init ane_rtclient_init(void)
 {
-	int ret = platform_driver_register(&ane_rtclient_driver);
+	int ret;
+
+	WRITE_ONCE(ane_rtclient_probe_failed_dirty, false);
+	ret = platform_driver_register(&ane_rtclient_driver);
 
 	if (ret)
 		ane_t6021_trace_free();

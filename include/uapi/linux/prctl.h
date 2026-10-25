@@ -430,7 +430,10 @@ struct prctl_mm_map {
  * SET_DEFAULT selects the fallback for subsequent execs; zero restores native.
  * GET_DEFAULT returns the alternative size in bytes, or zero for native.
  * Fork inherits both policies; exec preserves DEFAULT. Failed exec preserves
- * both. Neither setter changes the live address space or other threads.
+ * both. An exec that gains privilege (set-user-ID, set-group-ID, file
+ * capabilities or a secure-exec transition) ignores both, runs the image at
+ * its default granule and clears both for the new image.
+ * Neither setter changes the live address space or other threads.
  * AArch32 always selects 4K when supported, otherwise the native granule,
  * independently of these preferences. Sizes are capability-checked.
  */

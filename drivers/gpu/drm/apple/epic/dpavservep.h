@@ -22,6 +22,8 @@ struct dcpavserv {
 	struct completion enable_completion;
 	u32 unit;
 	struct apple_epic_service *service;
+	/* The service instance last opened; compared only, never used. */
+	struct apple_epic_service *opened;
 };
 
 bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation);

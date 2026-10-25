@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/dts-v1/;
+
+/* Reference placeholders are replaced with the live provider phandles. */
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	pmp: pmp { phandle = <1>; };
+	soc: soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		pmgr: power-management@380700000 {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x80700000 0 0x14000>;
+		};
+
+		pmgr_mini: power-management@388280000 {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x88280000 0 0x4000>;
+		};
+	};
+};
+
+#include "../../../arch/arm64/boot/dts/apple/t8132-pmgr.dtsi"
+#include "../../../arch/arm64/boot/dts/apple/t8132-j713-pmgr.dtsi"
+#include "../../../arch/arm64/boot/dts/apple/t8132-memory.dtsi"
+
+&mcc {
+	apple,boot-dma-devices = <&pmp>;
+};
+
+&pmc {
+	apple,static-voters = <3>;
+};
+
+&ps_gfx {
+	status = "okay";
+};

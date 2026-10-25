@@ -26,6 +26,7 @@
 
 #include "cd321x-dp.h"
 #include "tps6598x.h"
+#include "cd321x-setup.h"
 #include "trace.h"
 
 /* Register offsets */
@@ -102,6 +103,7 @@ enum {
 	TPS_MODE_BIST,
 	TPS_MODE_DISC,
 	TPS_MODE_PTCH,
+	TPS_MODE_APP1,
 	TPS_MODE_DBMA,
 };
 
@@ -111,6 +113,7 @@ static const char *const modes[] = {
 	[TPS_MODE_BIST]	= "BIST",
 	[TPS_MODE_DISC]	= "DISC",
 	[TPS_MODE_PTCH] = "PTCH",
+	[TPS_MODE_APP1]	= "APP1",
 	[TPS_MODE_DBMA] = "DBMa",
 };
 
@@ -239,7 +242,7 @@ static int tps6598x_set_data_role(struct tps6598x *tps,
 
 static int tps6598x_connect(struct tps6598x *tps, u32 status)
 {
-	struct typec_partner_desc desc;
+	struct typec_partner_desc desc = { };
 	enum typec_pwr_opmode mode;
 	int ret;
 
@@ -250,7 +253,6 @@ static int tps6598x_connect(struct tps6598x *tps, u32 status)
 
 	desc.usb_pd = mode == TYPEC_PWR_MODE_PD;
 	desc.accessory = TYPEC_ACCESSORY_NONE; /* XXX: handle accessories */
-	desc.identity = NULL;
 
 	if (desc.usb_pd) {
 		ret = tps6598x_read_partner_identity(tps);
@@ -272,8 +274,11 @@ static int tps6598x_connect(struct tps6598x *tps, u32 status)
 		return ret;
 
 	tps->partner = typec_register_partner(tps->port, &desc);
-	if (IS_ERR(tps->partner))
-		return PTR_ERR(tps->partner);
+	if (IS_ERR(tps->partner)) {
+		ret = PTR_ERR(tps->partner);
+		tps->partner = NULL;
+		return ret;
+	}
 
 	if (desc.identity)
 		typec_partner_set_identity(tps->partner);
@@ -414,6 +419,14 @@ static int tps6598x_dr_set(struct typec_port *port, enum typec_data_role role)
 	u32 status;
 	int ret;
 
+	/*
+	 * On the J613 SN201202x, SWDF/SWUF can stay busy forever. Keep the
+	 * negotiated data role rather than wedge the command mailbox.
+	 */
+	if (of_machine_is_compatible("apple,j613") &&
+	    device_is_compatible(tps->dev, "apple,sn201202x"))
+		return -EOPNOTSUPP;
+
 	mutex_lock(&tps->lock);
 
 	ret = tps6598x_exec_cmd(tps, cmd, 0, NULL, 0, NULL);
@@ -429,7 +442,7 @@ static int tps6598x_dr_set(struct typec_port *port, enum typec_data_role role)
 		goto out_unlock;
 	}
 
-	tps6598x_set_data_role(tps, role, true);
+	ret = tps6598x_set_data_role(tps, role, true);
 
 out_unlock:
 	mutex_unlock(&tps->lock);
@@ -565,6 +578,34 @@ static bool tps6598x_read_power_status(struct tps6598x *tps)
 	return true;
 }
 
+/*
+ * TPS66993 deprecated Power_Status register (0x3F). BC1.2 is not supported
+ * and the remaining bits are redundant with STATUS register (0x1A).
+ * Synthesize pwr_status from the already-read STATUS register.
+ */
+static bool tps66993_read_power_status(struct tps6598x *tps)
+{
+	u16 pwr_status = 0;
+
+	/* Same masks as TPS_POWER_STATUS_CONNECTION() / SOURCESINK() / PWROPMODE() in tps6598x.h */
+	if (tps->status & TPS_STATUS_PLUG_PRESENT)
+		pwr_status |= FIELD_PREP(TPS_POWER_STATUS_CONNECTION_MASK, 1);
+
+	/* SOURCESINK: 1=sink; STATUS.PortRole 1=source, opposite convention */
+	if (!TPS_STATUS_TO_TYPEC_PORTROLE(tps->status))
+		pwr_status |= FIELD_PREP(TPS_POWER_STATUS_SOURCESINK_MASK, 1);
+
+	if (TPS_STATUS_VBUS_STATUS(tps->status) == TPS_STATUS_VBUS_STATUS_PD)
+		pwr_status |= FIELD_PREP(TPS_POWER_STATUS_TYPEC_CURRENT_MASK,
+					 TPS_POWER_STATUS_TYPEC_CURRENT_PD);
+
+	tps->pwr_status = pwr_status;
+
+	tps->data->trace_power_status(pwr_status);
+
+	return true;
+}
+
 static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 {
 	int ret;
@@ -599,6 +640,59 @@ static int cd321x_mux_set(struct cd321x *cd321x, bool *held)
 static bool cd321x_mux_still_held(struct cd321x *cd321x, bool held)
 {
 	return held && cd321x->pm.mux_retry_ms;
+}
+
+/*
+ * The HPD level of a DisplayPort partner. DATA_STATUS reports it. An
+ * SN201202x also signals every new DP status of the partner, and a DP-to-HDMI
+ * converter can keep DATA_STATUS at HPD high while the display behind it is
+ * unplugged, and report that only in its DP status. Once the controller has
+ * signalled a DP status for this connection, that status must show HPD too.
+ */
+static bool cd321x_uses_dp_sid(const struct tps6598x *tps)
+{
+	return device_is_compatible(tps->dev, "apple,sn201202x") &&
+	       !of_machine_is_compatible("apple,t8140") &&
+	       !of_machine_is_compatible("apple,t8142");
+}
+
+static u64 cd321x_irq_mask(const struct tps6598x *tps)
+{
+	u64 mask = tps->data->irq_mask1;
+
+	if (device_is_compatible(tps->dev, "apple,sn201202x") &&
+	    !cd321x_uses_dp_sid(tps))
+		mask &= ~SN201202X_INT_DP_SID_UPDATE;
+	return mask;
+}
+
+static bool cd321x_dp_hpd(const struct cd321x *cd321x, const struct cd321x_status *st)
+{
+	if (!(st->data_status & CD321X_DATA_STATUS_HPD_LEVEL))
+		return false;
+	return !cd321x->dp_sid_valid ||
+	       (le32_to_cpu(st->dp_sid_status.status_rx) & DP_STATUS_HPD_STATE);
+}
+
+/*
+ * SN201202x, from the interrupt: the partner sent a new DP status. Note what
+ * it shows for the next update, which may come after several of these: HPD
+ * low (the display behind a converter went away, and maybe came back before
+ * the update), or IRQ_HPD with HPD high (the sink asks the source to look).
+ */
+static void cd321x_dp_sid_event(struct cd321x *cd321x)
+{
+	u32 rx = le32_to_cpu(cd321x->dp_sid_status.status_rx);
+
+	if (!cd321x_uses_dp_sid(&cd321x->tps) ||
+	    !(cd321x->tps.data_status & TPS_DATA_STATUS_DP_CONNECTION))
+		return;
+	cd321x->update_status.dp_sid_event = true;
+	if (!(rx & DP_STATUS_HPD_STATE))
+		cd321x->update_status.dp_sid_hpd_low = true;
+	else if (rx & DP_STATUS_IRQ_HPD)
+		cd321x->update_status.dp_sid_irq = true;
+	dev_dbg(cd321x->tps.dev, "DP status %#x\n", rx);
 }
 
 static int cd321x_typec_update_mode(struct tps6598x *tps,
@@ -683,7 +777,9 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
+		enum cd321x_dp_send send;
 		unsigned long mode;
+		bool hpd_pulse;
 
 		switch (TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT(st->data_status)) {
 		case TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT_A:
@@ -711,15 +807,33 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
 		dp_data.conf = le32_to_cpu(st->dp_sid_status.configure);
-		if (st->data_status & CD321X_DATA_STATUS_HPD_LEVEL)
+		if (cd321x_dp_hpd(cd321x, st))
 			dp_data.status |= DP_STATUS_HPD_STATE;
 		else
 			dp_data.status &= ~DP_STATUS_HPD_STATE;
 
+		/*
+		 * The sink dropped HPD and raised it again within the debounce
+		 * window, as a monitor does after losing the link. The coalesced
+		 * state looks unchanged, so the display side would never hear of
+		 * it: report the pulse as IRQ_HPD. A port with a displayport
+		 * reference reports the pulse out of band instead, as a
+		 * disconnect and a connect (see cd321x_update_work()).
+		 */
+		hpd_pulse = !tps->h17_display &&
+			    !(IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode) &&
+			    (st->data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
+			    (dp_data.status & DP_STATUS_HPD_STATE) &&
+			    (cd321x->dp_status & DP_STATUS_HPD_STATE);
+		if (hpd_pulse)
+			dp_data.status |= DP_STATUS_IRQ_HPD;
+
 		if (cd321x->state_valid && cd321x->state.alt == cd321x->port_altmode_dp &&
-		    cd321x->state.mode == mode &&
-		    cd321x->dp_status == dp_data.status &&
-		    cd321x->dp_conf == dp_data.conf)
+		    cd321x->state.mode == mode && cd321x->dp_conf == dp_data.conf)
+			send = cd321x_dp_send(cd321x->dp_status, dp_data.status, hpd_pulse);
+		else
+			send = CD321X_DP_SEND;
+		if (send == CD321X_DP_SEND_NONE)
 			return 0;
 
 		cd321x->state.alt = cd321x->port_altmode_dp;
@@ -728,8 +842,23 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		if (ret)
 			goto out;
+		if (send == CD321X_DP_SEND_EDGE) {
+			struct typec_displayport_data edge = {
+				.status = dp_data.status & ~DP_STATUS_IRQ_HPD,
+				.conf = dp_data.conf,
+			};
+
+			cd321x->state.data = &edge;
+			ret = cd321x_mux_set(cd321x, held);
+			cd321x->state.data = &dp_data;
+			if (ret) {
+				*display_busy = cd321x_display_taken(ret, tps->h17_display);
+				goto out;
+			}
+			cd321x->dp_status = edge.status;
+		}
 		ret = cd321x_mux_set(cd321x, held);
-		*display_busy = cd321x_display_taken(ret);
+		*display_busy = cd321x_display_taken(ret, tps->h17_display);
 		if (!ret) {
 			cd321x->dp_status = dp_data.status;
 			cd321x->dp_conf = dp_data.conf;
@@ -766,6 +895,70 @@ out:
 		cd321x->dp_conf = 0;
 	}
 
+	return ret;
+}
+
+/*
+ * SN201202x with a display route in use and HPD staying high: pass on what
+ * only the DP status showed since the last update, as the edge the final
+ * state hides. The normal update that follows sends the final state.
+ *  - HPD went low: the display behind the converter was unplugged, and
+ *    maybe another one plugged in. Send HPD low first, so that the display
+ *    is released and read anew.
+ *  - IRQ_HPD: send the status without it first, so that the request reaches
+ *    the display route even when the status it had already carried it.
+ */
+static int cd321x_dp_sid_replay(struct cd321x *cd321x,
+				const struct cd321x_status *st, bool *display_busy, bool *held)
+{
+	struct device *dev = cd321x->tps.dev;
+	struct cd321x_status edge = *st;
+	u32 rx = le32_to_cpu(st->dp_sid_status.status_rx);
+
+	if (!cd321x_uses_dp_sid(&cd321x->tps) || !cd321x->state_valid ||
+	    cd321x->state.alt != cd321x->port_altmode_dp ||
+	    !(cd321x->dp_status & DP_STATUS_HPD_STATE) || !cd321x_dp_hpd(cd321x, st))
+		return 0;
+	if (st->dp_sid_hpd_low) {
+		dev_info(dev, "DP partner reported its display gone and back: HPD low, then high\n");
+		edge.data_status &= ~CD321X_DATA_STATUS_HPD_LEVEL;
+	} else if (st->dp_sid_irq && (rx & DP_STATUS_IRQ_HPD)) {
+		dev_info(dev, "DP partner raised IRQ_HPD\n");
+		edge.dp_sid_status.status_rx = cpu_to_le32(rx & ~DP_STATUS_IRQ_HPD);
+	} else {
+		return 0;
+	}
+	/* The following update reports the HPD pulse once. */
+	edge.data_status_changed &= ~CD321X_DATA_STATUS_HPD_LEVEL;
+	return cd321x_typec_update_mode(&cd321x->tps, &edge, display_busy, held);
+}
+
+/*
+ * SN201202x: the display route in use is about to go (unplug, a new partner,
+ * or the partner leaving DP). Tell it HPD is low first, while the PHY still
+ * runs the link, so that the display is released and its link taken down
+ * before the PHY stops. The update that follows moves the PHY.
+ */
+static int cd321x_dp_release_first(struct cd321x *cd321x, bool *held)
+{
+	struct typec_displayport_data dp_data;
+	struct typec_mux_state state;
+	int ret;
+
+	if (!cd321x_uses_dp_sid(&cd321x->tps) || !cd321x->display_route_active ||
+	    !cd321x->state_valid || cd321x->state.alt != cd321x->port_altmode_dp ||
+	    !(cd321x->dp_status & DP_STATUS_HPD_STATE))
+		return 0;
+	dp_data.status = cd321x->dp_status & ~(DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD);
+	dp_data.conf = cd321x->dp_conf;
+	state = cd321x->state;
+	state.data = &dp_data;
+	ret = typec_mux_set(cd321x->mux, &state);
+	*held = cd321x_mux_held(cd321x, ret);
+	if (ret)
+		dev_warn(cd321x->tps.dev, "display not released before the port changes: %d\n", ret);
+	else
+		cd321x->dp_status = dp_data.status;
 	return ret;
 }
 
@@ -847,6 +1040,9 @@ static void cd321x_update_work(struct work_struct *work)
 	st = cd321x->update_status;
 	cd321x->update_status.status_changed = 0;
 	cd321x->update_status.data_status_changed = 0;
+	cd321x->update_status.dp_sid_event = false;
+	cd321x->update_status.dp_sid_hpd_low = false;
+	cd321x->update_status.dp_sid_irq = false;
 
 	bool old_connected = !!tps->partner;
 	bool new_connected = st.status & TPS_STATUS_PLUG_PRESENT;
@@ -869,6 +1065,7 @@ static void cd321x_update_work(struct work_struct *work)
 	bool dp_mode_changed = cd321x_dp_mode_changed(st.data_status,
 						       st.data_status_changed);
 	bool dp_connected = st.data_status & TPS_DATA_STATUS_DP_CONNECTION;
+	bool dp_route_was_active = cd321x->display_route_active;
 	struct cd321x_dp_update dp = {
 		.data_status = st.data_status,
 		.changed = st.data_status_changed,
@@ -876,6 +1073,12 @@ static void cd321x_update_work(struct work_struct *work)
 		.route_active = cd321x->display_route_active,
 		.sink_reported = cd321x->dp_sink_reported,
 	};
+
+	bool usb4_started =
+		(st.data_status_changed & CD321X_DATA_STATUS_USB4_CONNECTION) &&
+		(st.data_status & CD321X_DATA_STATUS_USB4_CONNECTION);
+
+	bool dp_hpd;
 
 	enum usb_role old_role = usb_role_switch_get_role(tps->role_sw);
 	enum usb_role new_role = USB_ROLE_NONE;
@@ -909,6 +1112,28 @@ static void cd321x_update_work(struct work_struct *work)
 		reset |= CD321X_DP_RESET_PARTNER;
 	if (!new_connected)
 		reset |= CD321X_DP_RESET_UNPLUG;
+
+	/* A new DP connection: its DP status counts once one is signalled. */
+	if (!new_connected || was_disconnected || !dp_connected || dp_mode_changed)
+		cd321x->dp_sid_valid = false;
+	if (dp_connected && st.dp_sid_event)
+		cd321x->dp_sid_valid = true;
+	dp_hpd = cd321x_dp_hpd(cd321x, &st);
+	/* Feed the effective legacy sink level into the shared HPD policy. */
+	if (!dp_hpd)
+		dp.data_status &= ~CD321X_DATA_STATUS_HPD_LEVEL;
+	if (st.dp_sid_hpd_low)
+		dp.changed |= CD321X_DATA_STATUS_HPD_LEVEL;
+	if (dp_hpd && cd321x_uses_dp_sid(tps))
+		dp.irq_hpd |= st.dp_sid_irq;
+
+	/* The display goes before anything else on the port changes. */
+	if (dp_route_was_active &&
+	    (!new_connected || was_disconnected || !dp_connected || dp_mode_changed)) {
+		ret = cd321x_dp_release_first(cd321x, &held);
+		if (ret)
+			goto retry;
+	}
 
 	/*
 	 * Report the sink as gone before any hardware transition that can fail:
@@ -992,11 +1217,10 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* Set up partner if we were previously disconnected (or changed). */
 	if (!tps->partner) {
-		struct typec_partner_desc desc;
+		struct typec_partner_desc desc = { };
 
 		desc.usb_pd = is_pd;
 		desc.accessory = TYPEC_ACCESSORY_NONE; /* XXX: handle accessories */
-		desc.identity = NULL;
 
 		/*
 		 * typec_register_partner() stores this pointer rather than
@@ -1022,16 +1246,31 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	/* Update the TypeC MUX/PHY state */
+	if (dp_route_was_active && dp_connected && !was_disconnected && !dp_mode_changed &&
+	    st.dp_sid_event) {
+		ret = cd321x_dp_sid_replay(cd321x, &st, &display_busy, &held);
+		if (ret && !display_busy)
+			goto retry;
+	}
 	ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
 	if (ret && !display_busy)
 		goto retry;
 	/* A shared display route can be busy while the dock's USB path is usable. */
-	cd321x->display_route_active = dp_connected && !ret;
+	cd321x->display_route_active = !ret &&
+		cd321x->state.alt == cd321x->port_altmode_dp;
 
 	/* Launch the USB role switch */
 	ret = usb_role_switch_set_role(tps->role_sw, new_role);
 	if (ret)
 		goto retry;
+
+	/* A new USB4 route can disturb another port on the shared fabric. */
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
+	    !of_machine_is_compatible("apple,t8140") &&
+	    !of_machine_is_compatible("apple,t8142") &&
+	    usb4_started && !cd321x->display_route_active)
+		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
+						connector_status_unknown);
 
 	/* An IRQ_HPD is delivered now, or overtaken by a connect. */
 	cd321x->dp_irq_hpd = false;
@@ -1057,6 +1296,47 @@ static void cd321x_update_work(struct work_struct *work)
 	return;
 
 retry:
+	/*
+	 * The Thunderbolt provider disabled the port for good after a failed
+	 * resume recovery (see apple_cio_tbt_switch_set()). Other errors,
+	 * including -ESHUTDOWN while the provider unbinds, are retried as before.
+	 */
+	if (ret == -EHOSTDOWN) {
+		struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
+		int cleanup;
+
+		/* A terminal provider failure must not cycle the complex again. */
+		cd321x->state.alt = NULL;
+		cd321x->state.mode = TYPEC_STATE_SAFE;
+		cd321x->state.data = NULL;
+		/* Retain prepare/role/finish ownership even for a failed provider. */
+		cleanup = typec_mux_begin(cd321x->mux, &safe);
+		if (!cleanup) {
+			if (!typec_mux_safe_after_role(cd321x->mux))
+				cleanup = typec_mux_apply(cd321x->mux);
+			if (!cleanup) {
+				cleanup = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+				if (cleanup)
+					typec_mux_abort(cd321x->mux);
+				else
+					cleanup = typec_mux_end(cd321x->mux);
+			}
+		}
+		if (cleanup)
+			dev_warn(tps->dev, "terminal provider cleanup incomplete: %d\n", cleanup);
+		cd321x_pm_mux_done(&cd321x->pm);
+		cd321x->pm.phase = CD321X_PM_STALE;
+		cd321x->pm.attempts_left = 0;
+		cd321x->pm.force_reconnect = false;
+		cd321x->pm.provider_busy = false;
+		cd321x->state_valid = false;
+		dev_err(tps->dev, "Type-C provider shut down; automatic retries stopped\n");
+		return;
+	}
+	/* A held mux must not consume a coalesced partner edge. */
+	cd321x->update_status.dp_sid_event |= st.dp_sid_event;
+	cd321x->update_status.dp_sid_hpd_low |= st.dp_sid_hpd_low;
+	cd321x->update_status.dp_sid_irq |= st.dp_sid_irq;
 	if (held) {
 		cd321x_retry_held_mux(cd321x);
 		return;
@@ -1150,13 +1430,17 @@ static void cd321x_event_lost(struct cd321x *cd321x)
  * provider to validate the resumed session. Preserve a healthy connection;
  * only a real cable change or a failed read/apply requests forced recovery.
  */
+static int cd321x_check_setup(struct cd321x *cd321x, u64 event);
+
 static void cd321x_resume_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
 					    struct cd321x, resume_work);
 	struct tps6598x *tps = &cd321x->tps;
+	unsigned int notes;
 	u32 status;
 	int ret;
+	bool fault, ready, restore;
 
 	guard(mutex)(&tps->lock);
 	if (cd321x->pm.phase == CD321X_PM_INITIALIZING ||
@@ -1164,15 +1448,21 @@ static void cd321x_resume_work(struct work_struct *work)
 	    cd321x->pm.phase == CD321X_PM_REMOVED)
 		return;
 
-	if (atomic_xchg(&cd321x->link_event, 0)) {
-		if (cd321x_pm_link_event(&cd321x->pm)) {
-			cd321x->state_valid = false;
-			dev_dbg(tps->dev, "revalidating cable after tunnel state change\n");
-		} else {
-			dev_warn_ratelimited(tps->dev,
-					     "tunnel link recovery budget exhausted\n");
-		}
-	}
+	if (cd321x->pm.setup_pending && cd321x_check_setup(cd321x, 0) < 0)
+		return;
+
+	fault = atomic_xchg(&cd321x->link_event, 0);
+	ready = atomic_xchg(&cd321x->ready_event, 0);
+	restore = atomic_xchg(&cd321x->restore_event, 0);
+	notes = cd321x_pm_notifications(&cd321x->pm, fault, ready, restore);
+	if (notes & CD321X_PM_FAULT_ACCEPTED)
+		dev_dbg(tps->dev, "revalidating cable after tunnel state change\n");
+	if (notes & CD321X_PM_FAULT_REFUSED)
+		dev_warn_ratelimited(tps->dev,
+				     "tunnel link recovery budget exhausted\n");
+	if (notes & (CD321X_PM_FAULT_ACCEPTED | CD321X_PM_READY_ACCEPTED |
+		     CD321X_PM_RESTORE_ACCEPTED))
+		cd321x->state_valid = false;
 	if (!cd321x_pm_begin_read(&cd321x->pm))
 		return;
 
@@ -1232,6 +1522,77 @@ static void cd321x_complete(struct tps6598x *tps)
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 }
 
+static int cd321x_setup_read_state(void *ctx, u8 *state)
+{
+	struct cd321x *cd321x = ctx;
+
+	return tps6598x_read8(&cd321x->tps, TPS_REG_SYSTEM_POWER_STATE, state);
+}
+
+static int cd321x_setup_read_mask(void *ctx, u64 *mask)
+{
+	struct cd321x *cd321x = ctx;
+
+	return tps6598x_read64(&cd321x->tps, TPS_REG_INT_MASK1, mask);
+}
+
+static int cd321x_setup_set_s0(void *ctx)
+{
+	struct cd321x *cd321x = ctx;
+	struct tps6598x *tps = &cd321x->tps;
+
+	return tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+}
+
+static int cd321x_setup_set_mask(void *ctx, u64 mask)
+{
+	struct cd321x *cd321x = ctx;
+
+	return tps6598x_write64(&cd321x->tps, TPS_REG_INT_MASK1, mask);
+}
+
+static const struct cd321x_setup_ops cd321x_setup_ops = {
+	.read_state = cd321x_setup_read_state,
+	.read_mask = cd321x_setup_read_mask,
+	.set_s0 = cd321x_setup_set_s0,
+	.set_mask = cd321x_setup_set_mask,
+};
+
+/* Restore a reset controller even if the sole reset IRQ has been cleared. */
+static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	if (cd321x->pm.phase == CD321X_PM_REMOVED ||
+	    (!cd321x->pm.setup_pending && !(event & ~cd321x_irq_mask(tps))))
+		return 0;
+	ret = cd321x_setup_run(&cd321x->pm, event, cd321x_irq_mask(tps),
+			       &cd321x_setup_ops, cd321x);
+	if (cd321x->pm.phase == CD321X_PM_PREPARED ||
+	    cd321x->pm.phase == CD321X_PM_INITIALIZING)
+		return 0;
+	if (ret < 0) {
+		if (cd321x->pm.setup_attempts_left)
+			mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
+					 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
+		else
+			dev_err(tps->dev, "controller setup recovery exhausted: %d\n", ret);
+		return ret;
+	}
+	if (ret)
+		dev_warn(tps->dev, "restored controller power state and interrupt mask\n");
+	/* Only a fresh snapshot may be applied after restoring the controller. */
+	cd321x->state_valid = false;
+	cd321x->pm.phase = CD321X_PM_REVALIDATE;
+	cd321x->pm.attempts_left = CD321X_RESUME_ATTEMPTS;
+	cd321x->pm.force_reconnect |= ret > 0;
+	cd321x->pm.provider_busy = false;
+	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+	return 0;
+}
+
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
@@ -1257,12 +1618,14 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 		dev_err(tps->dev, "%s: failed to clear events\n", __func__);
 		goto err_lost;
 	}
+	if (cd321x_check_setup(container_of(tps, struct cd321x, tps), event) < 0)
+		goto err_unlock;
 
 	if (!tps6598x_read_status(tps, &status))
 		goto err_lost;
 
 	if (event & APPLE_CD_REG_INT_POWER_STATUS_UPDATE) {
-		if (!tps6598x_read_power_status(tps))
+		if (!tps->data->read_power_status(tps))
 			goto err_lost;
 		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
 			if (tps6598x_read_partner_identity(tps)) {
@@ -1272,9 +1635,12 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 		}
 	}
 
-	if (event & APPLE_CD_REG_INT_DATA_STATUS_UPDATE)
+	if (event & (APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
+		     (cd321x_irq_mask(tps) & SN201202X_INT_DP_SID_UPDATE)))
 		if (!tps->data->read_data_status(tps))
 			goto err_lost;
+	if (event & cd321x_irq_mask(tps) & SN201202X_INT_DP_SID_UPDATE)
+		cd321x_dp_sid_event(container_of(tps, struct cd321x, tps));
 
 	/* Can be called uncondtionally since it will check for any changes itself */
 	cd321x_connect(tps, status);
@@ -1320,7 +1686,7 @@ static irqreturn_t tps25750_interrupt(int irq, void *data)
 		goto err_clear_ints;
 
 	if (event[0] & TPS_REG_INT_POWER_STATUS_UPDATE)
-		if (!tps6598x_read_power_status(tps))
+		if (!tps->data->read_power_status(tps))
 			goto err_clear_ints;
 
 	if (event[0] & TPS_REG_INT_DATA_STATUS_UPDATE)
@@ -1393,17 +1759,25 @@ static irqreturn_t tps6598x_interrupt(int irq, void *data)
 	if (!tps6598x_read_status(tps, &status))
 		goto err_unlock;
 
+	tps->status = status;
+
 	if ((event1[0] | event2[0]) & TPS_REG_INT_POWER_STATUS_UPDATE)
-		if (!tps6598x_read_power_status(tps))
+		if (!tps->data->read_power_status(tps))
 			goto err_unlock;
 
 	if ((event1[0] | event2[0]) & TPS_REG_INT_DATA_STATUS_UPDATE)
 		if (!tps->data->read_data_status(tps))
 			goto err_unlock;
 
-	/* Handle plug insert or removal */
-	if ((event1[0] | event2[0]) & TPS_REG_INT_PLUG_EVENT)
+	/*
+	 * Refresh power status before connect - needed for TPS66993 which
+	 * synthesizes pwr_status from STATUS and never gets POWER_STATUS_UPDATE.
+	 */
+	if ((event1[0] | event2[0]) & TPS_REG_INT_PLUG_EVENT) {
+		if (!tps->data->read_power_status(tps))
+			goto err_unlock;
 		tps6598x_handle_plug_event(tps, status);
+	}
 
 err_unlock:
 	mutex_unlock(&tps->lock);
@@ -1439,6 +1813,7 @@ static int tps6598x_check_mode(struct tps6598x *tps)
 
 	switch (ret) {
 	case TPS_MODE_APP:
+	case TPS_MODE_APP1:
 	case TPS_MODE_PTCH:
 		return ret;
 	case TPS_MODE_BOOT:
@@ -1648,11 +2023,18 @@ static int cd321x_tbt_notify(struct notifier_block *nb,
 {
 	struct cd321x *cd321x = container_of(nb, struct cd321x, tbt_notifier);
 
-	if (event != TYPEC_THUNDERBOLT_SWITCH_REVALIDATE)
+	if (event != TYPEC_THUNDERBOLT_SWITCH_REVALIDATE &&
+	    event != TYPEC_THUNDERBOLT_SWITCH_READY &&
+	    event != TYPEC_THUNDERBOLT_SWITCH_RESTORE)
 		return NOTIFY_DONE;
 
 	/* Publish the event even if the worker is already reading or applying. */
-	atomic_xchg(&cd321x->link_event, 1);
+	if (event == TYPEC_THUNDERBOLT_SWITCH_READY)
+		atomic_set(&cd321x->ready_event, 1);
+	else if (event == TYPEC_THUNDERBOLT_SWITCH_RESTORE)
+		atomic_set(&cd321x->restore_event, 1);
+	else
+		atomic_set(&cd321x->link_event, 1);
 	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 	return NOTIFY_OK;
 }
@@ -1720,6 +2102,8 @@ VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
 	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
 	INIT_DELAYED_WORK(&cd321x->resume_work, cd321x_resume_work);
 	atomic_set(&cd321x->link_event, 0);
+	atomic_set(&cd321x->ready_event, 0);
+	atomic_set(&cd321x->restore_event, 0);
 	cd321x_pm_init(&cd321x->pm);
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_init_work);
@@ -2284,8 +2668,9 @@ static int cd321x_remove(struct tps6598x *tps)
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
+	bool patch_loaded = false;
 	u32 status;
-	u32 vid;
+	u32 vid = 0;
 	int ret, cleanup_ret;
 	bool reset_allowed = true;
 
@@ -2298,8 +2683,11 @@ int tipd_init(struct tps6598x *tps)
 
 	if (!device_is_compatible(tps->dev, "ti,tps25750")) {
 		ret = tps6598x_read32(tps, TPS_REG_VID, &vid);
-		if (ret < 0 || !vid)
+		if (ret < 0 || !vid) {
+			dev_err(tps->dev, "failed to read vendor ID: %d, vid: %#x\n",
+				ret, vid);
 			return -ENODEV;
+		}
 	}
 
 	if (tps->data->switch_power_state) {
@@ -2314,6 +2702,7 @@ int tipd_init(struct tps6598x *tps)
 		return ret;
 
 	if (ret == TPS_MODE_PTCH) {
+		patch_loaded = true;
 		ret = tps->data->init(tps);
 		if (ret)
 			return ret;
@@ -2330,7 +2719,7 @@ int tipd_init(struct tps6598x *tps)
 	if (tps->dbma_at_probe)
 		dev_info(tps->dev, "controller in debug mode \"DBMa\", leaving it there\n");
 
-	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, tps->data->irq_mask1);
+	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, cd321x_irq_mask(tps));
 	if (ret)
 		goto err_reset_controller;
 
@@ -2338,6 +2727,8 @@ int tipd_init(struct tps6598x *tps)
 		ret = -ENODEV;
 		goto err_clear_mask;
 	}
+
+	tps->status = status;
 
 	/*
 	 * This fwnode has a "compatible" property, but is never populated as a
@@ -2377,7 +2768,7 @@ int tipd_init(struct tps6598x *tps)
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
 		ret = -EINVAL;
-		if (!tps6598x_read_power_status(tps))
+		if (!tps->data->read_power_status(tps))
 			goto err_disconnect;
 		if (!tps->data->read_data_status(tps))
 			goto err_disconnect;
@@ -2394,7 +2785,7 @@ int tipd_init(struct tps6598x *tps)
 						IRQF_SHARED | IRQF_ONESHOT,
 						dev_name(tps->dev), tps);
 	} else {
-		dev_warn(tps->dev, "Unable to find the interrupt, switching to polling\n");
+		dev_dbg(tps->dev, "no IRQ specified, using polling mode\n");
 		INIT_DELAYED_WORK(&tps->wq_poll, tps6598x_poll_work);
 		queue_delayed_work(system_power_efficient_wq, &tps->wq_poll,
 				   msecs_to_jiffies(POLL_INTERVAL));
@@ -2434,7 +2825,7 @@ err_clear_mask:
 	tps6598x_write64(tps, TPS_REG_INT_MASK1, 0);
 err_reset_controller:
 	/* Reset PD controller to remove any applied patch */
-	if (reset_allowed)
+	if (patch_loaded && reset_allowed)
 		tps->data->reset(tps);
 
 	return ret;
@@ -2494,6 +2885,9 @@ int tipd_resume(struct tps6598x *tps)
 {
 	int ret;
 
+	tps->h17_display = of_machine_is_compatible("apple,t8140") ||
+			   of_machine_is_compatible("apple,t8142");
+
 	ret = tps6598x_check_mode(tps);
 	if (ret < 0)
 		return ret;
@@ -2542,7 +2936,7 @@ void tipd_complete(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(tipd_complete);
 
-const struct tipd_data tipd_cd321x_data = {
+static const struct tipd_data tipd_cd321x_data = {
 	.irq_handler = cd321x_interrupt,
 	.irq_mask1 = APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
 		     APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
@@ -2557,15 +2951,15 @@ const struct tipd_data tipd_cd321x_data = {
 	.trace_status = trace_tps6598x_status,
 	.init = cd321x_init,
 	.read_data_status = cd321x_read_data_status,
+	.read_power_status = tps6598x_read_power_status,
 	.reset = cd321x_reset,
 	.switch_power_state = cd321x_switch_power_state,
 	.connect = cd321x_connect,
 	.prepare = cd321x_prepare,
 	.complete = cd321x_complete,
 };
-EXPORT_SYMBOL_GPL(tipd_cd321x_data);
 
-const struct tipd_data tipd_tps6598x_data = {
+static const struct tipd_data tipd_tps6598x_data = {
 	.irq_handler = tps6598x_interrupt,
 	.irq_mask1 = TPS_REG_INT_POWER_STATUS_UPDATE |
 		     TPS_REG_INT_DATA_STATUS_UPDATE |
@@ -2579,12 +2973,30 @@ const struct tipd_data tipd_tps6598x_data = {
 	.apply_patch = tps6598x_apply_patch,
 	.init = tps6598x_init,
 	.read_data_status = tps6598x_read_data_status,
+	.read_power_status = tps6598x_read_power_status,
 	.reset = tps6598x_reset,
 	.connect = tps6598x_connect,
 };
-EXPORT_SYMBOL_GPL(tipd_tps6598x_data);
 
-const struct tipd_data tipd_tps25750_data = {
+static const struct tipd_data tipd_tps66993_data = {
+	.irq_handler = tps6598x_interrupt,
+	.irq_mask1 = TPS_REG_INT_DATA_STATUS_UPDATE |
+		     TPS_REG_INT_PLUG_EVENT,
+	.tps_struct_size = sizeof(struct tps6598x),
+	.register_port = tps6598x_register_port,
+	.unregister_port = tps6598x_unregister_port,
+	.trace_data_status = trace_tps6598x_data_status,
+	.trace_power_status = trace_tps6598x_power_status,
+	.trace_status = trace_tps6598x_status,
+	.apply_patch = tps6598x_apply_patch,
+	.init = tps6598x_init,
+	.read_data_status = tps6598x_read_data_status,
+	.read_power_status = tps66993_read_power_status,
+	.reset = tps6598x_reset,
+	.connect = tps6598x_connect,
+};
+
+static const struct tipd_data tipd_tps25750_data = {
 	.irq_handler = tps25750_interrupt,
 	.irq_mask1 = TPS_REG_INT_POWER_STATUS_UPDATE |
 		     TPS_REG_INT_DATA_STATUS_UPDATE |
@@ -2598,16 +3010,17 @@ const struct tipd_data tipd_tps25750_data = {
 	.apply_patch = tps25750_apply_patch,
 	.init = tps25750_init,
 	.read_data_status = tps6598x_read_data_status,
+	.read_power_status = tps6598x_read_power_status,
 	.reset = tps25750_reset,
 	.connect = tps6598x_connect,
 };
-EXPORT_SYMBOL_GPL(tipd_tps25750_data);
 
-const struct tipd_data tipd_sn201202x_data = {
+static const struct tipd_data tipd_sn201202x_data = {
 	.irq_handler = cd321x_interrupt,
 	.irq_mask1 = APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
 		     APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
-		     APPLE_CD_REG_INT_PLUG_EVENT,
+		     APPLE_CD_REG_INT_PLUG_EVENT |
+		     SN201202X_INT_DP_SID_UPDATE,
 	.tps_struct_size = sizeof(struct sn201202x),
 	.remove = cd321x_remove,
 	.register_port = cd321x_register_port,
@@ -2618,13 +3031,28 @@ const struct tipd_data tipd_sn201202x_data = {
 	.trace_status = trace_tps6598x_status,
 	.init = cd321x_init,
 	.read_data_status = cd321x_read_data_status,
+	.read_power_status = tps6598x_read_power_status,
 	.reset = cd321x_reset,
 	.switch_power_state = cd321x_switch_power_state,
 	.connect = cd321x_connect,
 	.prepare = cd321x_prepare,
 	.complete = cd321x_complete,
 };
-EXPORT_SYMBOL_GPL(tipd_sn201202x_data);
+
+const struct tipd_data *tipd_hw_variants[] = {
+	[TIPD_VARIANT_CD321X] = &tipd_cd321x_data,
+	[TIPD_VARIANT_TPS6598X] = &tipd_tps6598x_data,
+	[TIPD_VARIANT_TPS25750] = &tipd_tps25750_data,
+	[TIPD_VARIANT_SN201202X] = &tipd_sn201202x_data,
+	[TIPD_VARIANT_TPS66993] = &tipd_tps66993_data,
+};
+EXPORT_SYMBOL_GPL(tipd_hw_variants);
+
+static void __exit tipd_core_exit(void)
+{
+	tipd_debugfs_exit();
+}
+module_exit(tipd_core_exit);
 
 static void __exit tipd_core_exit(void)
 {
@@ -2633,5 +3061,5 @@ static void __exit tipd_core_exit(void)
 module_exit(tipd_core_exit);
 
 MODULE_AUTHOR("Heikki Krogerus <heikki.krogerus@linux.intel.com>");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("TI TPS6598x USB Power Delivery Controller Core Functions");

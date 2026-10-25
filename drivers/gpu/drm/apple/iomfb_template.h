@@ -24,6 +24,20 @@ struct DCP_FW_NAME(dcp_swap) {
 
 	u64 flags1;
 	u64 flags2;
+#if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
+	u8 unk_v14_7[0x48];
+#endif
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * H17P inserts 0x48 bytes between flags2 and the swap ID, which moves
+	 * to +0x98.  Every following field shifts with it: surf_ids +0x9c,
+	 * src_rect +0xac, surf_flags +0xec, dst_rect +0x10c,
+	 * swap_enabled/completed +0x14c/+0x150, bg_color +0x154.  The gap holds
+	 * two small u32 counters (at +0x50 and +0x78) that are not modelled.
+	 */
+	u8 h17p_pre_swap_id[0x48];
+#endif
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
@@ -47,22 +61,48 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 swap_completed;
 
 	u32 bg_color;
-	u8 unk_110[0x1b8];
+	u8 unk_110[0x30];
+	u32 active_region_en[SWAP_SURFACES];
+	struct dcp_rect active_regions[SWAP_SURFACES];
+	u8 unk_190[0x138];
 	u32 unk_2c8;
+#if !DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 	u8 unk_2cc[0x14];
+#else
+	u8 unk_2cc[0x40];
+#endif
+#if !DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 	u32 unk_2e0;
+#else
+	u32 bl_update;
+#endif
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
 	u16 unk_2e2;
 #else
 	u8 unk_2e2[3];
 #endif
+#if !DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 	u64 bl_unk;
+#else
+	u32 bl_unk;
+#endif
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
 	u8 unk_2f3[0x2d];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u8 unk_320[0x13f];
-	u64 unk_1;
+#if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
+	u8 unk_14_7_2[0x30];
+#endif
+	u32 unk_flags;
+	u32 unk_flags2;
+#endif
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * The H17P A408 request is 0xe9c bytes; with a 0x22c-byte surface,
+	 * SWAP_SURFACES = 4 and no surf2 block, that leaves this tail.
+	 */
+	u8 h17p_tail[0xda];
 #endif
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
@@ -109,6 +149,9 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u32 clear; // or maybe switch to default fb?
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u32 unkU32Ptr;
+#endif
+#if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
+	u8 padding_14_7[0x234];
 #endif
 	u8 swap_null;
 	u8 surf_null[SWAP_SURFACES];
@@ -275,7 +318,7 @@ struct apple_dcp;
 
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state);
-void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_state *state);
+void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp);

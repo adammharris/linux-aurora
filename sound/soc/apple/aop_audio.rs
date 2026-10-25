@@ -37,10 +37,12 @@ use kernel::{
         },
         Arc, //
     },
-    types::ForeignOwnable, //
+    types::{ForeignOwnable, ScopeGuard}, //
 };
 
 use pin_init::Zeroable;
+
+mod aop_spkr;
 
 /// An unaligned u32 type.
 ///
@@ -326,6 +328,16 @@ impl AudioAttachDevice {
     }
 }
 
+// macOS sets node property 300 to the three channel masks of the ADT node /product/audio
+// (supportedChannels, enabledChannels, historyChannels).
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Default)]
+struct LpaiChannelControl {
+    supported: u32,
+    enabled: u32,
+    history: u32,
+}
+
 #[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
 struct LpaiChannelConfig {
@@ -457,6 +469,10 @@ static_assert!(
 static_assert!(
     mem::size_of::<AudioSetDeviceProp<PowerSetting>>() == 52 + mem::size_of::<PowerSetting>()
 );
+static_assert!(
+    mem::size_of::<AudioSetDeviceProp<LpaiChannelControl>>()
+        == 52 + mem::size_of::<LpaiChannelControl>()
+);
 
 impl<T: Default> AudioSetDeviceProp<T> {
     fn new(dev_id: u32, modifier: u32, data: T) -> AudioSetDeviceProp<T> {
@@ -473,7 +489,7 @@ impl<T: Default> AudioSetDeviceProp<T> {
     }
 }
 
-unsafe impl<T> Zeroable for AudioSetDeviceProp<T> {}
+unsafe impl<T: Zeroable> Zeroable for AudioSetDeviceProp<T> {}
 
 impl<T: Zeroable> AudioSetDeviceProp<T> {
     fn try_init<E>(
@@ -502,6 +518,10 @@ impl<T: Zeroable> AudioSetDeviceProp<T> {
 struct SndSocAopHwConfig {
     bytes_per_sample: u32,
     hf_decimator: bool,
+    // The T6040 firmware takes the microphone setup macOS sends. LPAI property 301 is the
+    // read-only stream description; the channel masks are property 300 (12 bytes). A refusal of
+    // any of the configuration steps is logged and not fatal, so the next step's answer is seen.
+    t6040_flow: bool,
 }
 
 struct SndSocAopData {
@@ -559,7 +579,8 @@ impl SndSocAopData {
             mic_settle_time_valid: U32(1),
             mic_settle_time_ms: U32(50),
             ..Zeroable::init_zeroed()
-        }).chain(|raw| {
+        })
+        .chain(|raw| {
             if !self.hwdata.hf_decimator {
                 self.build_decimator_config(&mut raw.decim);
             }
@@ -604,7 +625,8 @@ impl SndSocAopData {
             filter_lengths: FILTER_LENGTHS_HF,
             coeff_bulk: DECIM_NUM_COEFFS_HF as u32,
             ..Zeroable::init_zeroed()
-        }).chain(|raw| {
+        })
+        .chain(|raw| {
             raw.coeffs[..COEFFICIENTS_HF.len()].copy_from_slice(&COEFFICIENTS_HF);
             Ok(())
         });
@@ -642,6 +664,21 @@ impl SndSocAopData {
         } else {
             Ok(())
         }
+    }
+    fn set_lpai_channel_control(&self) -> Result<()> {
+        // ADT /product/audio on J616s: supportedChannels = enabledChannels = historyChannels = 7.
+        let ctl = LpaiChannelControl {
+            supported: 7,
+            enabled: 7,
+            history: 7,
+        };
+        let msg = AudioSetDeviceProp::new(AUDIO_DEV_LPAI, 300, ctl);
+        let ret = self.epic_wrapped_call(&msg)?;
+        dev_dbg!(self.dev, "lpai channel control (prop 300): {:#x}\n", ret);
+        if ret != 0 {
+            return Err(EIO);
+        }
+        Ok(())
     }
     fn audio_attach_device(&self, dev_id: u32) -> Result<()> {
         let msg = AudioAttachDevice::new(dev_id);
@@ -699,11 +736,19 @@ impl SndSocAopData {
     }
 }
 
-#[repr(transparent)]
-struct SndSocAopDriver(*mut bindings::snd_card);
+struct SndSocAopDriver {
+    card: *mut bindings::snd_card,
+    /// The J616s speaker and jack ASoC components (T6040, where the node has a "spkr" DMA channel)
+    spkr: Option<aop_spkr::SpeakerComponent>,
+}
 
 fn copy_str(target: &mut [u8], source: &[u8]) {
-    target[..source.len()].copy_from_slice(source)
+    target.fill(0);
+    let len = source
+        .len()
+        .saturating_sub(1)
+        .min(target.len().saturating_sub(1));
+    target[..len].copy_from_slice(&source[..len]);
 }
 
 unsafe fn dmaengine_slave_config(
@@ -762,6 +807,9 @@ unsafe extern "C" fn aop_pcm_open(substream: *mut bindings::snd_pcm_substream) -
         Err(e) => return e.to_errno(),
     };
 
+    // Until the PCM helper accepts ownership, every error must release this channel.
+    let channel = ScopeGuard::new(|| unsafe { bindings::dma_release_channel(dma_chan) });
+
     if unsafe { (*substream).dma_buffer.dev.type_ == bindings::SNDRV_DMA_TYPE_UNKNOWN as _ } {
         let ret = unsafe {
             bindings::snd_pcm_set_managed_buffer(
@@ -774,9 +822,6 @@ unsafe extern "C" fn aop_pcm_open(substream: *mut bindings::snd_pcm_substream) -
         };
         if ret < 0 {
             dev_err!(data.dev, "Unable to allocate dma buffers");
-            unsafe {
-                bindings::dma_release_channel(dma_chan);
-            }
             return ret;
         }
     }
@@ -794,14 +839,27 @@ unsafe extern "C" fn aop_pcm_open(substream: *mut bindings::snd_pcm_substream) -
         dev_err!(data.dev, "Unable to refine hwparams");
         return ret;
     }
+    // The refinement adds every format whose sample width the DMA channel can move, but the
+    // AOP always delivers 32-bit floats: keep only those.
+    hwparams.formats &= bindings::BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE;
+    if hwparams.formats == 0 {
+        dev_err!(data.dev, "The DMA channel cannot carry 32-bit samples");
+        return EINVAL.to_errno();
+    }
+    unsafe { (*(*substream).runtime).hw = hwparams };
+    let ret = unsafe { bindings::snd_dmaengine_pcm_open(substream, dma_chan) };
+    if ret < 0 {
+        return ret;
+    }
+    channel.dismiss();
     if let Err(e) = data.set_audio_power(POWER_STATE_ON, 1) {
         dev_err!(data.dev, "Unable to power mic on");
+        // The ALSA core will not call close after a failed open. Unwind the
+        // accepted host channel even when firmware's power result is uncertain.
+        unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) };
         return e.to_errno();
     }
-    unsafe {
-        (*(*substream).runtime).hw = hwparams;
-        bindings::snd_dmaengine_pcm_open(substream, dma_chan)
-    }
+    0
 }
 
 unsafe extern "C" fn aop_pcm_prepare(_: *mut bindings::snd_pcm_substream) -> i32 {
@@ -810,14 +868,16 @@ unsafe extern "C" fn aop_pcm_prepare(_: *mut bindings::snd_pcm_substream) -> i32
 
 unsafe extern "C" fn aop_pcm_close(substream: *mut bindings::snd_pcm_substream) -> i32 {
     let data = unsafe { Arc::<SndSocAopData>::borrow((*substream).private_data.cast()) };
-    if let Err(e) = data.set_audio_power(POWER_STATE_IDLE, 1) {
-        dev_err!(data.dev, "Unable to power mic off");
-        return e.to_errno();
-    }
+    // ALSA discards close's error and detaches the runtime. Its host DMA
+    // callbacks must be drained before a firmware RPC can fail or time out.
     let ret = unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) };
     if ret != 0 {
         dev_err!(data.dev, "Unable to close channel");
         return ret;
+    }
+    if let Err(e) = data.set_audio_power(POWER_STATE_IDLE, 1) {
+        dev_err!(data.dev, "Unable to power mic off");
+        return e.to_errno();
     }
     if let Err(e) = data.set_audio_power(POWER_STATE_OFF, 0) {
         dev_err!(data.dev, "Unable to enter 'idle' power state");
@@ -842,7 +902,7 @@ impl SndSocAopDriver {
         ioctl: None,
         hw_params: Some(aop_hw_params),
         hw_free: None,
-        sync_stop: None,
+        sync_stop: Some(bindings::snd_dmaengine_pcm_sync_stop),
         get_time_info: None,
         fill_silence: None,
         copy: None,
@@ -851,15 +911,18 @@ impl SndSocAopDriver {
         ack: None,
     };
     fn new(data: Arc<SndSocAopData>) -> Result<Self> {
-        let mut this = SndSocAopDriver(ptr::null_mut());
+        let mut this = SndSocAopDriver {
+            card: ptr::null_mut(),
+            spkr: None,
+        };
         let ret = unsafe {
             bindings::snd_card_new(
                 data.dev.as_raw(),
                 -1,
                 ptr::null(),
-                THIS_MODULE.as_ptr(),
+                kernel::module::this_module::<crate::LocalModule>().as_ptr(),
                 0,
-                &mut this.0,
+                &mut this.card,
             )
         };
         if ret < 0 {
@@ -875,15 +938,15 @@ impl SndSocAopDriver {
             .property_read::<CString>(c_str!("apple,machine-kind"))
             .required_by(&data.dev)?;
         unsafe {
-            copy_str(&mut (*this.0).driver, c"aop_audio".to_bytes_with_nul());
+            copy_str(&mut (*this.card).driver, c"aop_audio".to_bytes_with_nul());
         }
         let id_str = CString::try_from_fmt(fmt!("Apple{}HPAI", *chassis))?;
         unsafe {
-            copy_str(&mut (*this.0).id, id_str.to_bytes_with_nul());
+            copy_str(&mut (*this.card).id, id_str.to_bytes_with_nul());
         }
         let shortname = CString::try_from_fmt(fmt!("{} {} HPAI", *machine_kind, *chassis))?;
         unsafe {
-            copy_str(&mut (*this.0).shortname, shortname.to_bytes_with_nul());
+            copy_str(&mut (*this.card).shortname, shortname.to_bytes_with_nul());
         }
         let longname = CString::try_from_fmt(fmt!(
             "{} {} High-Power Audio Interface",
@@ -891,12 +954,12 @@ impl SndSocAopDriver {
             *chassis
         ))?;
         unsafe {
-            copy_str(&mut (*this.0).longname, longname.to_bytes_with_nul());
+            copy_str(&mut (*this.card).longname, longname.to_bytes_with_nul());
         }
 
         let mut pcm = ptr::null_mut();
         let ret =
-            unsafe { bindings::snd_pcm_new(this.0, longname.as_ptr() as _, 0, 0, 1, &mut pcm) };
+            unsafe { bindings::snd_pcm_new(this.card, longname.as_ptr() as _, 0, 0, 1, &mut pcm) };
         if ret < 0 {
             dev_err!(data.dev, "Unable to allocate PCM device");
             return Err(Error::from_errno(ret));
@@ -917,7 +980,7 @@ impl SndSocAopDriver {
             copy_str(&mut (*pcm).name, c"aop_audio".to_bytes_with_nul());
         }
 
-        let ret = unsafe { bindings::snd_card_register(this.0) };
+        let ret = unsafe { bindings::snd_card_register(this.card) };
         if ret < 0 {
             dev_err!(data.dev, "Unable to register sound card");
             return Err(Error::from_errno(ret));
@@ -928,9 +991,11 @@ impl SndSocAopDriver {
 
 impl Drop for SndSocAopDriver {
     fn drop(&mut self) {
-        if self.0 != ptr::null_mut() {
+        // The speaker component (and any card bound to its DAIs) goes before the microphone card.
+        self.spkr.take();
+        if self.card != ptr::null_mut() {
             unsafe {
-                bindings::snd_card_free(self.0);
+                bindings::snd_card_free(self.card);
             }
         }
     }
@@ -942,45 +1007,67 @@ unsafe impl Sync for SndSocAopDriver {}
 const HW_CFG_T8013: SndSocAopHwConfig = SndSocAopHwConfig {
     bytes_per_sample: 2,
     hf_decimator: false,
+    t6040_flow: false,
 };
 
 const HW_CFG_T6030: SndSocAopHwConfig = SndSocAopHwConfig {
     bytes_per_sample: 3,
     hf_decimator: true,
+    t6040_flow: false,
+};
+
+const HW_CFG_T6040: SndSocAopHwConfig = SndSocAopHwConfig {
+    bytes_per_sample: 3,
+    hf_decimator: true,
+    t6040_flow: true,
 };
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     <SndSocAopDriver as platform::Driver>::IdInfo,
     [
         (of::DeviceId::new(c_str!("apple,aop-audio")), &HW_CFG_T8013),
-        (of::DeviceId::new(c_str!("apple,t6030-aop-audio")), &HW_CFG_T6030),
+        (
+            of::DeviceId::new(c_str!("apple,t6030-aop-audio")),
+            &HW_CFG_T6030
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,t6041-aop-audio")),
+            &HW_CFG_T6040
+        ),
     ]
 );
 
 impl platform::Driver for SndSocAopDriver {
     type IdInfo = &'static SndSocAopHwConfig;
+    type Data<'bound> = SndSocAopDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(
-        pdev: &platform::Device<Core>,
-        info: Option<&Self::IdInfo>
-    ) -> impl PinInit<Self, Error> {
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let info = info.ok_or(ENODEV)?;
         let dev = ARef::<device::Device>::from(pdev.as_ref());
-        let parent = pdev.as_ref().parent().unwrap();
-        // SAFETY: our parent is AOP, and AopDriver is repr(transparent) for Arc<dyn Aop>
-        let adata_ptr = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(parent.get_drvdata()) };
-        let adata = (&*adata_ptr).clone();
-        // SAFETY: AOP sets the platform data correctly
-        let svc = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
+        let parent = pdev.as_ref().parent().ok_or(ENODEV)?;
+        // SAFETY: this is a service device the AOP core registered, being
+        // probed here; the lookup defers the probe until the core has
+        // published its driver data.
+        let adata = unsafe { <dyn AOP>::from_child(pdev.as_ref()) }?;
+        // SAFETY: the AOP core sets this child's platform data to the EPIC
+        // service it created the child for; it lives as long as the child.
+        let service = unsafe { (*dev.as_raw()).platform_data as *const EPICService };
+        if service.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: the pointer was checked above and stays valid with the child.
+        let svc = unsafe { *service };
         let parent_fwnode = parent.fwnode().ok_or(ENOENT)?;
         let fwnode = parent_fwnode
             .get_child_by_name(c_str!("audio"))
             .ok_or(EIO)?;
-        let audio = *module_parameters::mic_check_123.value() != 0;
+        let audio = module_parameters::mic_check_123.value() != 0;
         if !audio && parent_fwnode.property_present(c_str!("apple,no-beamforming")) {
             return Err(ENODEV);
         }
@@ -990,6 +1077,30 @@ impl platform::Driver for SndSocAopDriver {
         }
         if info.hf_decimator {
             data.audio_attach_device(from_fourcc(b"lilb"))?;
+        }
+        if info.t6040_flow {
+            // Property 301 is the read-only stream description on this firmware (writing it
+            // returns 0xE00002CF, kIOReturnNotWritable). Follow macOS: channel masks are property
+            // 300. A refusal is reported and does not stop the probe.
+            if data.set_lpai_channel_control().is_err() {
+                dev_warn!(data.dev, "lpai channel control refused, continuing\n");
+            }
+            if data.set_pdm_config().is_err() {
+                dev_warn!(data.dev, "pdm config refused, continuing\n");
+            }
+            if data.set_decimator_config_hf().is_err() {
+                dev_warn!(data.dev, "decimator config refused, continuing\n");
+            }
+            let mut this = Self::new(data.clone())?;
+            // The speaker stream, where the node has its DMA channel.
+            if data
+                .fwnode
+                .property_match_string(c_str!("dma-names"), c_str!("spkr"))
+                .is_ok()
+            {
+                this.spkr = Some(aop_spkr::SpeakerComponent::register(data)?);
+            }
+            return Ok(this);
         }
         data.set_lpai_channel_cfg()?;
         data.set_pdm_config()?;

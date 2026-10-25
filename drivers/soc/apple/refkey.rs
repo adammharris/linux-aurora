@@ -99,7 +99,7 @@ impl SepData {
         };
 
         if self.profile.key_store == profile::KeyStore::Variant5 {
-            // T6020's ref-key is bound to the unlocked identity bag.
+            // On variant 5 the ref-key is bound to the unlocked identity bag.
             if let Some(healthy) = self.sks_health_check(c"ref-key create") {
                 let _ = self.sks_send(self.sks_req_change_lock_state(
                     handle,
@@ -167,7 +167,7 @@ impl SepData {
     pub(crate) fn sks_machine_refkey(&self, handle: crate::sks::KeyBagHandle, secret: &[u8]) {
         const MACHINE_REFKEY_PATH: &CStr = c"/var/lib/aurora-sep-refkey.bin";
         const MACHINE_REFKEY_V2_PATH: &CStr = c"/var/lib/aurora-sep-refkey-v2.bin";
-        let path = if *crate::module_parameters::refkey_v2.value() != 0 {
+        let path = if crate::module_parameters::refkey_v2.value() != 0 {
             MACHINE_REFKEY_V2_PATH
         } else {
             MACHINE_REFKEY_PATH
@@ -248,9 +248,22 @@ impl SepData {
     pub(crate) fn refkey_seal_trusted(&self, key: &[u8]) -> Result<KVec<u8>> {
         self.wait_for_trusted_ready()?;
         self.ensure_machine_refkey()?;
-        let guard = self.machine_refkey.lock();
-        let mk = guard.as_ref().ok_or(ENODEV)?;
-        refkey_seal::ecies_seal(&mk.pub_raw, key)
+        let sealed = {
+            let guard = self.machine_refkey.lock();
+            let mk = guard.as_ref().ok_or(ENODEV)?;
+            refkey_seal::ecies_seal(&mk.pub_raw, key)?
+        };
+
+        // The cached public key can still encrypt after the identity bag
+        // stops admitting its private ref-key. Do not return a new trusted
+        // blob unless this bag can recover it. Release the cache lock before
+        // unsealing, which acquires that lock again.
+        let recovered = crate::Secret(self.refkey_unseal_trusted(&sealed)?);
+        if &*recovered != key {
+            dev_err!(self.dev, "trusted-keys: refusing a new blob whose private-key round trip failed\n");
+            return Err(EIO);
+        }
+        Ok(sealed)
     }
 
     pub(crate) fn refkey_unseal_trusted(&self, sealed: &[u8]) -> Result<KVec<u8>> {

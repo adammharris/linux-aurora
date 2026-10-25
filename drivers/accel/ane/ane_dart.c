@@ -174,7 +174,7 @@ bool ane_dart_faulted(struct ane_device *ane, u64 *iova, u32 *status)
  * A fault is a missing PTE, nothing more: the page tables are provider
  * owned and unchanged, so the stream-restore apple-dart uses at reset
  * time is the wrong tool mid-job (register surgery while the faulting
- * transaction is retried is what killed jwm1 twice). Instead the faulted
+ * transaction is retried takes the machine down). Instead the faulted
  * IOVA is handed a throwaway DART page, so the retried transaction
  * completes and the engine drains on its own; the scratch pages are
  * unmapped once the request has been failed cleanly.
@@ -184,14 +184,14 @@ bool ane_dart_faulted(struct ane_device *ane, u64 *iova, u32 *status)
  * allocator knows nothing about a raw iommu_map. A scratch PTE that
  * outlives its release path (any future bug on the wedge side) would
  * then sit, untracked, in a range the allocator considers free: the
- * next BO_INIT maps onto it and dies in dart_init_pte's "we require an
- * unmap first" WARN (m1-test-host 2026-09-25, iommu_map failed at 0x4000). So
- * the scratch range is RESERVED in the allocator first: a node-tracked
- * mapping can never collide with a later BO_INIT, and a scratch whose
- * release is skipped degrades into a bounded, benign leak instead of a
- * poisoned address space. Reserve failure means a live BO node already
- * owns the faulting page (a wild descriptor, not a hole): refuse and
- * let the caller wedge, fail closed.
+ * next BO_INIT maps onto it and fails with dart_init_pte's "we require
+ * an unmap first" WARN. So the scratch range is RESERVED in the
+ * allocator first: a node-tracked mapping can never collide with a
+ * later BO_INIT, and a scratch whose release is skipped degrades into
+ * a bounded, benign leak instead of a poisoned address space. Reserve
+ * failure means a live BO node already owns the faulting page (a wild
+ * descriptor, not a hole): refuse and let the caller wedge, fail
+ * closed.
  */
 int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
 			 struct ane_dart_scratch *scratch, int *pages)

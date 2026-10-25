@@ -9,8 +9,6 @@
 
 /dts-v1/;
 
-#define ENABLE_DCPEXT_TYPEC
-
 #define NO_DCP
 
 #include "t6022.dtsi"
@@ -24,13 +22,23 @@
 	aliases {
 		atcphy4 = &atcphy0_die1;
 		atcphy5 = &atcphy1_die1;
+		usb4-4-acio = &usb4_0_acio_die1;
+		usb4-4-nhi = &usb4_0_nhi_die1;
+		usb4-5-acio = &usb4_1_acio_die1;
+		usb4-5-nhi = &usb4_1_nhi_die1;
+
 		/delete-property/ dcp;
 		/delete-property/ sio;
+
+		usb4_4_rc = &usb4_0_acio_die1;
+		usb4_4_nhi = &usb4_0_nhi_die1;
+		usb4_5_rc = &usb4_1_acio_die1;
+		usb4_5_nhi = &usb4_1_nhi_die1;
 	};
 };
 
 &sio {
-        status = "disabled";
+	status = "disabled";
 };
 
 &framebuffer0 {
@@ -60,6 +68,8 @@
 	label = "USB-C Front Left";
 };
 
+#include "hwmon-fan-dual.dtsi"
+
 /* delete unused USB nodes on die 1 */
 /delete-node/ &dwc3_2_dart_0_die1;
 /delete-node/ &dwc3_2_dart_1_die1;
@@ -72,6 +82,12 @@
 /delete-node/ &dwc3_3_die1;
 /delete-node/ &atcphy3_die1;
 /delete-node/ &atcphy3_xbar_die1;
+
+/delete-node/ &usb4_2_acio_die1;
+/delete-node/ &usb4_2_mbox_die1;
+
+/delete-node/ &usb4_3_acio_die1;
+/delete-node/ &usb4_3_mbox_die1;
 
 /* delete unused always-on power-domains on die 1 */
 /delete-node/ &ps_atc2_usb_aon_die1;
@@ -94,5 +110,3 @@
 	compatible = "apple,j475-macaudio", "apple,j375-macaudio", "apple,macaudio";
 	model = "Mac Studio J475";
 };
-
-#include "hwmon-fan-dual.dtsi"

@@ -17,27 +17,27 @@ description: |
 
   The controller can be polled when interrupt resources are not supplied.
 
+  T8132 omits the register-selection interrupt, so selection is polled while
+  event, standby and wakeup notifications use interrupts.
+
 properties:
   compatible:
-    enum:
-      - apple,sn201202x
+    oneOf:
+      - const: apple,sn201202x
+      - items:
+          - const: apple,t8132-sn201202x
+          - const: apple,sn201202x
 
   reg:
     maxItems: 1
 
   interrupts:
-    items:
-      - description: Primary irq used for tps6598x events
-      - description: Logical register selection completed
-      - description: Standby command completed
-      - description: Wakeup command completed
+    minItems: 3
+    maxItems: 4
 
   interrupt-names:
-    items:
-      - const: irq
-      - const: select
-      - const: sleep
-      - const: wake
+    minItems: 3
+    maxItems: 4
 
   connector:
     $ref: /schemas/connector/usb-connector.yaml#
@@ -45,6 +45,39 @@ properties:
 required:
   - compatible
   - reg
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-sn201202x
+    then:
+      properties:
+        interrupts:
+          items:
+            - description: Primary irq used for tps6598x events
+            - description: Standby command completed
+            - description: Wakeup command completed
+        interrupt-names:
+          items:
+            - const: irq
+            - const: sleep
+            - const: wake
+    else:
+      properties:
+        interrupts:
+          items:
+            - description: Primary irq used for tps6598x events
+            - description: Logical register selection completed
+            - description: Standby command completed
+            - description: Wakeup command completed
+        interrupt-names:
+          items:
+            - const: irq
+            - const: select
+            - const: sleep
+            - const: wake
 
 dependentRequired:
   interrupts: [interrupt-names]

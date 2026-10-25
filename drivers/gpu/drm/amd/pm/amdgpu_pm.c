@@ -34,6 +34,7 @@
 #include <linux/nospec.h>
 #include <linux/pm_runtime.h>
 #include <linux/string_choices.h>
+#include <linux/units.h>
 #include <asm/processor.h>
 
 #define MAX_NUM_OF_FEATURES_PER_SUBSET		8
@@ -97,6 +98,37 @@ const char * const amdgpu_pp_profile_name[] = {
 	"CAPPED",
 	"UNCAPPED",
 };
+
+static int amdgpu_pm_parse_long_params(char *str, long *params,
+				       uint32_t max_params,
+				       uint32_t *num_params)
+{
+	const char delimiter[] = { ' ', '\n', '\0' };
+	uint32_t count = 0;
+	char *sub_str;
+	int ret;
+
+	if (!params || !num_params)
+		return -EINVAL;
+
+	while ((sub_str = strsep(&str, delimiter)) != NULL) {
+		if (strlen(sub_str) == 0)
+			continue;
+		if (count >= max_params)
+			return -EINVAL;
+		ret = kstrtol(sub_str, 0, &params[count]);
+		if (ret)
+			return -EINVAL;
+		count++;
+		if (!str)
+			break;
+		while (isspace(*str))
+			str++;
+	}
+	*num_params = count;
+
+	return 0;
+}
 
 /**
  * amdgpu_pm_dev_state_check - Check if device can be accessed.
@@ -761,8 +793,6 @@ static ssize_t amdgpu_set_pp_od_clk_voltage(struct device *dev,
 	long parameter[64];
 	char buf_cpy[128];
 	char *tmp_str;
-	char *sub_str;
-	const char delimiter[3] = {' ', '\n', '\0'};
 	uint32_t type;
 
 	if (count > 127 || count == 0)
@@ -797,20 +827,10 @@ static ssize_t amdgpu_set_pp_od_clk_voltage(struct device *dev,
 		tmp_str++;
 	while (isspace(*++tmp_str));
 
-	while ((sub_str = strsep(&tmp_str, delimiter)) != NULL) {
-		if (strlen(sub_str) == 0)
-			continue;
-		ret = kstrtol(sub_str, 0, &parameter[parameter_size]);
-		if (ret)
-			return -EINVAL;
-		parameter_size++;
-
-		if (!tmp_str)
-			break;
-
-		while (isspace(*tmp_str))
-			tmp_str++;
-	}
+	ret = amdgpu_pm_parse_long_params(
+		tmp_str, parameter, ARRAY_SIZE(parameter), &parameter_size);
+	if (ret)
+		return ret;
 
 	ret = amdgpu_pm_get_access(adev);
 	if (ret < 0)
@@ -868,6 +888,8 @@ static ssize_t amdgpu_get_pp_od_clk_voltage(struct device *dev,
 
 	for (clk_index = 0 ; clk_index < ARRAY_SIZE(od_clocks) ; clk_index++) {
 		amdgpu_dpm_emit_clock_levels(adev, od_clocks[clk_index], buf, &size);
+		if (unlikely(size >= (PAGE_SIZE - 1)))
+			break;
 	}
 
 	if (size == 0)
@@ -1381,42 +1403,31 @@ static ssize_t amdgpu_set_pp_power_profile_mode(struct device *dev,
 	struct amdgpu_device *adev = drm_to_adev(ddev);
 	uint32_t parameter_size = 0;
 	long parameter[64];
-	char *sub_str, buf_cpy[128];
-	char *tmp_str;
-	uint32_t i = 0;
+	char buf_cpy[128];
 	char tmp[2];
 	long int profile_mode = 0;
-	const char delimiter[3] = {' ', '\n', '\0'};
 
 	/* Reject empty/whitespace strings - fuzzing found this is not validated */
 	if (count == 0 || sysfs_streq(buf, ""))
 		return -EINVAL;
 
-	tmp[0] = *(buf);
+	tmp[0] = *(buf++);
 	tmp[1] = '\0';
 	ret = kstrtol(tmp, 0, &profile_mode);
 	if (ret)
 		return -EINVAL;
 
 	if (profile_mode == PP_SMC_POWER_PROFILE_CUSTOM) {
-		if (count < 2 || count > 127)
+		if (count < 2 || count > sizeof(buf_cpy))
 			return -EINVAL;
-		while (isspace(*++buf))
-			i++;
-		memcpy(buf_cpy, buf, count-i);
-		tmp_str = buf_cpy;
-		while ((sub_str = strsep(&tmp_str, delimiter)) != NULL) {
-			if (strlen(sub_str) == 0)
-				continue;
-			ret = kstrtol(sub_str, 0, &parameter[parameter_size]);
-			if (ret)
-				return -EINVAL;
-			parameter_size++;
-			if (!tmp_str)
-				break;
-			while (isspace(*tmp_str))
-				tmp_str++;
-		}
+		while (isspace(*buf))
+			buf++;
+		strscpy(buf_cpy, buf, sizeof(buf_cpy));
+		ret = amdgpu_pm_parse_long_params(buf_cpy, parameter,
+						  ARRAY_SIZE(parameter) - 1,
+						  &parameter_size);
+		if (ret)
+			return ret;
 	}
 	parameter[parameter_size] = profile_mode;
 
@@ -1627,6 +1638,10 @@ static ssize_t amdgpu_set_thermal_throttling_logging(struct device *dev,
 	ret = kstrtol(buf, 0, &throttling_logging_interval);
 	if (ret)
 		return ret;
+
+	/* Reject negative values - only 0 (disable) or 1-3600 (seconds) are valid */
+	if (throttling_logging_interval < 0)
+		return -EINVAL;
 
 	if (throttling_logging_interval > 3600)
 		return -EINVAL;
@@ -1870,12 +1885,12 @@ static ssize_t amdgpu_set_smartshift_bias(struct device *dev,
 {
 	struct drm_device *ddev = dev_get_drvdata(dev);
 	struct amdgpu_device *adev = drm_to_adev(ddev);
-	int r = 0;
+	int r;
 	int bias = 0;
 
 	r = kstrtoint(buf, 10, &bias);
 	if (r)
-		goto out;
+		return r;
 
 	r = amdgpu_pm_get_access(adev);
 	if (r < 0)
@@ -1887,14 +1902,12 @@ static ssize_t amdgpu_set_smartshift_bias(struct device *dev,
 		bias = AMDGPU_SMARTSHIFT_MIN_BIAS;
 
 	amdgpu_smartshift_bias = bias;
-	r = count;
 
 	/* TODO: update bias level with SMU message */
 
-out:
 	amdgpu_pm_put_access(adev);
 
-	return r;
+	return count;
 }
 
 static int ss_power_attr_update(struct amdgpu_device *adev, struct amdgpu_device_attr *attr,
@@ -2010,6 +2023,7 @@ static int pp_dpm_clk_default_attr_update(struct amdgpu_device *adev, struct amd
 		      gc_ver == IP_VERSION(11, 0, 1) ||
 		      gc_ver == IP_VERSION(11, 0, 4) ||
 		      gc_ver == IP_VERSION(11, 5, 0) ||
+		      gc_ver == IP_VERSION(11, 5, 1) ||
 		      gc_ver == IP_VERSION(11, 0, 2) ||
 		      gc_ver == IP_VERSION(11, 0, 3) ||
 		      amdgpu_is_multi_aid(adev)))
@@ -2018,7 +2032,8 @@ static int pp_dpm_clk_default_attr_update(struct amdgpu_device *adev, struct amd
 		if (!((gc_ver == IP_VERSION(10, 3, 1) ||
 		       gc_ver == IP_VERSION(10, 3, 0) ||
 		       gc_ver == IP_VERSION(11, 0, 2) ||
-		       gc_ver == IP_VERSION(11, 0, 3)) && adev->vcn.num_vcn_inst >= 2))
+		       gc_ver == IP_VERSION(11, 0, 3) ||
+		       gc_ver == IP_VERSION(11, 5, 1)) && adev->vcn.num_vcn_inst >= 2))
 			*states = ATTR_STATE_UNSUPPORTED;
 	} else if (DEVICE_ATTR_IS(pp_dpm_dclk)) {
 		if (!(gc_ver == IP_VERSION(10, 3, 1) ||
@@ -2031,6 +2046,7 @@ static int pp_dpm_clk_default_attr_update(struct amdgpu_device *adev, struct amd
 		      gc_ver == IP_VERSION(11, 0, 1) ||
 		      gc_ver == IP_VERSION(11, 0, 4) ||
 		      gc_ver == IP_VERSION(11, 5, 0) ||
+		      gc_ver == IP_VERSION(11, 5, 1) ||
 		      gc_ver == IP_VERSION(11, 0, 2) ||
 		      gc_ver == IP_VERSION(11, 0, 3) ||
 		      amdgpu_is_multi_aid(adev)))
@@ -2039,23 +2055,35 @@ static int pp_dpm_clk_default_attr_update(struct amdgpu_device *adev, struct amd
 		if (!((gc_ver == IP_VERSION(10, 3, 1) ||
 		       gc_ver == IP_VERSION(10, 3, 0) ||
 		       gc_ver == IP_VERSION(11, 0, 2) ||
-		       gc_ver == IP_VERSION(11, 0, 3)) && adev->vcn.num_vcn_inst >= 2))
+		       gc_ver == IP_VERSION(11, 0, 3) ||
+		       gc_ver == IP_VERSION(11, 5, 1)) && adev->vcn.num_vcn_inst >= 2))
 			*states = ATTR_STATE_UNSUPPORTED;
 	} else if (DEVICE_ATTR_IS(pp_dpm_pcie)) {
-		if (gc_ver == IP_VERSION(9, 4, 2) ||
-		    amdgpu_is_multi_aid(adev))
+		if (amdgpu_is_multi_aid(adev))
 			*states = ATTR_STATE_UNSUPPORTED;
 	}
 
 	switch (gc_ver) {
 	case IP_VERSION(9, 4, 1):
-	case IP_VERSION(9, 4, 2):
-		/* the Mi series card does not support standalone mclk/socclk/fclk level setting */
+		/* Arcturus does not support standalone mclk/socclk/fclk level setting */
 		if (DEVICE_ATTR_IS(pp_dpm_mclk) ||
 		    DEVICE_ATTR_IS(pp_dpm_socclk) ||
 		    DEVICE_ATTR_IS(pp_dpm_fclk)) {
 			dev_attr->attr.mode &= ~S_IWUGO;
 			dev_attr->store = NULL;
+		}
+		break;
+	case IP_VERSION(9, 4, 2):
+		if (DEVICE_ATTR_IS(pp_dpm_mclk) ||
+		    DEVICE_ATTR_IS(pp_dpm_socclk)) {
+			/* Aldebaran mclk/socclk DPM only supports voltage control,
+			 * not allow to set dpm level directly */
+			dev_attr->attr.mode &= ~S_IWUGO;
+			dev_attr->store = NULL;
+		} else if (DEVICE_ATTR_IS(pp_dpm_fclk) ||
+			   DEVICE_ATTR_IS(pp_dpm_pcie)) {
+			/* Aldebaran does not support fclk/pcie dpm */
+			*states = ATTR_STATE_UNSUPPORTED;
 		}
 		break;
 	default:
@@ -3927,17 +3955,14 @@ out_pm_put:
 	return size;
 }
 
-static int parse_input_od_command_lines(const char *buf,
-					size_t count,
-					u32 *type,
-					long *params,
+static int parse_input_od_command_lines(const char *buf, size_t count,
+					u32 *type, long *params,
+					uint32_t max_params,
 					uint32_t *num_of_params)
 {
-	const char delimiter[3] = {' ', '\n', '\0'};
 	uint32_t parameter_size = 0;
 	char buf_cpy[128] = {0};
-	char *tmp_str, *sub_str;
-	int ret;
+	char *tmp_str;
 
 	if (count > sizeof(buf_cpy) - 1)
 		return -EINVAL;
@@ -3962,25 +3987,8 @@ static int parse_input_od_command_lines(const char *buf,
 		break;
 	}
 
-	while ((sub_str = strsep(&tmp_str, delimiter)) != NULL) {
-		if (strlen(sub_str) == 0)
-			continue;
-
-		ret = kstrtol(sub_str, 0, &params[parameter_size]);
-		if (ret)
-			return -EINVAL;
-		parameter_size++;
-
-		if (!tmp_str)
-			break;
-
-		while (isspace(*tmp_str))
-			tmp_str++;
-	}
-
-	*num_of_params = parameter_size;
-
-	return 0;
+	return amdgpu_pm_parse_long_params(tmp_str, params, max_params,
+					   num_of_params);
 }
 
 static int
@@ -3993,10 +4001,8 @@ amdgpu_distribute_custom_od_settings(struct amdgpu_device *adev,
 	long parameter[64];
 	int ret;
 
-	ret = parse_input_od_command_lines(in_buf,
-					   count,
-					   &cmd_type,
-					   parameter,
+	ret = parse_input_od_command_lines(in_buf, count, &cmd_type, parameter,
+					   ARRAY_SIZE(parameter),
 					   &parameter_size);
 	if (ret)
 		return ret;
@@ -4871,9 +4877,8 @@ static int amdgpu_debugfs_pm_info_pp(struct seq_file *m, struct amdgpu_device *a
 {
 	uint32_t mp1_ver = amdgpu_ip_version(adev, MP1_HWIP, 0);
 	uint32_t gc_ver = amdgpu_ip_version(adev, GC_HWIP, 0);
-	uint32_t value, mwatt, centiwatt;
 	uint64_t value64 = 0;
-	uint32_t query = 0;
+	uint32_t value;
 	int size;
 
 	/* GPU Clocks */
@@ -4894,25 +4899,22 @@ static int amdgpu_debugfs_pm_info_pp(struct seq_file *m, struct amdgpu_device *a
 		seq_printf(m, "\t%u mV (VDDGFX)\n", value);
 	if (!amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_VDDNB, (void *)&value, &size))
 		seq_printf(m, "\t%u mV (VDDNB)\n", value);
-	size = sizeof(uint32_t);
-	if (!amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_GPU_AVG_POWER, (void *)&query, &size)) {
-		mwatt = query;
-		centiwatt = DIV_ROUND_CLOSEST(mwatt, 10);
+	if (!amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_GPU_AVG_POWER, (void *)&value, &size)) {
 		if (adev->flags & AMD_IS_APU)
-			seq_printf(m, "\t%u.%02u W (average SoC including CPU)\n", centiwatt / 100, centiwatt % 100);
+			seq_printf(m, "\t%u.%02u W (average SoC including CPU)\n",
+				   (u32)(value / MILLIWATT_PER_WATT), (u32)(value % MILLIWATT_PER_WATT) / 10);
 		else
-			seq_printf(m, "\t%u.%02u W (average SoC)\n", centiwatt / 100, centiwatt % 100);
+			seq_printf(m, "\t%u.%02u W (average SoC)\n",
+				   (u32)(value / MILLIWATT_PER_WATT), (u32)(value % MILLIWATT_PER_WATT) / 10);
 	}
-	size = sizeof(uint32_t);
-	if (!amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_GPU_INPUT_POWER, (void *)&query, &size)) {
-		mwatt = query;
-		centiwatt = DIV_ROUND_CLOSEST(mwatt, 10);
+	if (!amdgpu_dpm_read_sensor(adev, AMDGPU_PP_SENSOR_GPU_INPUT_POWER, (void *)&value, &size)) {
 		if (adev->flags & AMD_IS_APU)
-			seq_printf(m, "\t%u.%02u W (current SoC including CPU)\n", centiwatt / 100, centiwatt % 100);
+			seq_printf(m, "\t%u.%02u W (current SoC including CPU)\n",
+				   (u32)(value / MILLIWATT_PER_WATT), (u32)(value % MILLIWATT_PER_WATT) / 10);
 		else
-			seq_printf(m, "\t%u.%02u W (current SoC)\n", centiwatt / 100, centiwatt % 100);
+			seq_printf(m, "\t%u.%02u W (current SoC)\n",
+				   (u32)(value / MILLIWATT_PER_WATT), (u32)(value % MILLIWATT_PER_WATT) / 10);
 	}
-	size = sizeof(value);
 	seq_printf(m, "\n");
 
 	/* GPU Temp */

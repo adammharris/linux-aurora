@@ -1,0 +1,533 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J713 power-domain ownership.
+ *
+ * Only the domains whose Linux power/reset contract is qualified are enabled.
+ * Retained core, GPIO and display domains are firmware-owned: neither state
+ * reads nor power/reset writes are permitted. Other domains stay unavailable
+ * until their consumer and power sequence are implemented. This board policy
+ * is also used by the adapter for the original J713 loader tree.
+ */
+
+&ps_msg {
+	status = "disabled";
+};
+
+&ps_aic {
+	status = "okay";
+	apple,firmware-owned;
+};
+
+&ps_dwi {
+	status = "disabled";
+};
+
+&ps_gpio {
+	status = "okay";
+	apple,firmware-owned;
+};
+
+&ps_pmc {
+	status = "disabled";
+};
+
+&ps_pms_fpwm0 {
+	status = "disabled";
+};
+
+&ps_pms_fpwm1 {
+	status = "disabled";
+};
+
+&ps_pms_fpwm2 {
+	status = "disabled";
+};
+
+&ps_pms_fpwm3 {
+	status = "disabled";
+};
+
+&ps_pms_fpwm4 {
+	status = "disabled";
+};
+
+&ps_pms_c1ppt {
+	status = "disabled";
+};
+
+&ps_soc_rc {
+	status = "disabled";
+};
+
+&ps_soc_dpe {
+	status = "disabled";
+};
+
+&ps_pmgr_soc_ocla {
+	status = "disabled";
+};
+
+&ps_ap_tmm {
+	status = "disabled";
+};
+
+&ps_dispext0_sys {
+	status = "disabled";
+};
+
+&ps_dispext0_fe {
+	status = "disabled";
+};
+
+&ps_dispext0_cpu {
+	status = "disabled";
+};
+
+&ps_scodec {
+	status = "disabled";
+};
+
+&ps_scodec_streaming {
+	status = "disabled";
+};
+
+&ps_disp_sys {
+	status = "okay";
+	apple,firmware-owned;
+};
+
+&ps_disp_fe {
+	status = "okay";
+	apple,firmware-owned;
+};
+
+&ps_gfx {
+	status = "disabled";
+};
+
+&ps_sio_cpu {
+	status = "disabled";
+};
+
+&ps_fpwm0 {
+	status = "disabled";
+};
+
+&ps_fpwm1 {
+	status = "okay";
+};
+
+&ps_fpwm2 {
+	status = "disabled";
+};
+
+&ps_i2c0 {
+	status = "disabled";
+};
+
+&ps_i2c1 {
+	status = "disabled";
+};
+
+&ps_i2c2 {
+	status = "disabled";
+};
+
+&ps_i2c3 {
+	status = "disabled";
+};
+
+&ps_i2c4 {
+	status = "disabled";
+};
+
+&ps_i2c5 {
+	status = "disabled";
+};
+
+&ps_i2c6 {
+	status = "disabled";
+};
+
+&ps_i2c7 {
+	status = "disabled";
+};
+
+&ps_i2c8 {
+	status = "disabled";
+};
+
+&ps_spi_p {
+	status = "okay";
+};
+
+&ps_uart_p {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "disabled";
+};
+
+&ps_aes {
+	status = "disabled";
+};
+
+&ps_spi0 {
+	status = "disabled";
+};
+
+&ps_afiaft {
+	status = "disabled";
+};
+
+&ps_venc_sys {
+	status = "disabled";
+};
+
+&ps_spi1 {
+	status = "disabled";
+};
+
+&ps_atc0_common {
+	status = "disabled";
+};
+
+&ps_spi2 {
+	status = "disabled";
+};
+
+&ps_spi3 {
+	status = "disabled";
+};
+
+&ps_spi4 {
+	status = "disabled";
+};
+
+&ps_trace_fab {
+	status = "disabled";
+};
+
+&ps_atc0_pcie {
+	status = "disabled";
+};
+
+&ps_atc0_cio {
+	status = "disabled";
+};
+
+&ps_atc0_cio_pcie {
+	status = "disabled";
+};
+
+&ps_spi5 {
+	status = "disabled";
+};
+
+&ps_qspi {
+	status = "okay";
+};
+
+&ps_dptx_phy {
+	status = "disabled";
+};
+
+&ps_uart_n {
+	status = "disabled";
+};
+
+&ps_uart0 {
+	status = "okay";
+};
+
+&ps_uart1 {
+	status = "disabled";
+};
+
+&ps_uart2 {
+	status = "disabled";
+};
+
+&ps_uart3 {
+	status = "disabled";
+};
+
+&ps_uart4 {
+	status = "disabled";
+};
+
+&ps_uart5 {
+	status = "disabled";
+};
+
+&ps_uart6 {
+	status = "disabled";
+};
+
+&ps_dpa0 {
+	status = "disabled";
+};
+
+&ps_dpa1 {
+	status = "disabled";
+};
+
+&ps_atc0_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc1_common {
+	status = "okay";
+	apple,inherited-on;
+};
+
+&ps_atc1_pcie {
+	status = "disabled";
+};
+
+&ps_atc1_cio {
+	status = "disabled";
+};
+
+&ps_atc1_cio_pcie {
+	status = "disabled";
+};
+
+&ps_atc1_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc2_common {
+	status = "disabled";
+};
+
+&ps_atc2_pcie {
+	status = "disabled";
+};
+
+&ps_atc2_cio {
+	status = "disabled";
+};
+
+&ps_atc2_cio_pcie {
+	status = "disabled";
+};
+
+&ps_dpa2 {
+	status = "disabled";
+};
+
+&ps_atc2_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc3_common {
+	status = "disabled";
+};
+
+&ps_pmp {
+	status = "okay";
+};
+
+&ps_pms_sram {
+	status = "okay";
+};
+
+&ps_atc3_pcie {
+	status = "disabled";
+};
+
+&ps_atc3_cio {
+	status = "disabled";
+};
+
+&ps_dpa3 {
+	status = "disabled";
+};
+
+&ps_atc3_cio_pcie {
+	status = "disabled";
+};
+
+&ps_atc3_cio_usb {
+	status = "disabled";
+};
+
+&ps_dpa4 {
+	status = "disabled";
+};
+
+&ps_apcie_gp {
+	status = "disabled";
+};
+
+&ps_apcie_sys_gp {
+	status = "disabled";
+};
+
+&ps_dispext1_sys {
+	status = "disabled";
+};
+
+&ps_dispext1_fe {
+	status = "disabled";
+};
+
+&ps_dispext1_cpu {
+	status = "disabled";
+};
+
+&ps_ans {
+	status = "okay";
+};
+
+&ps_apcie_st {
+	status = "okay";
+};
+
+&ps_apcie_sys_st {
+	status = "okay";
+};
+
+&ps_apcie_phy_sw {
+	status = "disabled";
+};
+
+&ps_msr {
+	status = "disabled";
+};
+
+&ps_msr_ase_core {
+	status = "disabled";
+};
+
+&ps_ane_sys {
+	status = "disabled";
+};
+
+&ps_jpg {
+	status = "disabled";
+};
+
+&ps_avd_sys {
+	status = "disabled";
+};
+
+&ps_sep {
+	status = "disabled";
+};
+
+&ps_venc_dma {
+	status = "disabled";
+};
+
+&ps_venc_pipe4 {
+	status = "disabled";
+};
+
+&ps_venc_pipe5 {
+	status = "disabled";
+};
+
+&ps_venc_me0 {
+	status = "disabled";
+};
+
+&ps_venc_me1 {
+	status = "disabled";
+};
+
+&ps_ane_mpm {
+	status = "disabled";
+};
+
+&ps_ane_cpu {
+	status = "disabled";
+};
+
+&ps_ane_td {
+	status = "disabled";
+};
+
+&ps_ane_base {
+	status = "disabled";
+};
+
+&ps_disp_cpu {
+	status = "okay";
+	apple,firmware-owned;
+};
+
+&ps_debug_gated {
+	status = "disabled";
+};
+
+&ps_nub_spmi0 {
+	status = "disabled";
+};
+
+&ps_nub_spmi1 {
+	status = "disabled";
+};
+
+&ps_nub_spmi_a0 {
+	status = "disabled";
+};
+
+&ps_nub_spmi_a1 {
+	status = "disabled";
+};
+
+&ps_nub_spi0 {
+	status = "disabled";
+};
+
+&ps_nub_ocla {
+	status = "disabled";
+};
+
+&ps_nub_gpio {
+	status = "okay";
+	apple,firmware-owned;
+};
+
+&ps_nub_sram {
+	status = "disabled";
+};
+
+&ps_debug_switch {
+	status = "disabled";
+};
+
+&ps_atc0_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc1_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc0_usb {
+	status = "disabled";
+};
+
+&ps_atc1_usb {
+	status = "disabled";
+};
+
+&ps_atc2_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc3_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc2_usb {
+	status = "disabled";
+};
+
+&ps_atc3_usb {
+	status = "disabled";
+};

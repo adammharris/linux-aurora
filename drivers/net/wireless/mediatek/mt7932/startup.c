@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <crypto/sha2.h>
+#include <linux/ctype.h>
+#include <linux/debugfs.h>
 #include <linux/rtnetlink.h>
+#include <linux/seq_file.h>
 
 #include "mt7932.h"
 
 static int mt_stock_config(struct mt7932 *m);
-static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot *reg,
-			     const struct mt7932_policy *policy);
+static noinline_for_stack int mt_publish_policy(struct mt7932 *m,
+						const struct mt7932_reg_snapshot *reg,
+						const struct mt7932_policy *policy);
 static int mt_privacy_defaults(struct mt7932 *m);
 static int mt_startup_once(struct mt7932 *m);
 static void mt_startup_work(struct work_struct *work);
 static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request *request);
+static const char *mt7932_policy_fallback_reason(int fallback);
 
 struct mt_config_record {
 	u8 type, key_len, value_len, reserved;
@@ -137,11 +143,15 @@ out:
 	return ret;
 }
 
-static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot *reg,
-			     const struct mt7932_policy *policy)
+static noinline_for_stack int mt_publish_policy(struct mt7932 *m,
+						const struct mt7932_reg_snapshot *reg,
+						const struct mt7932_policy *policy)
 {
 	u8 dbdc[36] = {0,0,0,0,2,0,36};
 	unsigned int i;
+	struct mt7932_6g_limits limits = mt7932_6g_limits(reg);
+	u8 body[1020];
+	unsigned int j;
 	int ret;
 
 	if (!m->startup_started) {
@@ -154,7 +164,14 @@ static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot 
 		if (ret)
 			return ret;
 	}
-	ret = mt_request(m, 0x0f, true, true, false, reg->domain, reg->length);
+	memcpy(body, reg->domain, reg->length);
+	for (j = reg->domain[8] + reg->domain[9];
+	     j < reg->domain[8] + reg->domain[9] + reg->domain[10]; j++) {
+		u32 flags = get_unaligned_le32(body + 16 + j * 8);
+
+		put_unaligned_le32(flags & ~IEEE80211_CHAN_PSD, body + 16 + j * 8);
+	}
+	ret = mt_request(m, 0x0f, true, true, false, body, reg->length);
 	if (ret)
 		return ret;
 	for (i = 0; i < MT7932_POLICY_TABLES; i++) {
@@ -162,6 +179,21 @@ static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot 
 		if (ret)
 			return ret;
 	}
+	m->six_power_valid = false;
+	for (i = 0; i < policy->six_pages; i++) {
+		memcpy(body, policy->six_page[i], policy->six_length[i]);
+		if (policy->six_cid[i] == 0x5d)
+			mt7932_6g_limit_page(body, &limits);
+		ret = mt_request(m, policy->six_cid[i], true, true, false,
+				 body, policy->six_length[i]);
+		for (j = 0; j < 2; j++)
+			if (policy->six_page[i] == policy->assoc_power[j])
+				memcpy(m->six_assoc_power[j], body, 1020);
+		if (ret)
+			return ret;
+	}
+	if (policy->six_pages)
+		m->six_power_valid = true;
 	/* Native SETs have no response/atomic policy-commit event. Command
 	 * submission is not misrepresented as firmware readback or an ACK.
 	 */
@@ -236,8 +268,11 @@ static int mt_startup_once(struct mt7932 *m)
 
 static struct ieee80211_channel *mt_channel(struct mt7932 *m, unsigned int i)
 {
-	return i < MT7932_CHANNELS_2G ? &m->channels[i] :
-	       &m->channels5[i - MT7932_CHANNELS_2G];
+	if (i < MT7932_CHANNELS_2G)
+		return &m->channels[i];
+	i -= MT7932_CHANNELS_2G;
+	return i < MT7932_CHANNELS_5G ? &m->channels5[i] :
+		&m->channels6[i - MT7932_CHANNELS_5G];
 }
 
 /* Keep cfg80211's channel list in step with the channels the country
@@ -265,7 +300,15 @@ static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *poli
 	wiphy_lock(m->wiphy);
 	for (i = 0; i < MT7932_CHANNELS; i++) {
 		struct ieee80211_channel *channel = mt_channel(m, i);
-		bool forbidden = !mt7932_policy_permits(policy, channel->hw_value);
+		bool forbidden = !mt7932_policy_permits(policy, channel->band, channel->hw_value);
+
+		if (!forbidden && channel->band == NL80211_BAND_6GHZ) {
+			const struct ieee80211_reg_rule *rule;
+
+			rule = freq_reg_info(m->wiphy, MHZ_TO_KHZ(channel->center_freq));
+			if (!IS_ERR(rule) && !(rule->flags & NL80211_RRF_NO_IR))
+				channel->flags &= ~IEEE80211_CHAN_NO_IR;
+		}
 
 		__assign_bit(i, m->policy_disabled, forbidden);
 		if (forbidden)
@@ -307,15 +350,62 @@ void mt_retry_missing_policy(struct mt7932 *m)
 	spin_unlock_irqrestore(&m->response_lock, flags);
 }
 
+static int mt_policy_get(void *ctx, const char *path, struct mt7932_policy_file *file)
+{
+	struct mt7932 *m = ctx;
+	const struct firmware *fw;
+	int ret;
+
+	/* Every candidate but the last is optional: no warning on a miss. */
+	ret = request_firmware_direct(&fw, path, &m->pdev->dev);
+	if (ret) {
+		dev_dbg(&m->pdev->dev, "REGULATORY_PACKAGE_MISSING: %s: %d\n", path, ret);
+		return ret;
+	}
+	file->handle = fw;
+	file->data = fw->data;
+	file->size = fw->size;
+	return 0;
+}
+
+static void mt_policy_put(void *ctx, struct mt7932_policy_file *file)
+{
+	release_firmware(file->handle);
+	file->handle = NULL;
+}
+
+static void mt_policy_report(struct mt7932 *m, const struct mt7932_policy_choice *choice,
+			     int ret)
+{
+	char path[MT7932_POLICY_PATH_MAX];
+	unsigned int i;
+
+	for (i = 0; i < choice->n_tried; i++) {
+		if (choice->tried[i].error != -EINVAL)
+			continue;
+		mt7932_policy_path(path, sizeof(path), choice->tried[i].source, choice->alpha2);
+		dev_warn_ratelimited(&m->pdev->dev, "local input %s has invalid policy: %d\n",
+				     path, -EINVAL);
+	}
+	if (ret || choice->source != MT7932_POLICY_WORLD || !choice->fallback)
+		return;
+	dev_info(&m->pdev->dev, "REGULATORY_FALLBACK: %c%c firmware=XZ reason=%s, 6 GHz off\n",
+		 choice->alpha2[0], choice->alpha2[1],
+		 mt7932_policy_fallback_reason(choice->fallback));
+}
+
 static void mt_startup_work(struct work_struct *work)
 {
 	struct mt7932 *m = container_of(work, struct mt7932, startup_work);
+	const struct mt7932_policy_loader loader = {
+		.get = mt_policy_get, .put = mt_policy_put, .ctx = m,
+	};
+	struct mt7932_policy_choice choice;
+	struct mt7932_policy_file file;
 	struct mt7932_reg_snapshot reg;
-	struct mt7932_policy policy;
-	const struct firmware *file;
+	struct mt7932_policy *policy;
 	unsigned long flags;
 	u32 generation;
-	char path[64];
 	bool submitted;
 	int ret;
 
@@ -348,35 +438,28 @@ static void mt_startup_work(struct work_struct *work)
 		ret = reg.error;
 		if (READ_ONCE(m->retired_scan_seq))
 			ret = -EBUSY;
-		file = NULL;
+		memset(&file, 0, sizeof(file));
+		memset(&choice, 0, sizeof(choice));
+		memcpy(choice.alpha2, reg.alpha2, 2);
+		policy = NULL;
 		submitted = false;
 		if (READ_ONCE(m->policy_failed) || READ_ONCE(m->link_failed) ||
 		    (m->startup_started && !READ_ONCE(m->rf_ready)))
 			ret = -EIO;
 		if (!ret) {
-			if (!memcmp(reg.alpha2, "00", 2))
-				scnprintf(path, sizeof(path),
-					  "mediatek/mt7932/policy/world-XZ.bin");
-			else
-				scnprintf(path, sizeof(path), "mediatek/mt7932/policy/%c%c.bin",
-					  reg.alpha2[0], reg.alpha2[1]);
-			ret = mt_request_input(m, &file, path);
-		}
-		if (!ret) {
-			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
-			if (!ret) {
-				mt7932_policy_filter(&reg, &policy);
-				mt_policy_disable(m, &policy, generation);
-			} else {
-				dev_err_ratelimited(&m->pdev->dev, "local input %s has invalid policy: %d\n", path, ret);
-			}
+			policy = kzalloc_obj(*policy, GFP_KERNEL);
+			ret = policy ? mt7932_policy_select(&loader, &reg, policy, &file, &choice) :
+				-ENOMEM;
+			mt_policy_report(m, &choice, ret);
+			if (!ret)
+				mt_policy_disable(m, policy, generation);
 		}
 		mutex_lock(&m->command_mutex);
 		if (READ_ONCE(m->stopping) || generation != READ_ONCE(m->reg_generation))
 			goto next;
 		if (!ret) {
 			submitted = true;
-			ret = mt_publish_policy(m, &reg, &policy);
+			ret = mt_publish_policy(m, &reg, policy);
 			if (!ret && !m->startup_started)
 				ret = mt_startup_once(m);
 			/* A partial SET sequence is not a rollback. Only missing or
@@ -394,6 +477,11 @@ static void mt_startup_work(struct work_struct *work)
 				!m->cal_state.error;
 		if (!ret && generation == m->reg_generation)
 			WRITE_ONCE(m->reg_pending, false);
+		if (generation == m->reg_generation) {
+			choice.generation = generation;
+			choice.error = ret;
+			m->policy_choice = choice;
+		}
 		if (ret)
 			dev_warn_ratelimited(&m->pdev->dev, "REGULATORY_BLOCKED: %c%c generation=%u error=%d recovery-required=%u\n",
 				 reg.alpha2[0], reg.alpha2[1], generation, ret,
@@ -405,8 +493,9 @@ static void mt_startup_work(struct work_struct *work)
 		spin_unlock_irqrestore(&m->response_lock, flags);
 next:
 		mutex_unlock(&m->command_mutex);
-		if (file)
-			release_firmware(file);
+		if (file.handle)
+			mt_policy_put(m, &file);
+		kfree(policy);
 	}
 }
 
@@ -423,25 +512,42 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	if (!request)
 		return;
 	memcpy(reg.alpha2, request->alpha2, 2);
-	if (!((reg.alpha2[0] >= 'A' && reg.alpha2[0] <= 'Z' &&
-	       reg.alpha2[1] >= 'A' && reg.alpha2[1] <= 'Z') ||
-	      !memcmp(reg.alpha2, "00", 2)))
+	/* Countries, 00 and cfg80211's numeric codes (98 intersection, 99
+	 * custom); the numeric ones have no package and use the world one.
+	 */
+	if (!mt7932_policy_country(reg.alpha2) &&
+	    !(isdigit(reg.alpha2[0]) && isdigit(reg.alpha2[1])))
 		reg.error = -EOPNOTSUPP;
 	memcpy(reg.domain, reg.alpha2, 2);
 	/* Stock database-present startup resolves the absent 00 row to XZ.
 	 * Keep Linux's world channel restrictions and requested identity; only
 	 * the firmware country/domain and original power package use XZ.
-	 * Never fall back for an arbitrary unsupported explicit country.
+	 * A country without a usable package of its own falls back the same
+	 * way in mt7932_policy_select(), keeping its own channel list: the
+	 * firmware domain is the intersection of both, so the radio stays up
+	 * and is never more permissive than the country or the world profile.
 	 */
 	if (!memcmp(reg.alpha2, "00", 2))
 		memcpy(reg.domain, "XZ", 2);
 	reg.domain[4] = 1; /* 2 GHz remains 20 MHz. */
 	reg.domain[5] = mt7932_domain_5g_bw();
+	reg.domain[6] = 2;
 	for (i = 0; i < MT7932_CHANNELS; i++) {
 		struct ieee80211_channel *channel = mt_channel(m, i);
 		u32 flags = channel->flags;
 
+		if (channel->band == NL80211_BAND_6GHZ) {
+			const struct ieee80211_reg_rule *rule;
+
+			rule = freq_reg_info(m->wiphy, MHZ_TO_KHZ(channel->center_freq));
+			if (!IS_ERR(rule) && !(rule->flags & NL80211_RRF_NO_IR))
+				flags &= ~IEEE80211_CHAN_NO_IR;
+			if (flags & IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT)
+				flags |= IEEE80211_CHAN_DISABLED;
+		}
+
 		reg.power[i] = channel->max_power;
+		reg.psd[i] = channel->psd;
 		if (flags & IEEE80211_CHAN_DISABLED)
 			continue;
 		/* Native per-rate units are not a proven dBm conversion. Do not
@@ -451,8 +557,10 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		 * out of the firmware domain and disabled for cfg80211 instead.
 		 */
 		if (flags & (IEEE80211_CHAN_NO_OFDM | IEEE80211_CHAN_NO_20MHZ |
-			     IEEE80211_CHAN_PSD | IEEE80211_CHAN_IR_CONCURRENT) ||
-		    channel->max_power < 20) {
+			     IEEE80211_CHAN_IR_CONCURRENT) ||
+		    (channel->band != NL80211_BAND_6GHZ &&
+		     ((flags & IEEE80211_CHAN_PSD) || channel->max_power < 20)) ||
+		    (channel->band == NL80211_BAND_6GHZ && channel->max_power < -64)) {
 			channel->flags |= IEEE80211_CHAN_DISABLED;
 			continue;
 		}
@@ -466,7 +574,7 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		 */
 		put_unaligned_le32(flags, reg.domain + 16 + count * 8);
 		count++;
-		reg.domain[i < MT7932_CHANNELS_2G ? 8 : 9]++;
+		reg.domain[8 + mt7932_channel_band(channel->band, channel->hw_value) - 1]++;
 	}
 	reg.length = 12 + count * 8;
 	if (!count)
@@ -548,7 +656,9 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 {
 	static const int rates[] = {10,20,55,110,60,90,120,180,240,360,480,540};
 	static const u32 ciphers[] = { WLAN_CIPHER_SUITE_CCMP };
-	static const u32 akms[] = { WLAN_AKM_SUITE_PSK };
+	static const u32 akms[] = {
+		WLAN_AKM_SUITE_PSK, WLAN_AKM_SUITE_SAE, WLAN_AKM_SUITE_OWE,
+	};
 	unsigned int i;
 	int ret;
 
@@ -567,7 +677,10 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	m->wiphy->akm_suites = akms;
 	m->wiphy->n_akm_suites = ARRAY_SIZE(akms);
 	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
-	m->wiphy->max_scan_ssids = 1;
+	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD);
+	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_OWE_OFFLOAD);
+	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_MFP_OPTIONAL);
+	m->wiphy->max_scan_ssids = MT7932_SCAN_SSIDS;
 	m->wiphy->max_scan_ie_len = 600;
 	m->wiphy->reg_notifier = mt_regulatory_notify;
 	/* World roaming may relax NO_IR after observing an AP beacon without
@@ -593,6 +706,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 		m->rates[i].bitrate = rates[i];
 		m->rates[i].hw_value = i;
 	}
+	m->band2.band = NL80211_BAND_2GHZ;
 	m->band2.channels = m->channels;
 	m->band2.n_channels = ARRAY_SIZE(m->channels);
 	m->band2.bitrates = m->rates;
@@ -621,6 +735,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 			if (!MT7932_MAX_5G_BW)
 				m->channels5[i].flags |= IEEE80211_CHAN_NO_HT40;
 		}
+		m->band5.band = NL80211_BAND_5GHZ;
 		m->band5.channels = m->channels5;
 		m->band5.n_channels = ARRAY_SIZE(m->channels5);
 		m->band5.bitrates = m->rates + 4;
@@ -630,6 +745,35 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	if (mt7932_phy_profile(m->phy_cap)) {
 		mt7932_band_capabilities(&m->band2, false);
 		mt7932_band_capabilities(&m->band5, true);
+		if (m->six_ghz) {
+			for (i = 0; i < MT7932_CHANNELS_6G; i++) {
+				struct ieee80211_channel *ch = &m->channels6[i];
+				unsigned int pair, primary = mt7932_channel_6g(i);
+
+				ch->band = NL80211_BAND_6GHZ;
+				ch->hw_value = primary;
+				ch->center_freq = ieee80211_channel_to_frequency(primary, ch->band);
+				ch->max_power = 14;
+				ch->flags = IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_NO_160MHZ;
+				pair = mt7932_channel_6g_center(primary, false);
+				if (!pair)
+					ch->flags |= IEEE80211_CHAN_NO_HT40;
+				else
+					ch->flags |= pair < primary ? IEEE80211_CHAN_NO_HT40PLUS :
+						IEEE80211_CHAN_NO_HT40MINUS;
+				if (!mt7932_channel_6g_center(primary, true))
+					ch->flags |= IEEE80211_CHAN_NO_80MHZ;
+			}
+			m->band6.band = NL80211_BAND_6GHZ;
+			m->band6.channels = m->channels6;
+			m->band6.n_channels = MT7932_CHANNELS_6G;
+			m->band6.bitrates = m->rates + 4;
+			m->band6.n_bitrates = ARRAY_SIZE(m->rates) - 4;
+			mt7932_he_6g_capabilities(&m->he6, &m->band5);
+			m->band6.iftype_data = &m->he6;
+			m->band6.n_iftype_data = 1;
+			m->wiphy->bands[NL80211_BAND_6GHZ] = &m->band6;
+		}
 	}
 	ret = wiphy_register(m->wiphy);
 	if (ret) {
@@ -638,6 +782,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 		return ret;
 	}
 	m->wiphy_registered = true;
+	mt_policy_debugfs_init(m);
 	ret = mt_register_interface(m);
 	if (ret)
 		return ret;
@@ -645,4 +790,194 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	schedule_work(&m->startup_work);
 	dev_dbg(&m->pdev->dev, "REGULATORY_GATE_REGISTERED: cfg80211 country policy required\n");
 	return 0;
+}
+
+/* Country package selection. The lookup goes through a loader so the order,
+ * the version rules and the world fallback can be tested without the
+ * firmware loader.
+ */
+static const char *mt7932_policy_fallback_reason(int fallback)
+{
+	switch (fallback) {
+	case 0:
+		return "none";
+	case -ENOENT:
+		return "missing";
+	case -EOPNOTSUPP:
+		return "no-country-code";
+	default:
+		return "invalid";
+	}
+}
+
+static const char *const mt7932_policy_names[] = {
+	[MT7932_POLICY_NONE] = "none",
+	[MT7932_POLICY_V2] = "policy-v2",
+	[MT7932_POLICY_V1] = "policy",
+	[MT7932_POLICY_WORLD] = "world",
+};
+
+unsigned int mt7932_policy_candidates(const u8 alpha2[2],
+				      enum mt7932_policy_source sources[MT7932_POLICY_CANDIDATES])
+{
+	unsigned int n = 0;
+
+	/* 00 and the other numeric codes have no country package. */
+	if (mt7932_policy_country(alpha2)) {
+		sources[n++] = MT7932_POLICY_V2;
+		sources[n++] = MT7932_POLICY_V1;
+	}
+	sources[n++] = MT7932_POLICY_WORLD;
+	return n;
+}
+
+void mt7932_policy_path(char *buf, size_t len, enum mt7932_policy_source source,
+			const u8 alpha2[2])
+{
+	switch (source) {
+	case MT7932_POLICY_V2:
+		scnprintf(buf, len, "mediatek/mt7932/policy-v2/%c%c.bin", alpha2[0], alpha2[1]);
+		break;
+	case MT7932_POLICY_V1:
+		scnprintf(buf, len, "mediatek/mt7932/policy/%c%c.bin", alpha2[0], alpha2[1]);
+		break;
+	case MT7932_POLICY_WORLD:
+		scnprintf(buf, len, "mediatek/mt7932/policy/world-XZ.bin");
+		break;
+	default:
+		scnprintf(buf, len, "-");
+		break;
+	}
+}
+
+/*
+ * policy/ holds version 1 only: kernels that predate version 2 read that
+ * directory and reject anything else, so a version 2 package there is a
+ * packaging error rather than a newer package. policy-v2/ holds version 2
+ * only.
+ */
+static int mt7932_policy_check_version(enum mt7932_policy_source source,
+				       const u8 *data, size_t size)
+{
+	unsigned int version = size >= 6 ? get_unaligned_le16(data + 4) : 0;
+
+	return version == (source == MT7932_POLICY_V2 ? 2 : 1) ? 0 : -EINVAL;
+}
+
+int mt7932_policy_select(const struct mt7932_policy_loader *loader,
+			 struct mt7932_reg_snapshot *reg, struct mt7932_policy *policy,
+			 struct mt7932_policy_file *file, struct mt7932_policy_choice *choice)
+{
+	enum mt7932_policy_source sources[MT7932_POLICY_CANDIDATES];
+	unsigned int i, n = mt7932_policy_candidates(reg->alpha2, sources);
+	char path[MT7932_POLICY_PATH_MAX];
+	int country = mt7932_policy_country(reg->alpha2) ? 0 : -EOPNOTSUPP;
+	int ret = -ENOENT;
+
+	memset(choice, 0, sizeof(*choice));
+	memcpy(choice->alpha2, reg->alpha2, 2);
+	memset(file, 0, sizeof(*file));
+	for (i = 0; i < n; i++) {
+		const u8 *alpha2 = sources[i] == MT7932_POLICY_WORLD ? (const u8 *)"XZ" :
+			reg->alpha2;
+
+		mt7932_policy_path(path, sizeof(path), sources[i], reg->alpha2);
+		choice->tried[i].source = sources[i];
+		ret = loader->get(loader->ctx, path, file);
+		if (!ret) {
+			ret = mt7932_policy_check_version(sources[i], file->data, file->size);
+			if (!ret)
+				ret = mt7932_policy_parse(policy, file->data, file->size, alpha2);
+			if (ret) {
+				loader->put(loader->ctx, file);
+				memset(file, 0, sizeof(*file));
+			}
+		}
+		choice->tried[i].error = ret;
+		choice->n_tried = i + 1;
+		if (!ret) {
+			choice->source = sources[i];
+			break;
+		}
+		/* A present but unusable country package is the more useful
+		 * reason to report than a missing second candidate.
+		 */
+		if (sources[i] != MT7932_POLICY_WORLD && country != -EINVAL)
+			country = ret;
+	}
+	if (ret)
+		return ret;
+
+	/*
+	 * A country without a usable package of its own keeps its cfg80211
+	 * identity and channel list; the firmware gets the world profile and
+	 * the CID0f domain loses every channel the world package forbids. The
+	 * result is the intersection of both, never more permissive than
+	 * either. The world package has no 6 GHz section, so 6 GHz stays off.
+	 */
+	if (choice->source == MT7932_POLICY_WORLD) {
+		memcpy(reg->domain, "XZ", 2);
+		if (memcmp(reg->alpha2, "00", 2))
+			choice->fallback = country;
+	}
+	mt7932_policy_filter(reg, policy);
+	memcpy(choice->domain, reg->domain, 2);
+	choice->version = get_unaligned_le16(file->data + 4);
+	choice->size = file->size;
+	sha256(file->data, file->size, choice->sha256);
+	choice->six_primaries = reg->domain[10];
+	return 0;
+}
+
+static int mt_policy_show(struct seq_file *s, void *unused)
+{
+	struct mt7932 *m = s->private;
+	struct mt7932_policy_choice *c;
+	char path[MT7932_POLICY_PATH_MAX];
+	unsigned long flags;
+	unsigned int i;
+	bool pending;
+
+	c = kmalloc_obj(*c, GFP_KERNEL);
+	if (!c)
+		return -ENOMEM;
+	spin_lock_irqsave(&m->response_lock, flags);
+	*c = m->policy_choice;
+	pending = m->reg_pending;
+	spin_unlock_irqrestore(&m->response_lock, flags);
+
+	if (!c->alpha2[0]) {
+		seq_puts(s, "state: none\n");
+		goto out;
+	}
+	mt7932_policy_path(path, sizeof(path), c->source, c->alpha2);
+	seq_printf(s, "country: %c%c\n", c->alpha2[0], c->alpha2[1]);
+	if (c->error)
+		seq_printf(s, "state: blocked (%d)\n", c->error);
+	else
+		seq_printf(s, "state: %s\n", pending ? "applied, update pending" : "applied");
+	seq_printf(s, "generation: %u\n", c->generation);
+	if (c->source != MT7932_POLICY_NONE) {
+		seq_printf(s, "firmware_domain: %c%c\n", c->domain[0], c->domain[1]);
+		seq_printf(s, "source: %s\n", mt7932_policy_names[c->source]);
+		seq_printf(s, "path: %s\n", path);
+		seq_printf(s, "version: %u\n", c->version);
+		seq_printf(s, "size: %u\n", c->size);
+		seq_printf(s, "sha256: %8phN\n", c->sha256);
+		seq_printf(s, "6ghz_primaries: %u\n", c->six_primaries);
+	}
+	seq_printf(s, "fallback: %s\n", mt7932_policy_fallback_reason(c->fallback));
+	for (i = 0; i < c->n_tried; i++) {
+		mt7932_policy_path(path, sizeof(path), c->tried[i].source, c->alpha2);
+		seq_printf(s, "tried: %s %d\n", path, c->tried[i].error);
+	}
+out:
+	kfree(c);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(mt_policy);
+
+void mt_policy_debugfs_init(struct mt7932 *m)
+{
+	debugfs_create_file("mt7932_policy", 0400, m->wiphy->debugfsdir, m, &mt_policy_fops);
 }

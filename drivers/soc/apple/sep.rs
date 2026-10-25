@@ -20,6 +20,7 @@ mod hwrng;
 mod image;
 mod keybag;
 mod keybag_identity;
+mod os_identity;
 mod pm;
 mod profile;
 mod proto;
@@ -63,8 +64,9 @@ use kernel::{
             Relaxed, //
         },
         barrier::{
-            dma_rmb,
-            dma_wmb, //
+            dma_mb,
+            Read,
+            Write, //
         },
         new_condvar,
         Arc,
@@ -98,6 +100,20 @@ static_assert!(ENROL_WORK_ID != SETTLE_WORK_ID && ENROL_WORK_ID != 0);
 const VERIFY_WORK_ID: u64 = 3;
 static_assert!(VERIFY_WORK_ID != ENROL_WORK_ID && VERIFY_WORK_ID != SETTLE_WORK_ID);
 static_assert!(VERIFY_WORK_ID != 0);
+const LATE_ATTACH_WORK_ID: u64 = 4;
+static_assert!(LATE_ATTACH_WORK_ID != VERIFY_WORK_ID && LATE_ATTACH_WORK_ID != ENROL_WORK_ID);
+static_assert!(LATE_ATTACH_WORK_ID != SETTLE_WORK_ID && LATE_ATTACH_WORK_ID != 0);
+
+// When an attach-time sensor bring-up falls short, one more round runs this
+// long after Touch ID was activated. A round that cannot run yet, because the
+// boot-time bring-up is still going or the system is going to sleep, is put
+// off by the same delay, at most this many times.
+const LATE_ATTACH_DELAY_MS: time::Msecs = 10_000;
+const LATE_ATTACH_DEFERS: u32 = 3;
+
+// The step in which a pause between bring-up attempts checks whether the
+// result is still wanted.
+const BRINGUP_PAUSE_STEP_MS: u32 = 100;
 
 // J700 traces show the key-store endpoint arriving around 43 s after boot,
 // well after the first infrastructure endpoints. The wait exits promptly on
@@ -407,7 +423,10 @@ static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_SENSOR);
 
-const ENROL_MAX_CAPTURES: u32 = 12;
+// Captures per enrolment, including retries for partial contact and bad
+// frames. One J414s has needed up to 22. bio::ENROL_STAGES is derived from
+// this, so the stages cannot run out before the budget does.
+const ENROL_MAX_CAPTURES: u32 = 36;
 
 const ENROL_POLL_MS: u32 = 2;
 
@@ -663,6 +682,15 @@ struct SepData {
     // The enclave accepted an identification of the sensor since it booted,
     // even if the registration it began then failed.
     sensor_held: Atomic<bool>,
+    // The enclave may hold a serial registration whose session never opened;
+    // see registration::authenticate.
+    serial_unfinished: Atomic<bool>,
+    sensor_test_fault_done: Atomic<bool>,
+
+    // Activation left the sensor short of attached; the opener queues the
+    // late attach. And how often that has been put off.
+    late_attach_wanted: Atomic<bool>,
+    late_attach_defers: Atomic<u32>,
 
     #[pin]
     ool_sks: Mutex<Option<OolPair>>,
@@ -734,12 +762,24 @@ struct SepData {
     #[pin]
     sleep_over: CondVar,
 
-    // Enrol and verify work items between `capture_begin` and `capture_end`.
+    // Enrol and verify work items, and deletions, between `capture_begin`
+    // and `capture_end`.
     captures_running: Atomic<u32>,
 
     // Signalled when an enrol or verify work item has stopped.
     #[pin]
     worker_gone: CondVar,
+
+    // Held by an enrol or verify work item for its whole run and by a
+    // deletion while it removes identities and saves the Catacombs, so two
+    // Catacomb save sequences never interleave.
+    #[pin]
+    catacomb_writer: Mutex<()>,
+
+    // An identity has left the enclave but the Catacomb save that makes its
+    // deletion durable failed; the next deletion retries the save. Changed
+    // only under `catacomb_writer`.
+    deletion_unsaved: Atomic<bool>,
 
     #[pin]
     rx_work: Work<SepData>,
@@ -752,6 +792,9 @@ struct SepData {
 
     #[pin]
     verify_work: Work<SepData, VERIFY_WORK_ID>,
+
+    #[pin]
+    late_attach_work: DelayedWork<SepData, LATE_ATTACH_WORK_ID>,
 }
 
 impl_has_work! {
@@ -762,6 +805,7 @@ impl_has_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<Self, 1> for SepData { self.settle_work }
+    impl HasDelayedWork<Self, LATE_ATTACH_WORK_ID> for SepData { self.late_attach_work }
 }
 
 // SAFETY: every field is either internally synchronised (the mutexes, the
@@ -773,10 +817,10 @@ unsafe impl Send for SepData {}
 unsafe impl Sync for SepData {}
 
 impl SepData {
-    fn new(pdev: &platform::Device<device::Core>) -> Result<Arc<SepData>> {
+    fn new(pdev: &platform::Device<device::Core<'_>>) -> Result<Arc<SepData>> {
         let profile = profile::detect()?;
         let built = shmem::build(pdev, profile.shmem_capacity, profile.shmem_first_item)?;
-        let dev: &device::Device<device::Core> = pdev.as_ref();
+        let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
         dev_info!(dev, "SEP platform profile: {}\n", profile.name);
 
         let buf = built.buf;
@@ -803,10 +847,10 @@ impl SepData {
         )?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
-        let xart_writes = *module_parameters::xart_writes.value() != 0;
-        let xart_start = *module_parameters::xart_start_sector.value();
+        let xart_writes = module_parameters::xart_writes.value() != 0;
+        let xart_start = module_parameters::xart_start_sector.value();
         let xart_guard =
-            xart_guard::level(*module_parameters::xart_guard.value(), profile.xart_guard);
+            xart_guard::level(module_parameters::xart_guard.value(), profile.xart_guard);
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(mut store) => {
                 match xart_guard {
@@ -875,6 +919,10 @@ impl SepData {
                 sks_wedged: Atomic::new(0),
                 bringup: Atomic::new(BRINGUP_FRESH),
                 sensor_held: Atomic::new(false),
+                serial_unfinished: Atomic::new(false),
+                sensor_test_fault_done: Atomic::new(false),
+                late_attach_wanted: Atomic::new(false),
+                late_attach_defers: Atomic::new(0),
                 keybag_designated: Atomic::new(false),
                 bringup_started: Atomic::new(false),
                 touchid_started: Atomic::new(false),
@@ -930,10 +978,13 @@ impl SepData {
                 sleep_over <- new_condvar!("SepData::sleep_over"),
                 captures_running: Atomic::new(0),
                 worker_gone <- new_condvar!("SepData::worker_gone"),
+                catacomb_writer <- new_mutex!(()),
+                deletion_unsaved: Atomic::new(false),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
                 settle_work <- new_delayed_work!("SepData::settle_work"),
+                late_attach_work <- new_delayed_work!("SepData::late_attach_work"),
             }),
             GFP_KERNEL,
         )
@@ -953,7 +1004,7 @@ impl SepData {
         let (iova, size) = {
             let guard = self.shmem.lock();
             let buf = guard.as_ref().ok_or(EINVAL)?;
-            (buf.dma_handle(), buf.len())
+            (buf.dma_address(), buf.len())
         };
 
         let msg = proto::shmem_registration(iova, size)?;
@@ -985,7 +1036,7 @@ impl SepData {
         // The SEP stays booted after rmmod and Linux cannot reset it, so a
         // reload's TZ0 would go unanswered. Record the boot first, as the warm
         // path does, so a reload stops at probe and says to reboot instead.
-        let iova = self.shmem.lock().as_ref().map_or(0, |buf| buf.dma_handle());
+        let iova = self.shmem.lock().as_ref().map_or(0, |buf| buf.dma_address());
         if let Err(e) = dt::mark_registration_sent(sep_node, iova) {
             dev_err!(
                 self.dev,
@@ -1088,7 +1139,7 @@ impl SepData {
         let shm = {
             let guard = self.shmem.lock();
             let buf = guard.as_ref().ok_or(EINVAL)?;
-            buf.dma_handle()
+            buf.dma_address()
         };
         let msg = Message {
             msg0: u64::from(proto::EP_SHMEM)
@@ -1138,7 +1189,7 @@ impl SepData {
     /// reply's header overwritten by a refill that lands late. dma_wmb() is
     /// what writel() would put there, and what RTKit puts before its sends.
     fn ring(mbox: &Mailbox<SepData>, msg: Message) -> Result<()> {
-        dma_wmb();
+        dma_mb(Write);
         mbox.send(msg, false)
     }
 
@@ -1385,7 +1436,7 @@ impl SepData {
 
 
     fn alloc_ool(
-        dev: &device::Device<device::Core>,
+        dev: &device::Device<device::Core<'_>>,
         endpoint: u8,
         allocated: usize,
         declared: (usize, usize),
@@ -1435,8 +1486,8 @@ impl SepData {
                 b.allocated,
                 b.declared_in,
                 b.declared_out,
-                b.inbound.dma_handle(),
-                b.outbound.dma_handle(),
+                b.inbound.dma_address(),
+                b.outbound.dma_address(),
             )
         };
 
@@ -1486,28 +1537,23 @@ impl SepData {
     }
 
     fn prepare_os_uuid(&self) {
-        let hi = *module_parameters::os_uuid_hi.value();
-        let lo = *module_parameters::os_uuid_lo.value();
-        if hi != 0 || lo != 0 {
-            let mut uuid = [0u8; 16];
-            uuid[..8].copy_from_slice(&hi.to_be_bytes());
-            uuid[8..].copy_from_slice(&lo.to_be_bytes());
-            self.xarm.lock().os_uuid = Some(uuid);
-            dev_info!(
-                self.dev,
-                "xART: using explicit OS UUID {:016x}-{:016x}\n",
-                hi,
-                lo
-            );
-            return;
-        }
-
-        if let Some(uuid) = dt::preboot_uuid() {
-            self.xarm.lock().os_uuid = Some(uuid);
-            dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
-        } else {
-            self.xarm.lock().os_uuid = None;
-            dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
+        let hi = module_parameters::os_uuid_hi.value();
+        let lo = module_parameters::os_uuid_lo.value();
+        // Keep the existing lane on installed systems. The tested selector
+        // never invents an identity or lets a profile override explicit params.
+        match os_identity::select(hi, lo, dt::preboot_uuid) {
+            os_identity::Selection::Explicit(uuid) => {
+                self.xarm.lock().os_uuid = Some(uuid);
+                dev_info!(self.dev, "xART: using explicit OS identity\n");
+            }
+            os_identity::Selection::Chosen(uuid) => {
+                self.xarm.lock().os_uuid = Some(uuid);
+                dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
+            }
+            os_identity::Selection::Unavailable => {
+                self.xarm.lock().os_uuid = None;
+                dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
+            }
         }
     }
 
@@ -1587,7 +1633,7 @@ impl SepData {
             );
         }
 
-        if *module_parameters::xarm_trace.value() != 0 {
+        if module_parameters::xarm_trace.value() != 0 {
             dev_info!(
                 self.dev,
                 "xarm: op 0x{:02x} request_len {} reply_status 0x{:02x} reply_len {}\n",
@@ -2074,7 +2120,7 @@ impl SepData {
             return;
         }
         let delay = time::msecs_to_jiffies(SETTLE_MS);
-        let _ = workqueue::system()
+        let _ = workqueue::system_dfl()
             .enqueue_delayed::<Arc<SepData>, SETTLE_WORK_ID>(this.clone(), delay);
     }
 
@@ -2336,7 +2382,7 @@ impl SepData {
 
         *self.mbox.lock() = None;
 
-        // SAFETY: all four pointers refer to pinned work fields in `self`.
+        // SAFETY: all five pointers refer to pinned work fields in `self`.
         // Shutdown blocks requeueing, and the mailbox can no longer add work.
         unsafe {
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.rx_work)).cast());
@@ -2344,6 +2390,9 @@ impl SepData {
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.verify_work)).cast());
             sep_cancel_delayed_work_sync(
                 DelayedWork::raw_as_work(core::ptr::addr_of!(self.settle_work)).cast(),
+            );
+            sep_cancel_delayed_work_sync(
+                DelayedWork::raw_as_work(core::ptr::addr_of!(self.late_attach_work)).cast(),
             );
         }
 
@@ -2392,7 +2441,17 @@ unsafe extern "C" fn bio_open_trampoline(ctx: *mut c_void) -> c_int {
     // SAFETY: per the contract above.
     let this = unsafe { &*ctx.cast::<SepData>() };
     match this.bio_open() {
-        Ok(()) => 0,
+        Ok(()) => {
+            if this.take_late_attach() {
+                // SAFETY: as in `bio_ioctl_trampoline`: `ctx` is the pointer
+                // the driver's own `Arc<SepData>` was made from, and that
+                // `Arc` outlives every callback.
+                let borrow =
+                    unsafe { kernel::sync::ArcBorrow::<SepData>::from_raw(ctx.cast::<SepData>()) };
+                SepData::queue_late_attach(borrow.into());
+            }
+            0
+        }
         Err(e) => e.to_errno(),
     }
 }
@@ -2464,7 +2523,7 @@ impl MailCallback for SepData {
         }
         // The message was read from the mailbox with relaxed MMIO. Read the
         // buffers the enclave wrote before it only after that, as RTKit does.
-        dma_rmb();
+        dma_mb(Read);
         if !data.rx.push(msg) && data.rx.dropped() == 1 {
             dev_err!(
                 data.dev,
@@ -2474,7 +2533,7 @@ impl MailCallback for SepData {
         }
 
         let this: Arc<SepData> = data.into();
-        let _ = workqueue::system().enqueue::<Arc<SepData>, 0>(this);
+        let _ = workqueue::system_dfl().enqueue::<Arc<SepData>, 0>(this);
     }
 }
 
@@ -2502,10 +2561,20 @@ impl WorkItem<SETTLE_WORK_ID> for SepData {
     }
 }
 
+impl WorkItem<LATE_ATTACH_WORK_ID> for SepData {
+    type Pointer = Arc<SepData>;
+
+    fn run(this: Arc<SepData>) {
+        SepData::run_late_attach(&this);
+    }
+}
+
 impl WorkItem<ENROL_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        // Serialize saves before joining the suspend drain.
+        let _writer = this.catacomb_writer.lock();
         let epoch = this.capture_epoch.load(Relaxed);
         if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_enrolment();
@@ -2519,6 +2588,8 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        // Serialize saves before joining the suspend drain.
+        let _writer = this.catacomb_writer.lock();
         let epoch = this.capture_epoch.load(Relaxed);
         if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_verify();
@@ -2531,25 +2602,26 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 
 struct SepDriver(Arc<SepData>);
 
-kernel::of_device_table!(
-    OF_TABLE,
-    MODULE_OF_TABLE,
-    (),
-    [(of::DeviceId::new(c"apple,sep"), ())]
-);
+// Deliberately not exported as a module alias: udev must not load the driver
+// on its own. The loader service loads it once the iBoot system container's
+// partition link exists, which the xART store needs at probe, and only after
+// the owner has enabled it (or chosen read-only) for this Mac.
+const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, (), 1> =
+    kernel::device_id::IdArray::new([(of::DeviceId::new(c"apple,sep"), &())]);
 
 impl platform::Driver for SepDriver {
     type IdInfo = ();
+    type Data<'bound> = SepDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<()>> = Some(&OF_TABLE);
 
-    fn probe(
-        pdev: &platform::Device<device::Core>,
-        _info: Option<&()>,
-    ) -> impl PinInit<Self, Error> {
-        let dev: &device::Device<device::Core> = pdev.as_ref();
-        if *module_parameters::provision_keybag.value() != 0
-            && *module_parameters::xart_writes.value() == 0
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<device::Core<'_>>,
+        _info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+        let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
+        if module_parameters::provision_keybag.value() != 0
+            && module_parameters::xart_writes.value() == 0
         {
             dev_err!(dev, "provision_keybag=1 requires xart_writes=1\n");
             return Err(EINVAL);
@@ -2580,7 +2652,8 @@ impl platform::Driver for SepDriver {
 
         // As soon as the fixed facts are known, so a tool can watch the attach
         // from "pending" on. Diagnostics are not worth failing the probe for.
-        if let Err(e) = diag::register(dev, data.profile, data.xart_writable()) {
+        let guard = data.with_store(|store| store.guard_state()).flatten();
+        if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard) {
             dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
         }
 
@@ -2674,7 +2747,7 @@ module! {
         },
         xart_guard: i8 {
             default: -1,
-            description: "-1: the platform's level, 1 on M1 and M2 Macs and 0 on the MacBook Neo; 0: off; 1: refuse the enclave's writes and deletes of xART session records this Linux install did not create; 2: also refuse writes to the shared root records",
+            description: "-1: the platform's level, 1 on M1, M2 and M3 Macs and 0 on the MacBook Neo; 0: off; 1: refuse the enclave's writes and deletes of xART session records this Linux install did not create; 2: also refuse writes to the shared root records",
         },
         os_uuid_hi: u64 {
             default: 0,
@@ -2687,6 +2760,10 @@ module! {
         sensor_trace: u8 {
             default: 0,
             description: "Trace Touch ID sensor registration steps and timing, never sensor data",
+        },
+        sensor_test_fault: u8 {
+            default: 0,
+            description: "Test only: stop the first nonce-session sensor authentication of the boot after REGISTER_SERIAL, leaving the enclave an unfinished registration to recover from",
         },
         xarm_trace: u8 {
             default: 0,

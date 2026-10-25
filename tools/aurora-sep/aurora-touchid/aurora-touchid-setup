@@ -73,7 +73,9 @@ say "Place your right index finger on Touch ID, lift and repeat until enrolment 
 $sudo fprintd-enroll "${SUDO_USER:-$USER}" || die "Enrolment failed. Run aurora-touchid-setup again."
 
 say "Enrolled. Now touch the sensor once more to verify."
-fprintd-verify "${SUDO_USER:-$USER}" || die "Verification failed; PAM was not changed. Run aurora-touchid-setup again."
+# As root, like the enrolment: polkit lets an unprivileged user claim the
+# reader only from the active local session, so over SSH it refuses.
+$sudo fprintd-verify "${SUDO_USER:-$USER}" || die "Verification failed; PAM was not changed. Run aurora-touchid-setup again."
 
 configure_pam
 say "Touch ID now works for sudo, polkit prompts and the lock screen. Your password still works too."

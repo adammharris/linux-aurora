@@ -9,6 +9,8 @@
 #ifndef TB_TUNNEL_H_
 #define TB_TUNNEL_H_
 
+#include <linux/atomic.h>
+
 #include "tb.h"
 
 enum tb_tunnel_type {
@@ -62,15 +64,16 @@ enum tb_tunnel_state {
  * @allocated_down: Allocated downstream bandwidth (only for USB3)
  * @bw_mode: DP bandwidth allocation mode registers can be used to
  *	     determine consumed and allocated bandwidth
- * @dprx_started: DPRX has an outstanding worker reference and callback
+ * @dprx_started: DPRX negotiation was started (tb_dp_dprx_start() was called for it)
  * @dprx_canceled: Was DPRX capabilities read poll canceled
+ * @host_dp_generation: Nonzero identity of the announced display handoff
  * @host_dp_notified: The NHI glue was told this DP tunnel is up (Apple hosts)
  * @host_dp_activated: The NHI post-activation hook owns display-side state
  * @host_pci_activated: The NHI post-activation hook owns PCIe host state
  * @dprx_timeout: If set DPRX capabilities read poll work will timeout after this passes
  * @dprx_work: Worker that is scheduled to poll completion of DPRX capabilities read
- * @callback: Optional callback called when DP tunnel is fully activated
- * @callback_data: Optional data for @callback
+ * @callback: Callback called when DP tunnel is fully activated
+ * @callback_data: Data for @callback
  * @paths: All paths required by the tunnel
  */
 struct tb_tunnel {
@@ -105,6 +108,7 @@ struct tb_tunnel {
 	bool bw_mode;
 	bool dprx_started;
 	bool dprx_canceled;
+	u64 host_dp_generation;
 	bool host_dp_notified;
 	bool host_dp_activated;
 	bool host_pci_activated;
@@ -125,7 +129,11 @@ int tb_pci_tunnel_deactivate_host(struct tb_tunnel *tunnel);
 bool tb_tunnel_reserved_pci(struct tb_port *port, int *reserved_up,
 			    int *reserved_down);
 struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
-					bool alloc_hopid);
+					bool alloc_hopid,
+					void (*callback)(struct tb_tunnel *, void *),
+					void *callback_data);
+void tb_dp_tunnel_cancel_dprx(struct tb_tunnel *tunnel);
+bool tb_apple_nhi_needs_bw_grant(struct tb_nhi *nhi);
 struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
 				     struct tb_port *out, int link_nr,
 				     int max_up, int max_down,
@@ -145,6 +153,8 @@ struct tb_tunnel *tb_tunnel_alloc_usb3(struct tb *tb, struct tb_port *up,
 
 void tb_tunnel_put(struct tb_tunnel *tunnel);
 void tb_dp_tunnel_deactivate_host(struct tb_tunnel *tunnel);
+u64 tb_dp_tunnel_alloc_generation(void);
+u64 tb_dp_generation_alloc(atomic64_t *counter);
 int tb_tunnel_activate(struct tb_tunnel *tunnel);
 void tb_tunnel_deactivate(struct tb_tunnel *tunnel);
 

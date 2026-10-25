@@ -17,8 +17,47 @@
 
 #ifndef __ASSEMBLER__
 
+#include <linux/errno.h>
 #include <linux/refcount.h>
+#include <linux/sizes.h>
 #include <asm/cpufeature.h>
+
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+extern bool arm64_user4k_on;
+
+/*
+ * Mixed-granule userspace is built in but experimental: it stays off unless
+ * the kernel is booted with user4k=on. Fixed once early parameters are parsed.
+ */
+static inline bool user4k_enabled(void)
+{
+	return arm64_user4k_on;
+}
+#define arch_mm_alt_granule_enabled user4k_enabled
+#else
+static inline bool user4k_enabled(void)
+{
+	return false;
+}
+#endif
+
+/*
+ * Validate a page-size request for a later exec. Zero selects the native
+ * granule; an alternative needs user4k=on and CPU support. Pure for KUnit.
+ */
+static inline int arm64_exec_page_size_request(unsigned long size, bool enabled,
+					       bool has_4k, bool has_16k)
+{
+	if (!size || size == PAGE_SIZE)
+		return 0;
+	if (!enabled)
+		return -EINVAL;
+	if (size == SZ_4K)
+		return has_4k ? 12 : -EOPNOTSUPP;
+	if (PAGE_SIZE > SZ_16K && size == SZ_16K)
+		return has_16k ? 14 : -EOPNOTSUPP;
+	return -EINVAL;
+}
 
 /* AArch32 falls back to the native ABI when 4K translation is unavailable. */
 static inline unsigned int arm64_exec_page_shift(bool compat, bool has_4k,

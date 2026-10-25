@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/reset/apple,t8103-cio-reset.yaml#
@@ -60,19 +60,6 @@ examples:
         reset-controller@23b784000 {
             compatible = "apple,t8103-cio-reset";
             reg = <0x2 0x3b784000 0x0 0x8000>;
-            #reset-cells = <1>;
-        };
-    };
-  - |
-    power-management@28e080000 {
-        compatible = "apple,t6000-pmgr", "apple,pmgr", "syscon", "simple-mfd";
-        reg = <0x8e080000 0x1c000>;
-        #address-cells = <1>;
-        #size-cells = <1>;
-
-        reset-controller@1a034 {
-            compatible = "apple,t6000-cio-reset";
-            reg = <0x1a034 0x4>;
             #reset-cells = <1>;
         };
     };

@@ -13,6 +13,7 @@
 #include <linux/hex.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 
 #define MAX_GPIO 64
@@ -32,6 +33,15 @@
 #define MACSMC_J700_RADIO_REG_ON_GPIO	8
 #define MACSMC_J700_RADIO_REG_ON_LO	0x800000
 #define MACSMC_J700_RADIO_REG_ON_HI	0x80000
+
+/*
+ * J713 /amfm/function-reg_on is pKW4("gP13", 0x00800000). The firmware
+ * function preserves the template's upper 16 bits and inserts the level
+ * into its low 16 bits. This does not establish generic CMD_OUTPUT semantics,
+ * a pin-mode command, or a readback operation for this line.
+ */
+#define MACSMC_J713_RADIO_REG_ON_GPIO	0x13
+#define MACSMC_J713_RADIO_REG_ON_TEMPLATE	0x00800000
 
 /*
  * Commands 0-6 are, presumably, the intended API.
@@ -96,6 +106,11 @@ struct macsmc_gpio {
 
 	bool j700_pcio;
 	DECLARE_BITMAP(j700_pcio_level, MAX_GPIO);
+
+	bool j713;
+	struct mutex j713_reg_on_lock;
+	bool j713_reg_on_known;
+	bool j713_reg_on_level;
 };
 
 static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
@@ -104,6 +119,13 @@ static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
 	return smcgp->j700_pcio &&
 	       (offset == MACSMC_J700_AFE_RESET_GPIO ||
 		offset == MACSMC_J700_RADIO_REG_ON_GPIO);
+}
+
+static bool macsmc_gpio_is_j713_reg_on(struct macsmc_gpio *smcgp,
+				      unsigned int offset)
+{
+	return smcgp->j713 && smcgp->base_key == (smc_key)_SMC_KEY("gP\0\0") &&
+	       offset == MACSMC_J713_RADIO_REG_ON_GPIO;
 }
 
 static int macsmc_gpio_nr(smc_key key)
@@ -176,7 +198,8 @@ static int macsmc_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
 	u32 val;
 	int ret;
 
-	if (macsmc_gpio_is_j700_pcio(smcgp, offset))
+	if (macsmc_gpio_is_j700_pcio(smcgp, offset) ||
+	    macsmc_gpio_is_j713_reg_on(smcgp, offset))
 		return GPIO_LINE_DIRECTION_OUT;
 
 	/* First try reading the explicit pin mode register */
@@ -198,6 +221,14 @@ static int macsmc_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	smc_key key = macsmc_gpio_key(smcgp->base_key, offset);
 	u32 cmd, val;
 	int ret;
+
+	/* No qualified readback: report only the last successful native command. */
+	if (macsmc_gpio_is_j713_reg_on(smcgp, offset)) {
+		mutex_lock(&smcgp->j713_reg_on_lock);
+		ret = smcgp->j713_reg_on_known ? smcgp->j713_reg_on_level : -EOPNOTSUPP;
+		mutex_unlock(&smcgp->j713_reg_on_lock);
+		return ret;
+	}
 
 	/* pcIO cannot be read back; report the last level written. */
 	if (macsmc_gpio_is_j700_pcio(smcgp, offset))
@@ -224,6 +255,21 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
 	smc_key key = macsmc_gpio_key(smcgp->base_key, offset);
 	int ret;
+
+	if (macsmc_gpio_is_j713_reg_on(smcgp, offset)) {
+		mutex_lock(&smcgp->j713_reg_on_lock);
+		ret = apple_smc_write_u32(smcgp->smc, key,
+					  MACSMC_J713_RADIO_REG_ON_TEMPLATE | !!value);
+		if (!ret) {
+			smcgp->j713_reg_on_level = !!value;
+			smcgp->j713_reg_on_known = true;
+		}
+		mutex_unlock(&smcgp->j713_reg_on_lock);
+		if (ret < 0)
+			dev_err_ratelimited(smcgp->dev, "gP13 set to %u failed: %d\n",
+					    !!value, ret);
+		return ret;
+	}
 
 	if (macsmc_gpio_is_j700_pcio(smcgp, offset)) {
 		u32 lo, hi;
@@ -317,6 +363,8 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
 	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
+	smcgp->j713 = of_machine_is_compatible("apple,j713");
+	mutex_init(&smcgp->j713_reg_on_lock);
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
 	if (smcgp->first_index < 0)

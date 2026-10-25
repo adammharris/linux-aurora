@@ -100,6 +100,9 @@ static void apple_dart_test_before_attach(struct kunit *test)
 	master.dma_max = DMA_BIT_MASK(dart->ias);
 	master.stream_maps[0].dart = dart;
 	__set_bit(0, master.stream_maps[0].sidmap);
+	/* of_xlate() starts each master with the window of its DART. */
+	master.dma_min = dart->dma_min;
+	master.dma_max = dart->dma_max;
 	writel(dart->hw->ttbr_valid, dart->regs + DART_TTBR(dart, 0, 0));
 	KUNIT_ASSERT_EQ(test, apple_dart_finalize_domain(domain, &master), 0);
 	ops = domain->pgtbl_ops;
@@ -318,6 +321,7 @@ static void apple_dart_test_gated_commands(struct kunit *test)
 	dev_set_drvdata(dart->dev, dart);
 	dart->regs = (__force void __iomem *)kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, dart->regs);
+	dart->hw = &apple_dart_hw_t8110;
 	dart->num_streams = 1;
 	dart->pgsize = SZ_16K;
 	dart->version = 0x0202;
@@ -560,6 +564,105 @@ static void apple_dart_test_gated_irq(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&dart->dev->power.usage_count), 0);
 	KUNIT_EXPECT_EQ(test, pm_runtime_set_active(dart->dev), 0);
 	pm_runtime_disable(dart->dev);
+}
+
+struct apple_dart_test_commands {
+	DECLARE_BITMAP(sids, DART_MAX_STREAMS);
+	unsigned int count;
+};
+
+static void apple_dart_test_record_write(struct apple_dart *dart, u32 value,
+					 u32 offset)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct apple_dart_test_commands *commands = test->priv;
+
+	if (offset == DART_T8110_TLB_CMD) {
+		__set_bit(FIELD_GET(DART_T8110_TLB_CMD_STREAM, value), commands->sids);
+		commands->count++;
+	}
+	writel(value, dart->regs + offset);
+}
+
+/* Separate masters on one DART need not share a remap target. */
+static void apple_dart_test_independent_remap_roots(struct kunit *test)
+{
+	struct apple_dart_master_cfg masters[2] = {};
+	struct apple_dart_test_commands commands = {};
+	struct iommu_iotlb_gather gather;
+	struct apple_dart_domain *domain;
+	struct apple_dart *dart;
+	size_t mapped = 0;
+	unsigned int i;
+
+	/* T8110 table pointers must be aligned to its 16 KiB granule. */
+	if (PAGE_SIZE < SZ_16K) {
+		kunit_skip(test, "T8110 needs kernel pages of at least 16 KiB");
+		return;
+	}
+
+	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	domain = kunit_kzalloc(test, sizeof(*domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, domain);
+	dart->dev = kunit_device_register(test, "apple-dart-remap-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->dev);
+	dart->hw = &apple_dart_hw_t8110;
+	dart->num_streams = 16;
+	dart->pgsize = SZ_16K;
+	dart->ias = 32;
+	dart->oas = 42;
+	dart->regs = (__force void __iomem *)kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart->regs);
+	spin_lock_init(&dart->lock);
+	mutex_init(&domain->init_lock);
+	domain->domain.type = IOMMU_DOMAIN_UNMANAGED;
+	test->priv = &commands;
+	kunit_activate_static_stub(test, apple_dart_writel, apple_dart_test_record_write);
+	pm_runtime_set_active(dart->dev);
+	pm_runtime_enable(dart->dev);
+
+	for (i = 0; i < ARRAY_SIZE(masters); i++) {
+		struct device *dev;
+		unsigned int sid = 3 + 2 * i;
+		int ret;
+
+		dev = kunit_device_register(test, i ? "dart-master-5" : "dart-master-3");
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+		dev->iommu = kunit_kzalloc(test, sizeof(*dev->iommu), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, dev->iommu);
+		masters[i].dma_max = DMA_BIT_MASK(32);
+		masters[i].stream_maps[0].dart = dart;
+		__set_bit(sid, masters[i].stream_maps[0].sidmap);
+		dev->iommu->priv = &masters[i];
+		ret = apple_dart_attach_dev_paging(&domain->domain, dev, NULL);
+		dev->iommu = NULL;
+		KUNIT_ASSERT_EQ(test, ret, 0);
+		KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, sid)),
+				dart->hw->tcr_enabled);
+	}
+
+	KUNIT_ASSERT_EQ(test, apple_dart_map_pages(&domain->domain, 0, SZ_1M,
+						   SZ_16K, 1, IOMMU_READ | IOMMU_WRITE,
+						   GFP_KERNEL, &mapped), 0);
+	KUNIT_ASSERT_EQ(test, mapped, (size_t)SZ_16K);
+	KUNIT_ASSERT_EQ(test, apple_dart_iotlb_sync_map(&domain->domain, 0, SZ_16K), 0);
+	KUNIT_EXPECT_EQ(test, apple_dart_iova_to_phys(&domain->domain, 0), (phys_addr_t)SZ_1M);
+
+	bitmap_zero(commands.sids, DART_MAX_STREAMS);
+	commands.count = 0;
+	iommu_iotlb_gather_init(&gather);
+	KUNIT_EXPECT_EQ(test, apple_dart_unmap_pages(&domain->domain, 0, SZ_16K, 1,
+						     &gather), (size_t)SZ_16K);
+	apple_dart_iotlb_sync(&domain->domain, &gather);
+	KUNIT_EXPECT_EQ(test, apple_dart_iova_to_phys(&domain->domain, 0), (phys_addr_t)0);
+	KUNIT_EXPECT_EQ(test, commands.count, 2U);
+	KUNIT_EXPECT_EQ(test, commands.sids[0], BIT(3) | BIT(5));
+
+	pm_runtime_disable(dart->dev);
+	free_io_pgtable_ops(domain->pgtbl_ops);
+	kunit_deactivate_static_stub(test, apple_dart_writel);
+	test->priv = NULL;
 }
 
 static struct apple_dart *apple_dart_test_sleeping(struct kunit *test)
@@ -840,6 +943,7 @@ static void apple_dart_test_resume_reset_retry(struct kunit *test)
 
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_iommu_specifiers),
+	KUNIT_CASE(apple_dart_test_independent_remap_roots),
 	KUNIT_CASE(apple_dart_test_before_attach),
 	KUNIT_CASE(apple_dart_test_locked_handoff),
 	KUNIT_CASE(apple_dart_test_sync_unknown_roots),

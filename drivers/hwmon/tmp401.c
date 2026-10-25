@@ -560,7 +560,7 @@ static int tmp401_init_client(struct tmp401_data *data)
 			return ret;
 	}
 
-	ret = of_property_read_u32(data->client->dev.of_node, "ti,n-factor", &nfactor);
+	ret = of_property_read_s32(data->client->dev.of_node, "ti,n-factor", &nfactor);
 	if (!ret) {
 		if (data->kind == tmp401) {
 			dev_err(&data->client->dev, "ti,tmp401 does not support n-factor correction\n");
@@ -695,7 +695,7 @@ static int tmp401_probe(struct i2c_client *client)
 	info->type = hwmon_chip;
 	info->config = data->chip_channel_config;
 
-	data->chip_channel_config[0] = HWMON_C_UPDATE_INTERVAL;
+	data->chip_channel_config[0] = HWMON_C_REGISTER_TZ | HWMON_C_UPDATE_INTERVAL;
 
 	info = &data->temp_info;
 	info->type = hwmon_temp;

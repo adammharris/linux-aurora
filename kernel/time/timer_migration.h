@@ -6,6 +6,24 @@
 #define TMIGR_CHILDREN_PER_GROUP 8
 
 /**
+ * struct tmigr_hierarchy - a hierarchy associated to a given CPU capacity.
+ *                          Homogeneous systems have only one hierarchy.
+ *                          Heterogenous have one hierarchy per CPU capacity.
+ * @cpumask:	CPUs belonging to this hierarchy
+ * @root:	The current root of the hierarchy
+ * @capacity:	CPU capacity associated to this hierarchy
+ * @node:	Node in the global hierarchy list
+ * @level_list:	Per level lists of tmigr groups
+ */
+struct tmigr_hierarchy {
+	struct cpumask		*cpumask;
+	struct tmigr_group	*root;
+	unsigned long		capacity;
+	struct list_head	node;
+	struct list_head	level_list[];
+};
+
+/**
  * struct tmigr_event - a timer event associated to a CPU
  * @nextevt:	The node to enqueue an event in the parent group queue
  * @cpu:	The CPU to which this event belongs
@@ -85,7 +103,7 @@ struct tmigr_group {
  *			before the timer migration hierarchy hotplug callback is
  *			reached.  During this phase, the CPU has to handle the
  *			global timers on its own and must not act as a migrator.
-
+ *
  * @idle:		Indicates whether the CPU is idle in the timer migration
  *			hierarchy
  * @remote:		Is set when timers of the CPU are expired remotely

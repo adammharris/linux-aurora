@@ -12,6 +12,7 @@
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/file.h>
+#include <linux/pagemap.h>
 #include <linux/syscalls.h>
 #include <linux/sched.h>
 
@@ -85,8 +86,8 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
 			goto out_unlock;
 		}
 		file = vma->vm_file;
-		fstart = (start - vma->vm_start) +
-			 ((loff_t)vma->vm_pgoff << PAGE_SHIFT) + vma_subpage_offset(vma);
+		fstart = ((loff_t)linear_page_index(vma, start) << PAGE_SHIFT) +
+			 vma_page_offset_at(vma, start).offset;
 		fend = fstart + (min(end, vma->vm_end) - start) - 1;
 		start = vma->vm_end;
 		if ((flags & MS_SYNC) && file &&

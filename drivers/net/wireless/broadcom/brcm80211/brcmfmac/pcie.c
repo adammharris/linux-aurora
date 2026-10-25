@@ -5,6 +5,7 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/firmware.h>
 #include <linux/pci.h>
 #include <linux/vmalloc.h>
@@ -15,6 +16,7 @@
 #include <linux/sched/signal.h>
 #include <linux/kthread.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/random.h>
 #include <linux/unaligned.h>
 
@@ -73,6 +75,7 @@ BRCMF_FW_CLM_DEF(4378B3, "brcmfmac4378b3-pcie");
 BRCMF_FW_CLM_DEF(4387C2, "brcmfmac4387c2-pcie");
 BRCMF_FW_CLM_DEF(4388B0, "brcmfmac4388b0-pcie");
 BRCMF_FW_CLM_DEF(4388C0, "brcmfmac4388c0-pcie");
+BRCMF_FW_CLM_DEF(4388C2, "brcmfmac4388c2-pcie");
 BRCMF_FW_CLM_DEF(54591, "brcmfmac54591-pcie");
 
 /* firmware config files */
@@ -115,7 +118,8 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_4378_CHIP_ID, 0xFFFFFFE0, 4378B3), /* revision ID 5 */
 	BRCMF_FW_ENTRY(BRCM_CC_4387_CHIP_ID, 0xFFFFFFFF, 4387C2), /* revision ID 7 */
 	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0x0000000F, 4388B0),
-	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0xFFFFFFF0, 4388C0), /* revision ID 4 */
+	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0xFFFFFFB0, 4388C0), /* revision IDs 4, 5 and 7+ */
+	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0x00000040, 4388C2), /* revision ID 6 */
 };
 
 #define BRCMF_PCIE_FW_UP_TIMEOUT		5000 /* msec */
@@ -2808,6 +2812,52 @@ static const struct brcmf_pcie_drvdata drvdata[] = {
 /* Forward declaration for pci_match_id() call */
 static const struct pci_device_id brcmf_pcie_devid_table[];
 
+static int brcmf_pcie_set_dma_mask(struct brcmf_pciedev_info *devinfo)
+{
+	struct pci_dev *pdev = devinfo->pdev;
+	struct device *dev = &pdev->dev;
+	struct iommu_domain *domain;
+	u64 end;
+	int ret;
+
+	if (pdev->vendor != BRCM_PCIE_VENDOR_ID_BROADCOM ||
+	    pdev->device != BRCM_PCIE_4388_DEVICE_ID ||
+	    devinfo->ci->chip != BRCM_CC_4388_CHIP_ID ||
+	    (devinfo->ci->chiprev != 4 && devinfo->ci->chiprev != 6))
+		return 0;
+
+	domain = iommu_get_domain_for_dev(dev);
+	if (!domain || !domain->geometry.force_aperture ||
+	    domain->geometry.aperture_start <= DMA_BIT_MASK(32))
+		return 0;
+	end = domain->geometry.aperture_end;
+	if (domain->geometry.aperture_start > end || end > DMA_BIT_MASK(42)) {
+		pci_warn(pdev, "unsupported high DMA aperture %#llx-%#llx\n",
+			 (unsigned long long)domain->geometry.aperture_start,
+			 (unsigned long long)end);
+		return 0;
+	}
+
+	if (dma_get_mask(dev) >= end && dev->coherent_dma_mask >= end)
+		return 0;
+
+	/* The message-buffer ABI carries both words of host DMA addresses. */
+	if (dma_get_mask(dev) < end) {
+		ret = dma_set_mask(dev, DMA_BIT_MASK(42));
+		if (ret)
+			goto fail;
+	}
+	if (dev->coherent_dma_mask < end) {
+		ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(42));
+		if (ret)
+			goto fail;
+	}
+	return 0;
+fail:
+	pci_err(pdev, "failed to enable 42-bit DMA: %d\n", ret);
+	return ret;
+}
+
 static int
 brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -2828,6 +2878,22 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	brcmf_dbg(PCIE, "Enter %x:%x\n", pdev->vendor, pdev->device);
 
+	/*
+	 * T8132's BCM4388 IOVA aperture starts above 1 TiB and the message-buffer
+	 * ABI carries full 64-bit host addresses, so do not retain PCI's
+	 * conservative 32-bit default DMA mask on this platform.
+	 */
+	if (pdev->device == BRCM_PCIE_4388_DEVICE_ID &&
+	    of_machine_is_compatible("apple,t8132")) {
+		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
+		if (ret) {
+			pci_err(pdev, "failed to enable 42-bit DMA: %d\n", ret);
+			return ret;
+		}
+		pci_info(pdev, "using 42-bit DMA addresses\n");
+	}
+
+
 	ret = -ENOMEM;
 	devinfo = kzalloc_obj(*devinfo);
 	if (devinfo == NULL)
@@ -2842,6 +2908,10 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		devinfo->ci = NULL;
 		goto fail;
 	}
+
+	ret = brcmf_pcie_set_dma_mask(devinfo);
+	if (ret)
+		goto fail;
 
 	core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
 	if (core->rev >= 64)
@@ -3089,17 +3159,18 @@ static const struct dev_pm_ops brcmf_pciedrvr_pm = {
 
 #define BRCMF_PCIE_DEVICE(dev_id, fw_vend) \
 	{ \
-		BRCM_PCIE_VENDOR_ID_BROADCOM, (dev_id), \
-		PCI_ANY_ID, PCI_ANY_ID, \
-		PCI_CLASS_NETWORK_OTHER << 8, 0xffff00, \
-		BRCMF_DRVDATA_ ## fw_vend \
+		PCI_DEVICE(BRCM_PCIE_VENDOR_ID_BROADCOM, (dev_id)), \
+		.class = PCI_CLASS_NETWORK_OTHER << 8, \
+		.class_mask = 0xffff00, \
+		.driver_data = BRCMF_DRVDATA_ ## fw_vend, \
 	}
 #define BRCMF_PCIE_DEVICE_SUB(dev_id, subvend, subdev, fw_vend) \
 	{ \
-		BRCM_PCIE_VENDOR_ID_BROADCOM, (dev_id), \
-		(subvend), (subdev), \
-		PCI_CLASS_NETWORK_OTHER << 8, 0xffff00, \
-		BRCMF_DRVDATA_ ## fw_vend \
+		PCI_DEVICE_SUB(BRCM_PCIE_VENDOR_ID_BROADCOM, (dev_id), \
+			       (subvend), (subdev)), \
+		.class = PCI_CLASS_NETWORK_OTHER << 8, \
+		.class_mask = 0xffff00, \
+		.driver_data = BRCMF_DRVDATA_ ## fw_vend, \
 	}
 
 static const struct pci_device_id brcmf_pcie_devid_table[] = {

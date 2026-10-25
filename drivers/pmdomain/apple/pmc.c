@@ -28,6 +28,7 @@
 #include <linux/bits.h>
 #include <linux/debugfs.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -39,6 +40,10 @@
 #include <linux/spinlock.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
+
+#if IS_ENABLED(CONFIG_APPLE_PMC_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
 
 #define APPLE_PMC_MAX_RAILS	8
 #define APPLE_PMC_MAX_AGENTS	32
@@ -60,6 +65,7 @@
  *	"rails" region
  * @dcs_rail: rail of the DRAM controller (DCS)
  * @dcs_max: highest DCS performance state
+ * @agent_rails: rails on which an agent is enabled; 0 for every rail
  * @ap_agent: voter agent of the application processor, which a DCS limit
  *	votes through
  */
@@ -71,7 +77,9 @@ struct apple_pmc_hw {
 	u32 rail_enable;
 	u32 dcs_rail;
 	u32 dcs_max;
+	u32 agent_rails;
 	u32 ap_agent;
+	bool has_pending;
 };
 
 struct apple_pmc {
@@ -115,6 +123,9 @@ static struct dentry *apple_pmc_debugfs_root;
 
 static u32 apple_pmc_enable_read(struct apple_pmc *pmc, unsigned int rail)
 {
+#if IS_ENABLED(CONFIG_APPLE_PMC_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_pmc_enable_read, pmc, rail);
+#endif
 	return readl(pmc->rails + pmc->hw->rail_enable + 4 * rail);
 }
 
@@ -125,7 +136,7 @@ static u32 apple_pmc_enable_read(struct apple_pmc *pmc, unsigned int rail)
 static int apple_pmc_enable_write(struct apple_pmc *pmc, unsigned int rail)
 {
 	void __iomem *reg = pmc->rails + pmc->hw->rail_enable + 4 * rail;
-	u32 old = readl(reg);
+	u32 old = apple_pmc_enable_read(pmc, rail);
 	u32 val = pmc->enable[rail];
 
 	if (pmc->dcs_state && rail == pmc->hw->dcs_rail)
@@ -134,7 +145,7 @@ static int apple_pmc_enable_write(struct apple_pmc *pmc, unsigned int rail)
 		return 0;
 
 	writel(val, reg);
-	if (readl(reg) != val) {
+	if (apple_pmc_enable_read(pmc, rail) != val) {
 		dev_err_ratelimited(pmc->dev,
 				    "rail %u enable %#x -> %#x did not stick\n",
 				    rail, old, val);
@@ -169,10 +180,10 @@ static void apple_pmc_enable_restore(struct apple_pmc *pmc, const u32 *prev,
 }
 
 /*
- * Enable or disable @agent on every rail. If a rail does not take the
- * change, undo it on the rails changed so far: genpd keeps a domain whose
- * power_on() fails off, and never calls its power_off(), so an agent left
- * enabled on some rails would stay enabled for good.
+ * Enable or disable @agent on the rails in hw->agent_rails. If a rail does
+ * not take the change, undo it on the rails changed so far: genpd keeps a
+ * domain whose power_on() fails off, and never calls its power_off(), so an
+ * agent left enabled on some rails would stay enabled for good.
  */
 static int apple_pmc_agent_enable(struct apple_pmc *pmc, unsigned int agent,
 				  bool enable)
@@ -185,6 +196,8 @@ static int apple_pmc_agent_enable(struct apple_pmc *pmc, unsigned int agent,
 	raw_spin_lock_irqsave(&pmc->lock, flags);
 	memcpy(prev, pmc->enable, sizeof(prev));
 	for (rail = 0; rail < pmc->hw->rails; rail++) {
+		if (pmc->hw->agent_rails && !(pmc->hw->agent_rails & BIT(rail)))
+			continue;
 		ret = apple_pmc_enable_update(pmc, rail,
 					      enable ? BIT(agent) : 0,
 					      enable ? 0 : BIT(agent));
@@ -284,6 +297,11 @@ int apple_pmc_floor_update(struct device *dev, unsigned int agent, u32 mask,
 
 	reg = pmc->voters + agent * pmc->hw->agent_stride;
 	raw_spin_lock_irqsave(&pmc->lock, flags);
+	if (pmc->hw->has_pending) {
+		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
+		if (ret)
+			goto unlock;
+	}
 	old = readl(reg);
 	val = (old & ~mask) | (value & mask);
 	if (val != old) {
@@ -291,6 +309,9 @@ int apple_pmc_floor_update(struct device *dev, unsigned int agent, u32 mask,
 		if ((readl(reg) & mask) != (value & mask))
 			ret = -EIO;
 	}
+	if (!ret && pmc->hw->has_pending)
+		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
+unlock:
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 
 	return ret;
@@ -539,7 +560,7 @@ static int apple_pmc_dcs_init(struct apple_pmc *pmc)
 		ops = &apple_pmc_dcs_power_ops;
 	}
 
-	cdev = devm_thermal_of_cooling_device_register(dev, np, "pmc-dcs", pmc,
+	cdev = devm_thermal_of_cooling_device_register(dev, 0, "pmc-dcs", pmc,
 						       ops);
 	if (IS_ERR(cdev))
 		return dev_err_probe(dev, PTR_ERR(cdev),
@@ -705,6 +726,23 @@ static int apple_pmc_probe(struct platform_device *pdev)
 	struct apple_pmc *pmc;
 	unsigned int rail;
 	int count, i, ret;
+	struct device_node *pmp_node;
+	struct platform_device *pmp;
+	struct device_link *link;
+
+	pmp_node = of_parse_phandle(np, "apple,pmp", 0);
+	if (pmp_node) {
+		pmp = of_find_device_by_node(pmp_node);
+		of_node_put(pmp_node);
+		if (!pmp)
+			return -EPROBE_DEFER;
+		link = device_link_add(dev, &pmp->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
+		put_device(&pmp->dev);
+		if (!link)
+			return -EINVAL;
+		if (link->supplier->links.status != DL_DEV_DRIVER_BOUND)
+			return -EPROBE_DEFER;
+	}
 
 	pmc = devm_kzalloc(dev, sizeof(*pmc), GFP_KERNEL);
 	if (!pmc)
@@ -795,6 +833,18 @@ static int apple_pmc_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct apple_pmc_hw apple_pmc_hw_t8132 = {
+	.agent_stride = 0x4000,
+	.agents = 4,
+	.rails = 2,
+	.agent_state = 0x0,
+	.rail_enable = 0x2000,
+	.dcs_rail = 0,
+	.dcs_max = 5,
+	.ap_agent = 3,
+	.has_pending = true,
+};
+
 static const struct apple_pmc_hw apple_pmc_hw_t8140 = {
 	.agent_stride = 0x4000,
 	.agents = 4,
@@ -806,8 +856,29 @@ static const struct apple_pmc_hw apple_pmc_hw_t8140 = {
 	.ap_agent = 3,
 };
 
+/*
+ * T6040 (M4 Pro): the T8140 layout, with DCS states 0-5 and fabric states
+ * 0-2. The ADT's voter-agent rail mask is 0x7 (DCS, SOC and DISP_INT).
+ * Agents are enabled on DCS and SOC only: iBoot leaves both at their
+ * lowest state, so an agent with a zero floor changes nothing there. How
+ * DISP_INT arbitrates zero floors is not known.
+ */
+static const struct apple_pmc_hw apple_pmc_hw_t6040 = {
+	.agent_stride = 0x4000,
+	.agents = 4,
+	.rails = 4,
+	.agent_state = 0x0,
+	.rail_enable = 0x2000,
+	.dcs_rail = 0,
+	.dcs_max = 5,
+	.agent_rails = GENMASK(1, 0),
+	.ap_agent = 3,
+};
+
 static const struct of_device_id apple_pmc_of_match[] = {
+	{ .compatible = "apple,t8132-pmc", .data = &apple_pmc_hw_t8132 },
 	{ .compatible = "apple,t8140-pmc", .data = &apple_pmc_hw_t8140 },
+	{ .compatible = "apple,t6041-pmc", .data = &apple_pmc_hw_t6040 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_pmc_of_match);

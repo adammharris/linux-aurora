@@ -73,8 +73,11 @@
 /*
  * Give SS hubs 200ms time after wake to train downstream links before
  * assuming no port activity and allowing hub to runtime suspend back.
+ * Root hubs have no upstream hub whose wake propagation needs to be
+ * accounted for, so they need less time, use 120ms for them.
  */
 #define USB_SS_PORT_U0_WAKE_TIME	200  /* ms */
+#define USB_SS_RH_PORT_U0_WAKE_TIME     120 /* ms */
 
 /* Protect struct usb_device->state and ->children members
  * Note: Both are also protected by ->dev.sem, except that ->state can
@@ -623,11 +626,11 @@ static int hub_ext_port_status(struct usb_hub *hub, int port1, int type,
 	mutex_lock(&hub->status_mutex);
 	ret = get_port_status(hub->hdev, port1, &hub->status->port, type, len);
 	if (ret < len) {
-		if (ret != -ENODEV)
-			dev_err(hub->intfdev,
-				"%s failed (err = %d)\n", __func__, ret);
 		if (ret >= 0)
 			ret = -EIO;
+		if (ret != -ENODEV)
+			dev_dbg(hub->intfdev,
+				"get_port_status failed: err = %d\n", ret);
 	} else {
 		*status = le16_to_cpu(hub->status->port.wPortStatus);
 		*change = le16_to_cpu(hub->status->port.wPortChange);
@@ -753,10 +756,12 @@ void usb_wakeup_notification(struct usb_device *hdev,
 {
 	struct usb_hub *hub;
 	struct usb_port *port_dev;
+	unsigned long flags;
 
 	if (!hdev)
 		return;
 
+	spin_lock_irqsave(&device_state_lock, flags);
 	hub = usb_hub_to_struct_hub(hdev);
 	if (hub) {
 		port_dev = hub->ports[portnum - 1];
@@ -766,6 +771,7 @@ void usb_wakeup_notification(struct usb_device *hdev,
 		set_bit(portnum, hub->wakeup_bits);
 		kick_hub_wq(hub);
 	}
+	spin_unlock_irqrestore(&device_state_lock, flags);
 }
 EXPORT_SYMBOL_GPL(usb_wakeup_notification);
 
@@ -991,10 +997,12 @@ static int hub_hub_status(struct usb_hub *hub,
 
 	mutex_lock(&hub->status_mutex);
 	ret = get_hub_status(hub->hdev, &hub->status->hub);
-	if (ret < 0) {
+	if (ret < (int)sizeof(hub->status->hub)) {
+		if (ret >= 0)
+			ret = -EIO;
 		if (ret != -ENODEV)
-			dev_err(hub->intfdev,
-				"%s failed (err = %d)\n", __func__, ret);
+			dev_dbg(hub->intfdev,
+				"get_hub_status failed: err = %d\n", ret);
 	} else {
 		*status = le16_to_cpu(hub->status->hub.wHubStatus);
 		*change = le16_to_cpu(hub->status->hub.wHubChange);
@@ -1072,6 +1080,38 @@ enum hub_activation_type {
 	HUB_INIT, HUB_INIT2, HUB_INIT3,		/* INITs must come first */
 	HUB_POST_RESET, HUB_RESUME, HUB_RESET_RESUME,
 };
+
+static void hub_reconnect_ss_peer(struct usb_hub *hub)
+{
+	struct usb_device *ss = hub->hdev;
+	struct usb_hub *parent, *hs_hub;
+	struct usb_port *upstream, *peer;
+
+	if (!ss->parent || !hub_is_superspeed(ss))
+		return;
+
+	guard(mutex)(&usb_port_peer_mutex);
+	parent = usb_hub_to_struct_hub(ss->parent);
+	if (!parent || ss->portnum > ss->parent->maxchild)
+		return;
+	upstream = parent->ports[ss->portnum - 1];
+	peer = upstream->peer;
+	/* Only firmware-described, asymmetric paths need this handover. */
+	if (!upstream->connector_node || !peer)
+		return;
+	hs_hub = usb_hub_to_struct_hub(to_usb_device(peer->dev.parent->parent));
+	if (!hs_hub || hs_hub->disconnected || hs_hub->hdev->level == ss->parent->level)
+		return;
+
+	/* Disconnect publishes child = NULL under device_state_lock. */
+	scoped_guard(spinlock_irq, &device_state_lock) {
+		if (!peer->child || peer->reconnect_ss || peer->ss_reconnected)
+			return;
+		peer->reconnect_hs = usb_get_dev(peer->child);
+		peer->reconnect_ss = usb_get_dev(ss);
+	}
+	kick_hub_wq(hs_hub);
+}
 
 static void hub_init_func2(struct work_struct *ws);
 static void hub_init_func3(struct work_struct *ws);
@@ -1329,6 +1369,10 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
  init3:
 	hub->quiescing = 0;
 
+	/* The SS hub's ports are powered and debounced before USB2 restarts. */
+	if (type == HUB_INIT2 || type == HUB_INIT3)
+		hub_reconnect_ss_peer(hub);
+
 	status = usb_submit_urb(hub->urb, GFP_NOIO);
 	if (status < 0)
 		dev_err(hub->intfdev, "activate --> %d\n", status);
@@ -1353,7 +1397,9 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 
 		queue_delayed_work(system_power_efficient_wq,
 				   &hub->post_resume_work,
-				   msecs_to_jiffies(USB_SS_PORT_U0_WAKE_TIME));
+				   msecs_to_jiffies(hdev->parent ?
+				USB_SS_PORT_U0_WAKE_TIME :
+				USB_SS_RH_PORT_U0_WAKE_TIME));
 		return;
 	}
 
@@ -2205,6 +2251,7 @@ int usb_hub_port_power_off(struct usb_device *hdev, int port1)
 		goto put_port;
 	}
 
+	dev_dbg(&port_dev->dev, "lane handover: power off\n");
 	/* The runtime PM reference is dropped once the hold ends. */
 	port_dev->held_off = !disabled;
 	/* Nothing hub_wq still has queued for the port applies to it off. */
@@ -2270,6 +2317,7 @@ int usb_hub_port_power_on(struct usb_device *hdev, int port1)
 	ret = usb_hub_set_port_power(hdev, hub, port1, true);
 	if (!ret) {
 		msleep(hub_power_on_good_delay(hub));
+		dev_dbg(&port_dev->dev, "lane handover: power on\n");
 		if (hub_is_superspeed(hdev))
 			set_bit(port1, hub->warm_reset_bits);
 		set_bit(port1, hub->change_bits);
@@ -2564,7 +2612,7 @@ static void show_string(struct usb_device *udev, char *id, char *string)
 	dev_info(&udev->dev, "%s: %s\n", id, string);
 }
 
-static void announce_device(struct usb_device *udev)
+static void announce_device_ids(struct usb_device *udev)
 {
 	u16 bcdDevice = le16_to_cpu(udev->descriptor.bcdDevice);
 
@@ -2573,6 +2621,10 @@ static void announce_device(struct usb_device *udev)
 		le16_to_cpu(udev->descriptor.idVendor),
 		le16_to_cpu(udev->descriptor.idProduct),
 		bcdDevice >> 8, bcdDevice & 0xff);
+}
+
+static void announce_device_strings(struct usb_device *udev)
+{
 	dev_info(&udev->dev,
 		"New USB device strings: Mfr=%d, Product=%d, SerialNumber=%d\n",
 		udev->descriptor.iManufacturer,
@@ -2583,7 +2635,8 @@ static void announce_device(struct usb_device *udev)
 	show_string(udev, "SerialNumber", udev->serial);
 }
 #else
-static inline void announce_device(struct usb_device *udev) { }
+static inline void announce_device_ids(struct usb_device *udev) { }
+static inline void announce_device_strings(struct usb_device *udev) { }
 #endif
 
 
@@ -2814,6 +2867,9 @@ int usb_new_device(struct usb_device *udev)
 		device_init_wakeup(&udev->dev, 0);
 	}
 
+	/* Announce the device identity */
+	announce_device_ids(udev);
+
 	/* Tell the runtime-PM framework the device is active */
 	pm_runtime_set_active(&udev->dev);
 	pm_runtime_get_noresume(&udev->dev);
@@ -2835,8 +2891,8 @@ int usb_new_device(struct usb_device *udev)
 	udev->dev.devt = MKDEV(USB_DEVICE_MAJOR,
 			(((udev->bus->busnum-1) * 128) + (udev->devnum-1)));
 
-	/* Tell the world! */
-	announce_device(udev);
+	/* Announce the device's product, manufacturer and serial number */
+	announce_device_strings(udev);
 
 	if (udev->serial)
 		add_device_randomness(udev->serial, strlen(udev->serial));
@@ -3311,7 +3367,7 @@ static int hub_port_reset(struct usb_hub *hub, int port1,
 		delay = HUB_LONG_RESET_TIME;
 	}
 
-	dev_err(&port_dev->dev, "Cannot enable. Maybe the USB cable is bad?\n");
+	dev_err_ratelimited(&port_dev->dev, "Cannot enable. Maybe the USB cable is bad?\n");
 
 done:
 	if (status == 0) {
@@ -5601,6 +5657,10 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 	static int unreliable_port = -1;
 	bool retry_locked;
 
+	/* Consume our own reconnect once; physical changes start a new attachment. */
+	scoped_guard(mutex, &usb_port_peer_mutex)
+		usb_port_ss_reconnect_event(port_dev, portstatus, portchange);
+
 	/* Disconnect any existing devices under this port */
 	if (udev) {
 		if (hcd->usb_phy && !hdev->parent)
@@ -6074,6 +6134,52 @@ static void port_event(struct usb_hub *hub, int port1)
 		hub_port_connect_change(hub, port1, portstatus, portchange);
 }
 
+/* Process on the USB2 parent's worker: never nest the two peer hub locks. */
+static void hub_port_reconnect_ss(struct usb_hub *hub, int port1)
+{
+	struct usb_port *port = hub->ports[port1 - 1];
+	struct usb_device *hs, *ss;
+	bool reconnect;
+	int ret;
+
+	scoped_guard(mutex, &usb_port_peer_mutex) {
+		hs = port->reconnect_hs;
+		ss = port->reconnect_ss;
+		port->reconnect_hs = NULL;
+		port->reconnect_ss = NULL;
+		if (!ss)
+			return;
+		reconnect = usb_port_needs_ss_reconnect(port, hs, ss);
+	}
+	if (!reconnect)
+		goto out;
+
+	dev_info(&port->dev, "reconnecting USB2 hub after late SuperSpeed connection\n");
+	ret = usb_hub_port_power_off(hub->hdev, port1);
+	if (ret)
+		goto report;
+	/* Power loss can reconnect the SS half too; it must not start a loop. */
+	scoped_guard(mutex, &usb_port_peer_mutex) {
+		port->ss_reconnected = true;
+		port->ss_reconnect_pending = true;
+	}
+
+	/* A transient control-transfer error must not strand the powered-off hub. */
+	for (int retry = 0; retry < 5; retry++) {
+		ret = usb_hub_port_power_on(hub->hdev, port1);
+		if (ret >= 0)
+			break;
+		if (retry < 4)
+			msleep(100 << retry);
+	}
+report:
+	if (ret < 0)
+		dev_warn(&port->dev, "late SuperSpeed handover failed: %d\n", ret);
+ out:
+	usb_put_dev(hs);
+	usb_put_dev(ss);
+}
+
 static void hub_event(struct work_struct *work)
 {
 	struct usb_device *hdev;
@@ -6133,6 +6239,10 @@ static void hub_event(struct work_struct *work)
 		hub->nerrors = 0;
 		hub->error = 0;
 	}
+
+	/* Each request pins both observed devices and is consumed only once. */
+	for (i = 1; i <= hdev->maxchild; i++)
+		hub_port_reconnect_ss(hub, i);
 
 	/* deal with port status changes */
 	for (i = 1; i <= hdev->maxchild; i++) {

@@ -102,9 +102,6 @@ static const struct {
 	int version;
 	const char *string;
 } version_strings[] = {
-#ifdef CONFIG_SMB_INSECURE_SERVER
-	{SMB1_PROT, SMB1_VERSION_STRING},
-#endif
 	{SMB2_PROT, SMB20_VERSION_STRING},
 	{SMB21_PROT, SMB21_VERSION_STRING},
 	{SMB30_PROT, SMB30_VERSION_STRING},
@@ -167,7 +164,22 @@ int ksmbd_verify_smb_message(struct ksmbd_work *work)
 	hdr = smb_get_msg(work->request_buf);
 	if (*(__le32 *)hdr->Protocol == SMB1_PROTO_NUMBER &&
 	    hdr->Command == SMB_COM_NEGOTIATE) {
-		work->conn->outstanding_credits++;
+		struct ksmbd_conn *conn = work->conn;
+
+		conn->outstanding_credits++;
+		/*
+		 * A legacy SMB1 multi-protocol negotiate occupies sequence
+		 * number 0 but does not pass through
+		 * ksmbd_smb2_check_message(). Consume it here so that, after
+		 * the connection is upgraded to SMB2, the command sequence
+		 * window can advance instead of staying pinned at 0.
+		 */
+		spin_lock(&conn->credits_lock);
+		if (conn->seq_low == 0) {
+			__clear_bit(0, conn->seq_bitmap);
+			conn->seq_low = 1;
+		}
+		spin_unlock(&conn->credits_lock);
 		return 0;
 	}
 
@@ -188,11 +200,6 @@ bool ksmbd_smb_request(struct ksmbd_conn *conn)
 		return false;
 
 	proto = (__le32 *)smb_get_msg(conn->request_buf);
-	if (*proto == SMB2_COMPRESSION_TRANSFORM_ID) {
-		pr_err_ratelimited("smb2 compression not support yet");
-		return false;
-	}
-
 	if (*proto != SMB1_PROTO_NUMBER &&
 	    *proto != SMB2_PROTO_NUMBER &&
 	    *proto != SMB2_TRANSFORM_PROTO_NUM)

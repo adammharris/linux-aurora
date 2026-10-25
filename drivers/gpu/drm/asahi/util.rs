@@ -124,6 +124,23 @@ impl<'a> Reader<'a> {
         Ok(obj)
     }
 
+    /// Reads a record like [`Self::read_up_to`], for a path that implements only the first
+    /// `supported` bytes of `T`. Any nonzero byte of the declared record from `supported` on,
+    /// whether in a field this path does not implement or in a tail beyond `T`, fails with
+    /// `EINVAL` instead of being ignored.
+    pub(crate) fn read_supported<T: AnyBitPattern>(
+        &mut self,
+        declared_size: usize,
+        supported: usize,
+    ) -> Result<T> {
+        let end = self.offset.checked_add(declared_size).ok_or(EINVAL)?;
+        let record = self.buffer.get(self.offset..end).ok_or(EINVAL)?;
+        if record.iter().skip(supported).any(|byte| *byte != 0) {
+            return Err(EINVAL);
+        }
+        self.read_up_to(declared_size)
+    }
+
     pub(crate) fn read<T: Default + AnyBitPattern>(&mut self) -> Result<T> {
         self.read_up_to(core::mem::size_of::<T>())
     }
@@ -138,5 +155,65 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn rewind(&mut self) {
         self.offset = 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    #[derive(Default, Copy, Clone)]
+    struct Pair {
+        first: u32,
+        second: u32,
+    }
+
+    unsafe impl AnyBitPattern for Pair {}
+    unsafe impl AnyBitPattern for u32 {}
+
+    #[test]
+    fn read_supported_accepts_zero_unsupported_fields_and_tail() {
+        let raw = [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0];
+        let mut reader = Reader::new(&raw);
+        let pair: Pair = reader.read_supported(12, 4).unwrap();
+        assert_eq!(pair.first, 5);
+        assert_eq!(pair.second, 0);
+        assert_eq!(reader.read::<u32>().unwrap(), 6);
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn read_supported_accepts_a_record_shorter_than_the_supported_part() {
+        let raw = [7, 0];
+        let mut reader = Reader::new(&raw);
+        let pair: Pair = reader.read_supported(2, 4).unwrap();
+        assert_eq!(pair.first, 7);
+        assert_eq!(pair.second, 0);
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn read_supported_rejects_an_unsupported_field() {
+        let raw = [1, 0, 0, 0, 0, 1, 0, 0];
+        let mut reader = Reader::new(&raw);
+        assert!(reader.read_supported::<Pair>(8, 4).is_err());
+    }
+
+    #[test]
+    fn read_supported_rejects_a_nonzero_tail_beyond_the_type() {
+        let raw = [1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0x80];
+        let mut reader = Reader::new(&raw);
+        assert!(reader.read_supported::<Pair>(12, 8).is_err());
+        let mut reader = Reader::new(&raw);
+        let pair: Pair = reader.read_supported(8, 8).unwrap();
+        assert_eq!(pair.second, 2);
+    }
+
+    #[test]
+    fn read_supported_rejects_a_truncated_record() {
+        let raw = [1, 0, 0, 0];
+        let mut reader = Reader::new(&raw);
+        assert!(reader.read_supported::<Pair>(8, 8).is_err());
     }
 }

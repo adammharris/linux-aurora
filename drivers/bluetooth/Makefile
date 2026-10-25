@@ -9,9 +9,6 @@ obj-$(CONFIG_BT_HCIBCM203X)	+= bcm203x.o
 obj-$(CONFIG_BT_HCIBCM4377)	+= hci_bcm4377.o
 obj-$(CONFIG_BT_HCIBPA10X)	+= bpa10x.o
 obj-$(CONFIG_BT_HCIBFUSB)	+= bfusb.o
-obj-$(CONFIG_BT_HCIDTL1)	+= dtl1_cs.o
-obj-$(CONFIG_BT_HCIBT3C)	+= bt3c_cs.o
-obj-$(CONFIG_BT_HCIBLUECARD)	+= bluecard_cs.o
 
 obj-$(CONFIG_BT_HCIBTUSB)	+= btusb.o
 obj-$(CONFIG_BT_HCIBTSDIO)	+= btsdio.o
@@ -55,3 +52,5 @@ hci_uart-$(CONFIG_BT_HCIUART_AML)	+= hci_aml.o
 hci_uart-objs				:= $(hci_uart-y)
 
 obj-$(CONFIG_BT_MTK7932_PCIE) += mt7932_bt_pcie.o
+
+CONTEXT_ANALYSIS := y

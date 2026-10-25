@@ -130,7 +130,7 @@ static struct cd321x_test *cd321x_test_port(struct kunit *test)
 
 	mutex_init(&t->cd.tps.lock);
 	t->cd.tps.dev = dev;
-	t->cd.tps.data = &tipd_cd321x_data;
+	t->cd.tps.data = tipd_hw_variants[TIPD_VARIANT_CD321X];
 	t->cd.tps.regmap = devm_regmap_init(dev, &cd321x_test_bus, &t->ctrl,
 					    &tps6598x_regmap_config);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, t->cd.tps.regmap);

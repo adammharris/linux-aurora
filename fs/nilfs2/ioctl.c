@@ -69,7 +69,7 @@ static int nilfs_ioctl_wrap_copy(struct the_nilfs *nilfs,
 	if (argv->v_index > ~(__u64)0 - argv->v_nmembs)
 		return -EINVAL;
 
-	buf = (void *)get_zeroed_page(GFP_NOFS);
+	buf = kzalloc(PAGE_SIZE, GFP_NOFS);
 	if (unlikely(!buf))
 		return -ENOMEM;
 	maxmembs = PAGE_SIZE / argv->v_size;
@@ -107,7 +107,7 @@ static int nilfs_ioctl_wrap_copy(struct the_nilfs *nilfs,
 	}
 	argv->v_nmembs = total;
 
-	free_pages((unsigned long)buf, 0);
+	kfree(buf);
 	return ret;
 }
 
@@ -612,7 +612,7 @@ static int nilfs_ioctl_move_blocks(struct super_block *sb,
 	struct nilfs_vdesc *vdesc;
 	struct buffer_head *bh, *n;
 	LIST_HEAD(buffers);
-	ino_t ino;
+	u64 ino;
 	__u64 cno;
 	int i, ret;
 

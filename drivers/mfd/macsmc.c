@@ -12,6 +12,7 @@
 #include <linux/device.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
+#include <linux/iopoll.h>
 #include <linux/math.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
@@ -274,7 +275,7 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 {
 	guard(spinlock_irqsave)(&smc->lock);
 	u8 result;
-	int ret;
+	int ret, poll_ret;
 	u64 msg;
 
 	if (size > SMC_MAX_SIZE || size == 0)
@@ -284,6 +285,15 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 		return -EIO;
 	if (!smc->atomic_mode)
 		return -EIO;
+	/*
+	 * A poll timeout or a mismatched reply does not cancel the command or
+	 * release its SRAM. Its late reply does: take it if it has arrived.
+	 */
+	if (smc->atomic_pending) {
+		ret = apple_rtkit_poll(smc->rtk);
+		if (ret < 0 || smc->atomic_pending)
+			return -EBUSY;
+	}
 
 	memcpy_toio(smc->shmem.iomem, buf, size);
 	smc->msg_id = (smc->msg_id + 1) & 0xf;
@@ -295,20 +305,28 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 
 	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT, msg, NULL, true);
 	if (ret < 0) {
+		/* Never sent, so no reply will release the buffer. */
+		smc->atomic_pending = false;
 		dev_err(smc->dev, "Failed to send command (%d)\n", ret);
 		return ret;
 	}
 
-	while (smc->atomic_pending) {
-		ret = apple_rtkit_poll(smc->rtk);
-		if (ret < 0) {
-			dev_err(smc->dev, "RTKit poll failed (%llx)", msg);
-			return ret;
-		}
-		udelay(100);
+	ret = read_poll_timeout_atomic(apple_rtkit_poll, poll_ret,
+				       poll_ret < 0 || !smc->atomic_pending,
+				       100, SMC_TIMEOUT_MS * USEC_PER_MSEC,
+				       false, smc->rtk);
+	if (poll_ret < 0) {
+		dev_err(smc->dev, "RTKit poll failed (%llx)", msg);
+		return poll_ret;
+	}
+	if (ret < 0 || smc->atomic_pending) {
+		dev_err(smc->dev, "Atomic SMC command timed out (%llx)\n", msg);
+		return -ETIMEDOUT;
 	}
 
 	if (FIELD_GET(SMC_ID, smc->cmd_ret) != smc->msg_id) {
+		/* This response cannot resolve ownership of the published command. */
+		smc->atomic_pending = true;
 		dev_err(smc->dev, "Command sequence mismatch (expected %d, got %d)\n",
 			smc->msg_id, (unsigned int)FIELD_GET(SMC_ID, smc->cmd_ret));
 		return -EIO;
@@ -446,6 +464,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&smc->mutex);
+	spin_lock_init(&smc->lock);
 	smc->dev = &pdev->dev;
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
 	if (IS_ERR(smc->sram_base))

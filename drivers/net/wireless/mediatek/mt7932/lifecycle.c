@@ -66,4 +66,7 @@ void mt_stop_host(struct mt7932 *m)
 				      NULL, 0, true, GFP_KERNEL);
 	}
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
+	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
+	m->connect_sae_pwd_length = 0;
+	m->connect_pmk_valid = false;
 }

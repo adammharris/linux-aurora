@@ -3,6 +3,7 @@
  * TI TPS6598x / Apple CD321x / SN201202x debugfs interface
  *
  * /sys/kernel/debug/usb/tipd/<device>/command
+ *	Only with CONFIG_TYPEC_TPS6598X_DEBUG_COMMANDS.
  *	write: 4CC command followed by 0..64 bytes for DATA1. The command is
  *	       executed as a whole under the driver's lock. Only a small set
  *	       of commands used to talk to a connected Apple device (as
@@ -269,8 +270,9 @@ void tipd_debugfs_register(struct tps6598x *tps)
 
 	dbg->dentry = debugfs_create_dir(dev_name(tps->dev), tipd_debugfs_root);
 	tps->debugfs = dbg;
-	debugfs_create_file("command", 0600, dbg->dentry, tps,
-			    &tipd_debugfs_command_fops);
+	if (IS_ENABLED(CONFIG_TYPEC_TPS6598X_DEBUG_COMMANDS))
+		debugfs_create_file("command", 0600, dbg->dentry, tps,
+				    &tipd_debugfs_command_fops);
 	debugfs_create_file("regs", 0400, dbg->dentry, tps,
 			    &tipd_debugfs_regs_fops);
 }

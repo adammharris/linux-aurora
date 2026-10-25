@@ -1,7 +1,7 @@
 .. SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 Apple DCP H17P backlight integration
-===================================
+====================================
 
 The backlight policy implements the clean display specification's BACKLIGHT-1
 through BACKLIGHT-4, with IOMFB-3 and LIFETIME-1 through LIFETIME-3 constraints.
@@ -129,7 +129,7 @@ Hardware acceptance requires O-BACKLIGHT, O-BACKLIGHT-TAKEOVER (10 Hz PBwo with
 no jump above 0.05 W), O-BACKLIGHT-CRC, O-DPMS (twenty cycles), and O-SUSPEND.
 
 Measured activation and software replay
---------------------------------------
+---------------------------------------
 
 Linux-boundary measurements on the default J700 driver establish an 18-byte
 fragment at A408 offsets 0x354 through 0x365. Brightness-enabled presents use

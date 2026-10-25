@@ -102,6 +102,9 @@ struct apple_dpxbar {
 	const struct apple_dpxbar_hw *hw;
 	void __iomem *regs;
 	int selected_dispext[MUX_MAX];
+	/* T6030 programs all its outputs itself, see apple_dpxbar_t6030_link() */
+	bool t6030_dpin;
+	bool tunnel_link_up[MUX_MAX];
 	spinlock_t lock;
 };
 
@@ -200,6 +203,125 @@ static void t602x_dump(struct apple_dpxbar *xbar, const char *tag)
 		readl(xbar->regs + T602X_REG_81C_STAT));
 }
 
+/* T602X compact register map; the older dpphy-only names above are retained. */
+#define T602X_RD_PCLK1 0x00c
+#define T602X_RD_PCLK2 0x010
+#define T602X_RD_GATE 0x014
+#define T602X_RD_SELECT 0x018
+#define T602X_OUT_PCLK1 0x01c
+#define T602X_OUT_PCLK2 0x020
+#define T602X_OUT_GATE 0x024
+#define T602X_OUT_SELECT 0x028
+#define T602X_DISPEXT_ENABLE 0x02c
+#define T602X_MUX_SELECT 0x030
+#define T602X_ATC_ENABLE 0x034
+
+/*
+ * Field of a T6030 output in the gate, select and enable registers. DP IN 0,
+ * DP IN 1 and the DP PHY output use bits 0, 4 and 8.
+ */
+static unsigned int apple_dpxbar_t6030_shift(unsigned int index)
+{
+	switch (index) {
+	case MUX_DPIN0:
+		return 0;
+	case MUX_DPIN1:
+		return 4;
+	case MUX_DPPHY:
+	default:
+		return 8;
+	}
+}
+
+/* Called with the crossbar lock held and a selected output. */
+static void apple_dpxbar_t6030_link(struct apple_dpxbar *xbar,
+				  unsigned int index, bool up)
+{
+	u32 state = xbar->selected_dispext[index];
+	u32 u = BIT(state), shift = apple_dpxbar_t6030_shift(index);
+	u32 d = BIT(shift);
+	bool pclk2 = (index == MUX_DPIN1) ^ (state & 1);
+	u32 ps = pclk2 ? 3 : 1;
+	u32 rd = pclk2 ? T602X_RD_PCLK2 : T602X_RD_PCLK1;
+	u32 out = pclk2 ? T602X_OUT_PCLK2 : T602X_OUT_PCLK1;
+
+	lockdep_assert_held(&xbar->lock);
+	if (xbar->tunnel_link_up[index] == up)
+		return;
+	if (up) {
+		dpxbar_clear32(xbar, T602X_FIFO_WR_N_CLK_EN, u);
+		dpxbar_clear32(xbar, T602X_RD_GATE, u);
+		dpxbar_clear32(xbar, T602X_OUT_GATE, d);
+		udelay(1);
+		if ((readl(xbar->regs + 0x804) & u) ||
+		    (readl(xbar->regs + 0x810) & u) ||
+		    (readl(xbar->regs + 0x81c) & d))
+			dev_warn(xbar->dev, "%s: T602X clock gate status remains set\n",
+				 apple_dpxbar_names[index]);
+		dpxbar_set32(xbar, T602X_FIFO_WR_UNK_EN, u);
+		dpxbar_mask32(xbar, T602X_RD_SELECT, 3U << (2 * state), ps << (2 * state));
+		dpxbar_mask32(xbar, T602X_OUT_SELECT, 3U << shift, ps << shift);
+		dpxbar_set32(xbar, T602X_FIFO_WR_DPTX_CLK_EN, u);
+		dpxbar_set32(xbar, rd, u);
+		dpxbar_set32(xbar, out, d);
+		dpxbar_set32(xbar, T602X_ATC_ENABLE, d);
+		dpxbar_set32(xbar, T602X_DISPEXT_ENABLE, u);
+	} else {
+		dpxbar_clear32(xbar, T602X_DISPEXT_ENABLE, u);
+		dpxbar_clear32(xbar, T602X_FIFO_WR_DPTX_CLK_EN, u);
+		dpxbar_clear32(xbar, rd, u);
+		dpxbar_clear32(xbar, out, d);
+		udelay(1);
+		if ((readl(xbar->regs + 0x800) & u) ||
+		    (readl(xbar->regs + (pclk2 ? 0x80c : 0x808)) & u) ||
+		    (readl(xbar->regs + (pclk2 ? 0x818 : 0x814)) & d))
+			dev_warn(xbar->dev, "%s: T602X clocks remain active\n",
+				 apple_dpxbar_names[index]);
+		dpxbar_clear32(xbar, T602X_FIFO_WR_UNK_EN, u);
+		dpxbar_mask32(xbar, T602X_RD_SELECT, 3U << (2 * state), 0);
+		dpxbar_mask32(xbar, T602X_OUT_SELECT, 3U << shift, 0);
+		dpxbar_set32(xbar, T602X_FIFO_WR_N_CLK_EN, u);
+		dpxbar_set32(xbar, T602X_RD_GATE, u);
+		dpxbar_set32(xbar, T602X_OUT_GATE, d);
+	}
+	/* No T8103 cycle-slip workaround: T602X does not require one. */
+	xbar->tunnel_link_up[index] = up;
+}
+
+/* Standard mux ownership, but Activate only routes; DidChange enables clocks. */
+static int apple_dpxbar_t6030_dpin_set(struct mux_control *mux, int state)
+{
+	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	unsigned long flags;
+	u32 shift = apple_dpxbar_t6030_shift(index);
+	u32 mask = (0xfU << shift) | (0xfU << (shift + 12));
+	unsigned int i;
+
+	if (state != MUX_IDLE_DISCONNECT && (state < 0 || state >= 9))
+		return -EINVAL;
+	spin_lock_irqsave(&xbar->lock, flags);
+	if (state >= 0) {
+		for (i = 0; i < MUX_MAX; i++) {
+			if (i != index && xbar->selected_dispext[i] == state) {
+				spin_unlock_irqrestore(&xbar->lock, flags);
+				return -EBUSY;
+			}
+		}
+	}
+	if (xbar->selected_dispext[index] >= 0)
+		apple_dpxbar_t6030_link(xbar, index, false);
+	if (state >= 0)
+		dpxbar_mask32(xbar, T602X_MUX_SELECT, mask,
+			      (state << shift) | (state << (shift + 12)));
+	/* Leave MUX and ATC enable intact on disconnect, as the hardware does. */
+	xbar->selected_dispext[index] = state;
+	spin_unlock_irqrestore(&xbar->lock, flags);
+	dev_info(xbar->dev, "%s: T602X route %d, clocks disabled\n",
+		 apple_dpxbar_names[index], state);
+	return 0;
+}
+
 static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 {
 	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
@@ -216,6 +338,9 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 
 	if (index >= MUX_MAX)
 		return -EINVAL;
+	/* T6030 routes every output on select and clocks it on link up. */
+	if (dpxbar->t6030_dpin)
+		return apple_dpxbar_t6030_dpin_set(mux, state);
 
 	if (state == MUX_IDLE_DISCONNECT) {
 		mux_state = 0;
@@ -518,6 +643,7 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 }
 
 static const struct mux_control_ops apple_dpxbar_ops;
+static const struct mux_control_ops apple_dpxbar_t602x_ops;
 
 static const u32 apple_dpxbar_atc_bits[MUX_MAX] = { ATC_DPPHY, ATC_DPIN0, ATC_DPIN1 };
 
@@ -776,12 +902,36 @@ static int apple_dpxbar_t602x_link_up(struct mux_control *mux)
 	return ret;
 }
 
+/* T6030: bring a selected output's connection up or down. */
+static int apple_dpxbar_t6030_link_set(struct mux_control *mux, bool up)
+{
+	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	unsigned long flags;
+	int ret = 0;
+
+	if (index >= MUX_MAX)
+		return -EINVAL;
+	spin_lock_irqsave(&xbar->lock, flags);
+	if (xbar->selected_dispext[index] < 0)
+		ret = -ENODEV;
+	else
+		apple_dpxbar_t6030_link(xbar, index, up);
+	spin_unlock_irqrestore(&xbar->lock, flags);
+	return ret;
+}
+
 int apple_dpxbar_link_up(struct mux_control *mux)
 {
 	if (!mux)
 		return -EINVAL;
-	if (mux->chip->ops == &apple_dpxbar_t602x_ops)
+	if (mux->chip->ops == &apple_dpxbar_t602x_ops) {
+		struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
+
+		if (xbar->t6030_dpin)
+			return apple_dpxbar_t6030_link_set(mux, true);
 		return apple_dpxbar_t602x_link_up(mux);
+	}
 	return apple_dpxbar_t8103_link_up(mux);
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_link_up);
@@ -823,8 +973,13 @@ int apple_dpxbar_link_down(struct mux_control *mux)
 {
 	if (!mux)
 		return -EINVAL;
-	if (mux->chip->ops == &apple_dpxbar_t602x_ops)
+	if (mux->chip->ops == &apple_dpxbar_t602x_ops) {
+		struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
+
+		if (xbar->t6030_dpin)
+			return apple_dpxbar_t6030_link_set(mux, false);
 		return apple_dpxbar_t602x_link_down(mux);
+	}
 	return apple_dpxbar_t8103_link_down(mux);
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_link_down);
@@ -848,6 +1003,7 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	spin_lock_init(&dpxbar->lock);
 
 	dpxbar->dev = dev;
+	dpxbar->t6030_dpin = of_machine_is_compatible("apple,t6030");
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
@@ -868,8 +1024,59 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
+	platform_set_drvdata(pdev, dpxbar);
 	return 0;
 }
+
+/*
+ * A T6030 crossbar loses its registers when its power domain goes down in
+ * system sleep, but its routes stay selected: a DCP selects a fixed route
+ * once at probe, and the mux core skips a select of the state it already
+ * holds. Rewrite every selected route on resume.
+ *
+ * The link clocks are not turned back on here. The PHY's link stays stopped
+ * until the DCP configures it again, and the clocks have to follow the PHY.
+ * If the enables did not survive, record the link as down, so the DCP's next
+ * apple_dpxbar_link_up() turns them on again.
+ */
+static int apple_dpxbar_resume(struct device *dev)
+{
+	struct apple_dpxbar *xbar = dev_get_drvdata(dev);
+	unsigned long restored = 0, flags;
+	unsigned int i;
+
+	if (!xbar || !xbar->t6030_dpin)
+		return 0;
+
+	spin_lock_irqsave(&xbar->lock, flags);
+	for (i = 0; i < MUX_MAX; i++) {
+		int state = xbar->selected_dispext[i];
+		u32 shift = apple_dpxbar_t6030_shift(i);
+		u32 mask = (0xfU << shift) | (0xfU << (shift + 12));
+		u32 route = (state << shift) | (state << (shift + 12));
+
+		if (state < 0)
+			continue;
+		if ((readl(xbar->regs + T602X_MUX_SELECT) & mask) != route) {
+			dpxbar_mask32(xbar, T602X_MUX_SELECT, mask, route);
+			restored |= BIT(i);
+		}
+		if (xbar->tunnel_link_up[i] &&
+		    (!(readl(xbar->regs + T602X_ATC_ENABLE) & BIT(shift)) ||
+		     !(readl(xbar->regs + T602X_DISPEXT_ENABLE) & BIT(state)))) {
+			xbar->tunnel_link_up[i] = false;
+			restored |= BIT(i);
+		}
+	}
+	spin_unlock_irqrestore(&xbar->lock, flags);
+
+	for_each_set_bit(i, &restored, MUX_MAX)
+		dev_info(dev, "%s: route %d restored after power loss, link waits for the DCP\n",
+			 apple_dpxbar_names[i], xbar->selected_dispext[i]);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_dpxbar_pm_ops, NULL, apple_dpxbar_resume);
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t8103 = {
 	.n_ufp = 2,
@@ -920,6 +1127,7 @@ static struct platform_driver apple_dpxbar_driver = {
 	.driver = {
 		.name = "apple-display-crossbar",
 		.of_match_table	= apple_dpxbar_ids,
+		.pm = pm_sleep_ptr(&apple_dpxbar_pm_ops),
 	},
 	.probe = apple_dpxbar_probe,
 };

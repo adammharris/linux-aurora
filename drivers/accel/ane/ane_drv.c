@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2022 Eileen Yoon <eyn@gmx.com> */
 
+#include <kunit/visibility.h>
 #include <linux/atomic.h>
 #include <linux/device.h>
 #include <linux/iommu.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
+#include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -27,35 +29,33 @@
  * map_mode) and read at BO-mmap/iommu-map time:
  *   bit 0 — mark DART descriptors IOMMU_CACHE (cacheable, inner-shareable)
  *   bit 1 — map the CPU vma cacheable instead of write-combine
- * 0 = today's WC CPU vmas + NC descriptors; 3 = both cacheable (device
- * accesses cohere with the CPU caches). Each axis is toggleable alone for
- * attribution.
+ * 0 = WC CPU vmas + NC descriptors; 3 = both cacheable (device
+ * accesses cohere with the CPU caches). Each axis is toggleable alone.
  *
- * Coherency evidence for mode 3, both SoCs:
- *  - T6001/t6001-test-host (apple,t6000-dart x3, APPLE_DART2 PTEs): (1) the ANE sits in
+ * Why mode 3 is coherent, on both SoCs:
+ *  - T6001 (apple,t6000-dart x3, APPLE_DART2 PTEs): (1) the ANE sits in
  *    the dma-coherent DART class every SoC DMA-API device uses on
  *    arm64/Asahi, where dma-iommu itself programs descriptors with
- *    IOMMU_CACHE; (2) eiln's pre-GEM driver (4566c89^) mapped BOs cacheable
+ *    IOMMU_CACHE; (2) eiln's pre-GEM driver mapped BOs cacheable
  *    on the CPU while DMAing them through this same iommu_map() path for
- *    months with no maintenance; (3) empirically, an alternating-pattern
- *    16-rep buffer-reuse battery over 6 programs in both directions is
- *    byte-identical WC+NC vs cached on every rep — stale cache lines would
- *    surface as the previous pattern's bytes.
- *  - T8103/m1-test-host (apple,t8103-dart x3, APPLE_DART1 PTEs): the DART1 PTE
+ *    months with no maintenance; (3) buffers reused with alternating
+ *    patterns in both directions read back byte-identical under WC+NC
+ *    and cached mappings — stale cache lines would surface as the
+ *    previous pattern's bytes.
+ *  - T8103 (apple,t8103-dart x3, APPLE_DART1 PTEs): the DART1 PTE
  *    format has no cacheability field (io-pgtable-dart.c dart_prot_to_pte),
  *    so bit 0 is a structural no-op there and the lever is the cached CPU
- *    vma alone. eiln's pre-GEM precedent ran exactly that on M1 for months.
- *    The same reuse battery is byte-identical (14/14) and the certified
- *    Parakeet E2E pins hold bit-for-bit with ane_exec 2561.2 -> 2402.0 ms.
+ *    vma alone. eiln's pre-GEM driver ran exactly that on M1 for months,
+ *    and the same buffer-reuse check reads back byte-identical.
  *
- * Default 3 (cached both sides). 0 is the documented rollback: runtime via
- * /sys/module/ane/parameters/map_mode, or by loading the retained prior
- * module (ane-96d5a88.ko on both hosts).
+ * Default 3 (cached both sides). 0 restores write-combine CPU vmas and
+ * non-cacheable descriptors at runtime via
+ * /sys/module/ane/parameters/map_mode.
  */
 static int map_mode = 3;
 module_param(map_mode, int, 0644);
 MODULE_PARM_DESC(map_mode,
-		 "BO mapping: bit0=IOMMU_CACHE DART descriptors, bit1=cacheable CPU vmas (default 3 = cached; 0 = writecombine + non-cacheable rollback)");
+		 "BO mapping: bit0=IOMMU_CACHE DART descriptors, bit1=cacheable CPU vmas (default 3 = cached; 0 = writecombine + non-cacheable fallback)");
 
 /*
  * Producer-side stats (ane_stats sysfs, ane_timeline debugfs), read
@@ -136,8 +136,8 @@ static unsigned long ane_iommu_clear_range(struct ane_device *ane, u64 start,
  * inserted. A VALID PTE in a just-reserved range is therefore a stray
  * from a torn-down session or a lost unmap. Both map paths clear it once
  * and retry instead of poisoning every later BO_INIT until reload
- * (m1-test-host 2026-09-25: dart_init_pte -EEXIST at 0x4000 for the rest
- * of the session).
+ * (dart_init_pte would return -EEXIST at that IOVA for the rest of the
+ * session).
  */
 static int ane_iommu_map_each(struct ane_device *ane, struct ane_bo *bo,
 			      int prot)
@@ -438,8 +438,8 @@ static void ane_gem_free_object(struct drm_gem_object *gem)
 			 * DMA. The range's node stays reserved and tracked
 			 * until recovery quiesces the engine and reclaims
 			 * it, so no later BO_INIT can map over these PTEs
-			 * (a leaked-but-forgotten mapping is what turned
-			 * into dart_init_pte -EEXIST WARNs on m1-test-host).
+			 * (a leaked-but-forgotten mapping turns into
+			 * dart_init_pte -EEXIST WARNs).
 			 */
 			dev_err(ane->dev, "wedged: preserving bo mapping\n");
 			list_del_init(&bo->node);
@@ -583,6 +583,26 @@ static int ane_bo_free(struct drm_device *drm, void *data,
 	return 0;
 }
 
+/*
+ * SUBMIT runs a chain of td_count task descriptors of td_size bytes. They lie
+ * in the first tsk_size bytes of handles[0], ahead of the weights, and the
+ * engine starts from a copy of the first descriptor in the bootstrap buffer.
+ * Check that each buffer holds what the engine is told to read from it.
+ */
+VISIBLE_IF_KUNIT int ane_submit_check_sizes(const struct drm_ane_submit *args,
+					    size_t cmd_size, size_t btsp_size)
+{
+	u32 span;
+
+	if (check_mul_overflow(args->td_count, args->td_size, &span) ||
+	    span > args->tsk_size || args->tsk_size >= cmd_size ||
+	    args->td_size > btsp_size)
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_submit_check_sizes);
+
 static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct ane_device *ane = drm->dev_private;
@@ -624,9 +644,7 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 			goto put;
 		}
 		gem[bdx] = &bo->base;
-		if (!bo->iova ||
-		    (bdx == CMD_BUF_BDX &&
-		     args->tsk_size >= (bo->npages << ane->shift))) {
+		if (!bo->iova) {
 			err = -EINVAL;
 			goto put;
 		}
@@ -647,10 +665,13 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 		goto put;
 	}
 	btsp = &bo->base;
-	if (!bo->iova || args->td_size > bo->base.size) {
+	if (!bo->iova) {
 		err = -EINVAL;
 		goto put;
 	}
+	err = ane_submit_check_sizes(args, gem[CMD_BUF_BDX]->size, btsp->size);
+	if (err)
+		goto put;
 	req.btsp_iova = lower_32_bits(bo->iova);
 
 	/*
@@ -843,8 +864,7 @@ static long ane_drm_ioctl(struct file *file, unsigned int cmd,
 	 * _IOC_TYPEMASK is the low 8 bits, which encode the *nr*, not the
 	 * *type*. The type byte lives at offset _IOC_TYPESHIFT (8). Use
 	 * _IOC_TYPE(cmd) to extract the right field; misuse here returns
-	 * -ENOTTY for every legitimate ane_ioctl, which is exactly the
-	 * regression committed and reverted in the lifecycle-reset series.
+	 * -ENOTTY for every legitimate ane_ioctl.
 	 */
 	if (_IOC_TYPE(cmd) != DRM_IOCTL_BASE ||
 	    (_IOC_NR(cmd) < DRM_COMMAND_BASE &&
@@ -1079,11 +1099,11 @@ static int ane_attach_genpd(struct ane_device *ane)
  * device tree by design: DART topology from "iommus", power wiring from
  * "power-domains", the engine window from "reg", the IRQ by name. The SET
  * block is the one exception: the device tree carries no range for it, so
- * it is compiled in per SoC, and only from a source that has proven the
+ * it is compiled in per SoC, and only from a source that confirms the
  * address on hardware (m1n1 proxyclient ANE.ps_map, then a bound device).
  * A guessed SET base is not a bug but a brick: direct writes to the
- * block external-abort the SoC (T6001 named by netconsole 2026-09-16,
- * PS_SET0 down at 0x28e08c000; T8103 same mechanism at 0x23b70c000).
+ * block external-abort the SoC (T6001 at 0x28e08c000 with PS_SET0 down;
+ * T8103 same mechanism at 0x23b70c000).
  * The M2 family (T602x, T8112) runs the ANE firmware and binds to
  * ane_t6021 instead.
  */
@@ -1096,15 +1116,15 @@ struct ane_soc {
 };
 
 static const struct ane_soc ane_soc_t8103 = {
-	/* M1 (m1-test-host). SET block mapped read-only for the recovery ACTUAL
-	 * log and the powered-on guard. Execution proven in the fleet.
+	/* M1. SET block mapped read-only for the recovery ACTUAL log and the
+	 * powered-on guard.
 	 */
 	.ps_base = 0x23b70c000ULL,
 };
 
 static const struct ane_soc ane_soc_t6000 = {
 	/* M1 Pro, M1 Max and M1 Ultra die 0 share this compatible and SET base
-	 * (proven on T6001/t6001-test-host); M1 Pro and M1 Ultra are untested.
+	 * (verified on T6001); M1 Pro and M1 Ultra are untested.
 	 */
 	.ps_base = 0x28e08c000ULL,
 	.tm_retention = true,
@@ -1184,9 +1204,9 @@ static int ane_platform_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
-	/* m1n1 keys the SET block by ADT node name (ANE.ps_map); the live
-	 * overlays carry no range for it, so the SoC descriptor picks the
-	 * base (see the tier table above). Mapped read-only, always:
+	/* m1n1 keys the SET block by ADT node name (ANE.ps_map); the device
+	 * tree carries no range for it, so the SoC descriptor picks the
+	 * base (see struct ane_soc above). Mapped read-only, always:
 	 * recovery logs its ACTUAL nibbles beside every engine write and
 	 * refuses engine MMIO unless the islands read powered on. Unmapped
 	 * is tolerated: recovery then just skips the check.
@@ -1326,10 +1346,9 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 	if (first) {
 		/* Bisect order, each stage named before it runs: genpd
 		 * raise is already complete when this callback runs; the
-		 * SET window reads come first (pmgr class, always safe
-		 * per T6001/T8103 bisect evidence), then the engine. A
-		 * hard reset after the last off-box line names the
-		 * killing access exactly.
+		 * SET window reads come first (pmgr class, always safe on
+		 * T6001 and T8103), then the engine. A hard reset after
+		 * the last line logged names the killing access exactly.
 		 */
 		struct platform_device *pdev = to_platform_device(dev);
 		struct resource *eng;

@@ -19,6 +19,15 @@ static int usage(const char *name, int status)
 	return status;
 }
 
+/* Without user4k=on the kernel refuses every smaller size with EINVAL. */
+static int off_hint(unsigned long size, int error)
+{
+	if (error == EINVAL && size && size < getauxval(AT_PAGESZ))
+		fputs("Smaller page sizes need a kernel booted with user4k=on.\n",
+		      stderr);
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	unsigned long size;
@@ -66,14 +75,18 @@ int main(int argc, char **argv)
 		return usage(argv[0], 2);
 
 	if (!once && prctl(PR_AURORA_SET_DEFAULT_PAGE_SIZE, size, 0UL, 0UL, 0UL)) {
+		int error = errno;
+
 		fprintf(stderr, "Cannot set inherited %s pages: %s\n",
-			argv[first], strerror(errno));
-		return 1;
+			argv[first], strerror(error));
+		return off_hint(size, error);
 	}
 	if (prctl(PR_AURORA_SET_EXEC_PAGE_SIZE, size, 0UL, 0UL, 0UL)) {
+		int error = errno;
+
 		fprintf(stderr, "Cannot select %s userspace pages: %s\n",
-			argv[first], strerror(errno));
-		return 1;
+			argv[first], strerror(error));
+		return off_hint(size, error);
 	}
 	execvp(argv[first + 1], &argv[first + 1]);
 	int error = errno;

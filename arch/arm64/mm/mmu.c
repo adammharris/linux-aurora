@@ -24,6 +24,7 @@
 #include <linux/mm.h>
 #include <linux/vmalloc.h>
 #include <linux/set_memory.h>
+#include <linux/suspend.h>
 #include <linux/kfence.h>
 #include <linux/pkeys.h>
 #include <linux/mm_inline.h>
@@ -132,10 +133,6 @@ bool pgattr_change_is_safe(pteval_t old, pteval_t new)
 	if (pte_pfn(__pte(old)) != pte_pfn(__pte(new)))
 		return false;
 
-	/* live contiguous mappings may not be manipulated at all */
-	if ((old | new) & PTE_CONT)
-		return false;
-
 	/* Transitioning from Non-Global to Global is unsafe */
 	if (old & ~new & PTE_NG)
 		return false;
@@ -185,6 +182,17 @@ static void init_pte(pte_t *ptep, unsigned long addr, unsigned long end,
 	} while (ptep++, addr += PAGE_SIZE, addr != end);
 }
 
+static bool pte_range_has_valid_noncont(pte_t *ptep)
+{
+	for (int i = 0; i < CONT_PTES; i++) {
+		pte_t pte = __ptep_get(&ptep[i]);
+
+		if (pte_valid(pte) && !pte_cont(pte))
+			return true;
+	}
+	return false;
+}
+
 static int alloc_init_cont_pte(pmd_t *pmdp, unsigned long addr,
 			       unsigned long end, phys_addr_t phys,
 			       pgprot_t prot,
@@ -222,7 +230,8 @@ static int alloc_init_cont_pte(pmd_t *pmdp, unsigned long addr,
 
 		/* use a contiguous mapping if the range is suitably aligned */
 		if ((((addr | next | phys) & ~CONT_PTE_MASK) == 0) &&
-		    (flags & NO_CONT_MAPPINGS) == 0)
+		    (flags & NO_CONT_MAPPINGS) == 0 &&
+		    !pte_range_has_valid_noncont(ptep))
 			__prot = __pgprot(pgprot_val(prot) | PTE_CONT);
 
 		init_pte(ptep, addr, next, phys, __prot);
@@ -254,8 +263,9 @@ static int init_pmd(pmd_t *pmdp, unsigned long addr, unsigned long end,
 
 		/* try section mapping first */
 		if (((addr | next | phys) & ~PMD_MASK) == 0 &&
-		    (flags & NO_BLOCK_MAPPINGS) == 0) {
-			pmd_set_huge(pmdp, phys, prot);
+		    (flags & NO_BLOCK_MAPPINGS) == 0 &&
+		    !pmd_table(old_pmd)) {
+			WARN_ON(!pmd_set_huge(pmdp, phys, prot));
 
 			/*
 			 * After the PMD entry has been populated once, we
@@ -271,13 +281,24 @@ static int init_pmd(pmd_t *pmdp, unsigned long addr, unsigned long end,
 			if (ret)
 				return ret;
 
-			BUG_ON(pmd_val(old_pmd) != 0 &&
-			       pmd_val(old_pmd) != READ_ONCE(pmd_val(*pmdp)));
+			VM_WARN_ON_ONCE(pmd_val(old_pmd) != 0 &&
+					pmd_val(old_pmd) != READ_ONCE(pmd_val(*pmdp)));
 		}
 		phys += next - addr;
 	} while (pmdp++, addr = next, addr != end);
 
 	return 0;
+}
+
+static bool pmd_range_has_valid_noncont(pmd_t *pmdp)
+{
+	for (int i = 0; i < CONT_PMDS; i++) {
+		pte_t pte = pmd_pte(READ_ONCE(pmdp[i]));
+
+		if (pte_valid(pte) && !pte_cont(pte))
+			return true;
+	}
+	return false;
 }
 
 static int alloc_init_cont_pmd(pud_t *pudp, unsigned long addr,
@@ -321,7 +342,8 @@ static int alloc_init_cont_pmd(pud_t *pudp, unsigned long addr,
 
 		/* use a contiguous mapping if the range is suitably aligned */
 		if ((((addr | next | phys) & ~CONT_PMD_MASK) == 0) &&
-		    (flags & NO_CONT_MAPPINGS) == 0)
+		    (flags & NO_CONT_MAPPINGS) == 0 &&
+		    !pmd_range_has_valid_noncont(pmdp))
 			__prot = __pgprot(pgprot_val(prot) | PTE_CONT);
 
 		ret = init_pmd(pmdp, addr, next, phys, __prot, pgtable_alloc, flags);
@@ -377,8 +399,9 @@ static int alloc_init_pud(p4d_t *p4dp, unsigned long addr, unsigned long end,
 		 */
 		if (pud_sect_supported() &&
 		   ((addr | next | phys) & ~PUD_MASK) == 0 &&
-		    (flags & NO_BLOCK_MAPPINGS) == 0) {
-			pud_set_huge(pudp, phys, prot);
+		    (flags & NO_BLOCK_MAPPINGS) == 0 &&
+		    !pud_table(old_pud)) {
+			WARN_ON(!pud_set_huge(pudp, phys, prot));
 
 			/*
 			 * After the PUD entry has been populated once, we
@@ -392,8 +415,8 @@ static int alloc_init_pud(p4d_t *p4dp, unsigned long addr, unsigned long end,
 			if (ret)
 				goto out;
 
-			BUG_ON(pud_val(old_pud) != 0 &&
-			       pud_val(old_pud) != READ_ONCE(pud_val(*pudp)));
+			VM_WARN_ON_ONCE(pud_val(old_pud) != 0 &&
+					pud_val(old_pud) != READ_ONCE(pud_val(*pudp)));
 		}
 		phys += next - addr;
 	} while (pudp++, addr = next, addr != end);
@@ -443,8 +466,8 @@ static int alloc_init_p4d(pgd_t *pgdp, unsigned long addr, unsigned long end,
 		if (ret)
 			goto out;
 
-		BUG_ON(p4d_val(old_p4d) != 0 &&
-		       p4d_val(old_p4d) != READ_ONCE(p4d_val(*p4dp)));
+		VM_WARN_ON_ONCE(p4d_val(old_p4d) != 0 &&
+				p4d_val(old_p4d) != READ_ONCE(p4d_val(*p4dp)));
 
 		phys += next - addr;
 	} while (p4dp++, addr = next, addr != end);
@@ -755,18 +778,18 @@ out:
 
 static inline bool force_pte_mapping(void)
 {
-	const bool bbml2 = system_capabilities_finalized() ?
-		system_supports_bbml2_noabort() : cpu_supports_bbml2_noabort();
+	const bool bbml3 = system_capabilities_finalized() ?
+		system_supports_bbml3() : cpu_supports_bbml3();
 
 	if (debug_pagealloc_enabled())
 		return true;
-	if (bbml2)
+	if (bbml3)
 		return false;
 	return rodata_full || arm64_kfence_can_set_direct_map() || is_realm_world();
 }
 
 static DEFINE_MUTEX(pgtable_split_lock);
-static bool linear_map_requires_bbml2;
+static bool linear_map_requires_bbml3;
 
 int split_kernel_leaf_mapping(unsigned long start, unsigned long end)
 {
@@ -779,15 +802,15 @@ int split_kernel_leaf_mapping(unsigned long start, unsigned long end)
 	 * always pte-mapped), we must not go any further because taking the
 	 * mutex below may sleep. Do not call force_pte_mapping() here because
 	 * it could return a confusing result if called from a secondary cpu
-	 * prior to finalizing caps. Instead, linear_map_requires_bbml2 gives us
+	 * prior to finalizing caps. Instead, linear_map_requires_bbml3 gives us
 	 * what we need.
 	 */
-	if (!linear_map_requires_bbml2 || is_kfence_address((void *)start))
+	if (!linear_map_requires_bbml3 || is_kfence_address((void *)start))
 		return 0;
 
-	if (!system_supports_bbml2_noabort()) {
+	if (!system_supports_bbml3()) {
 		/*
-		 * !BBML2_NOABORT systems should not be trying to change
+		 * BBML3 systems should not be trying to change
 		 * permissions on anything that is not pte-mapped in the first
 		 * place. Just return early and let the permission change code
 		 * raise a warning if not already pte-mapped.
@@ -804,8 +827,8 @@ int split_kernel_leaf_mapping(unsigned long start, unsigned long end)
 
 		/*
 		 * Boot-time: Started secondary cpus but don't know if they
-		 * support BBML2_NOABORT yet. Can't allow splitting in this
-		 * window in case they don't.
+		 * support BBML3 yet. Can't allow splitting in this window
+		 * in case they don't.
 		 */
 		if (WARN_ON(num_online_cpus() > 1))
 			return -EBUSY;
@@ -910,11 +933,11 @@ static int range_split_to_ptes(unsigned long start, unsigned long end, gfp_t gfp
 	return ret;
 }
 
-u32 idmap_kpti_bbml2_flag;
+u32 idmap_kpti_bbml3_flag;
 
-static void __init init_idmap_kpti_bbml2_flag(void)
+static void __init init_idmap_kpti_bbml3_flag(void)
 {
-	WRITE_ONCE(idmap_kpti_bbml2_flag, 1);
+	WRITE_ONCE(idmap_kpti_bbml3_flag, 1);
 	/* Must be visible to other CPUs before stop_machine() is called. */
 	smp_mb();
 }
@@ -923,7 +946,7 @@ static int __init linear_map_split_to_ptes(void *__unused)
 {
 	/*
 	 * Repainting the linear map must be done by CPU0 (the boot CPU) because
-	 * that's the only CPU that we know supports BBML2. The other CPUs will
+	 * that's the only CPU that we know supports BBML3. The other CPUs will
 	 * be held in a waiting area with the idmap active.
 	 */
 	if (!smp_processor_id()) {
@@ -936,7 +959,7 @@ static int __init linear_map_split_to_ptes(void *__unused)
 		/*
 		 * Wait for all secondary CPUs to be put into the waiting area.
 		 */
-		smp_cond_load_acquire(&idmap_kpti_bbml2_flag, VAL == num_online_cpus());
+		smp_cond_load_acquire(&idmap_kpti_bbml3_flag, VAL == num_online_cpus());
 
 		/*
 		 * Walk all of the linear map [lstart, lend), except the kernel
@@ -955,7 +978,7 @@ static int __init linear_map_split_to_ptes(void *__unused)
 		 * Relies on dsb in flush_tlb_kernel_range() to avoid reordering
 		 * before any page table split operations.
 		 */
-		WRITE_ONCE(idmap_kpti_bbml2_flag, 0);
+		WRITE_ONCE(idmap_kpti_bbml3_flag, 0);
 	} else {
 		typedef void (wait_split_fn)(void);
 		extern wait_split_fn wait_linear_map_split_to_ptes;
@@ -964,7 +987,7 @@ static int __init linear_map_split_to_ptes(void *__unused)
 		wait_fn = (void *)__pa_symbol(wait_linear_map_split_to_ptes);
 
 		/*
-		 * At least one secondary CPU doesn't support BBML2 so cannot
+		 * At least one secondary CPU doesn't support BBML3 so cannot
 		 * tolerate the size of the live mappings changing. So have the
 		 * secondary CPUs wait for the boot CPU to make the changes
 		 * with the idmap active and init_mm inactive.
@@ -979,8 +1002,8 @@ static int __init linear_map_split_to_ptes(void *__unused)
 
 void __init linear_map_maybe_split_to_ptes(void)
 {
-	if (linear_map_requires_bbml2 && !system_supports_bbml2_noabort()) {
-		init_idmap_kpti_bbml2_flag();
+	if (linear_map_requires_bbml3 && !system_supports_bbml3()) {
+		init_idmap_kpti_bbml3_flag();
 		stop_machine(linear_map_split_to_ptes, NULL, cpu_online_mask);
 	}
 }
@@ -998,8 +1021,7 @@ void __init create_mapping_noalloc(phys_addr_t phys, unsigned long virt,
 			&phys, virt);
 		return;
 	}
-	early_create_pgd_mapping(init_mm.pgd, phys, virt, size, prot, NULL,
-				 NO_CONT_MAPPINGS);
+	early_create_pgd_mapping(init_mm.pgd, phys, virt, size, prot, NULL, 0);
 }
 
 void __init create_pgd_mapping(struct mm_struct *mm, phys_addr_t phys,
@@ -1026,18 +1048,40 @@ static void update_mapping_prot(phys_addr_t phys, unsigned long virt,
 		return;
 	}
 
-	early_create_pgd_mapping(init_mm.pgd, phys, virt, size, prot, NULL,
-				 NO_CONT_MAPPINGS);
+	early_create_pgd_mapping(init_mm.pgd, phys, virt, size, prot, NULL, 0);
 
 	/* flush the TLBs after updating live kernel mappings */
 	flush_tlb_kernel_range(virt, virt + size);
 }
 
-static void __init __map_memblock(pgd_t *pgdp, phys_addr_t start,
-				  phys_addr_t end, pgprot_t prot, int flags)
+static void __init __map_memblock(phys_addr_t start, phys_addr_t end,
+				  pgprot_t prot, int flags)
 {
-	early_create_pgd_mapping(pgdp, start, __phys_to_virt(start), end - start,
-				 prot, early_pgtable_alloc, flags);
+	early_create_pgd_mapping(swapper_pg_dir, start, __phys_to_virt(start),
+				 end - start, prot, early_pgtable_alloc, flags);
+}
+
+static void mark_linear_data_alias_valid(bool valid)
+{
+	set_memory_valid((unsigned long)lm_alias(__init_end),
+			 (unsigned long)(__bss_stop - __init_end) / PAGE_SIZE,
+			 valid);
+}
+
+static int arm64_hibernate_pm_notify(struct notifier_block *nb,
+				     unsigned long mode, void *unused)
+{
+	switch (mode) {
+	default:
+		break;
+	case PM_POST_HIBERNATION:
+		mark_linear_data_alias_valid(false);
+		break;
+	case PM_HIBERNATION_PREPARE:
+		mark_linear_data_alias_valid(true);
+		break;
+	}
+	return 0;
 }
 
 void __init mark_linear_text_alias_ro(void)
@@ -1048,6 +1092,21 @@ void __init mark_linear_text_alias_ro(void)
 	update_mapping_prot(__pa_symbol(_text), (unsigned long)lm_alias(_text),
 			    (unsigned long)__init_begin - (unsigned long)_text,
 			    PAGE_KERNEL_RO);
+
+	/*
+	 * Register a PM notifier to remap the linear alias of data/bss as
+	 * valid read/write before hibernation. This is needed because the
+	 * snapshot logic disregards PageReserved pages (such as the ones
+	 * covering the kernel image) unless they are mapped in the linear
+	 * map.
+	 */
+	if (IS_ENABLED(CONFIG_HIBERNATION) && rodata_enabled) {
+		static struct notifier_block nb = {
+			.notifier_call = arm64_hibernate_pm_notify
+		};
+
+		register_pm_notifier(&nb);
+	}
 }
 
 #ifdef CONFIG_KFENCE
@@ -1065,36 +1124,24 @@ static int __init parse_kfence_early_init(char *arg)
 }
 early_param("kfence.sample_interval", parse_kfence_early_init);
 
-static phys_addr_t __init arm64_kfence_alloc_pool(void)
+static void __init arm64_kfence_map_pool(void)
 {
 	phys_addr_t kfence_pool;
 
 	if (!kfence_early_init)
-		return 0;
+		return;
 
 	kfence_pool = memblock_phys_alloc(KFENCE_POOL_SIZE, PAGE_SIZE);
 	if (!kfence_pool) {
 		pr_err("failed to allocate kfence pool\n");
 		kfence_early_init = false;
-		return 0;
+		return;
 	}
 
-	/* Temporarily mark as NOMAP. */
-	memblock_mark_nomap(kfence_pool, KFENCE_POOL_SIZE);
-
-	return kfence_pool;
-}
-
-static void __init arm64_kfence_map_pool(phys_addr_t kfence_pool, pgd_t *pgdp)
-{
-	if (!kfence_pool)
-		return;
-
 	/* KFENCE pool needs page-level mapping. */
-	__map_memblock(pgdp, kfence_pool, kfence_pool + KFENCE_POOL_SIZE,
+	__map_memblock(kfence_pool, kfence_pool + KFENCE_POOL_SIZE,
 			pgprot_tagged(PAGE_KERNEL),
-			NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS);
-	memblock_clear_nomap(kfence_pool, KFENCE_POOL_SIZE);
+			NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS | NO_EXEC_MAPPINGS);
 	__kfence_pool = phys_to_virt(kfence_pool);
 }
 
@@ -1117,7 +1164,7 @@ bool arch_kfence_init_pool(void)
 	mutex_unlock(&pgtable_split_lock);
 
 	/*
-	 * Since the system supports bbml2_noabort, tlb invalidation is not
+	 * Since the system supports bbml3, tlb invalidation is not
 	 * required here; the pgtable mappings have been split to pte but larger
 	 * entries may safely linger in the TLB.
 	 */
@@ -1126,18 +1173,18 @@ bool arch_kfence_init_pool(void)
 }
 #else /* CONFIG_KFENCE */
 
-static inline phys_addr_t arm64_kfence_alloc_pool(void) { return 0; }
-static inline void arm64_kfence_map_pool(phys_addr_t kfence_pool, pgd_t *pgdp) { }
+static inline void arm64_kfence_map_pool(void) { }
 
 #endif /* CONFIG_KFENCE */
 
-static void __init map_mem(pgd_t *pgdp)
+static void __init map_mem(void)
 {
 	static const u64 direct_map_end = _PAGE_END(VA_BITS_MIN);
 	phys_addr_t kernel_start = __pa_symbol(_text);
-	phys_addr_t kernel_end = __pa_symbol(__init_begin);
+	phys_addr_t init_begin = __pa_symbol(__init_begin);
+	phys_addr_t init_end = __pa_symbol(__init_end);
+	phys_addr_t kernel_end = __pa_symbol(__bss_stop);
 	phys_addr_t start, end;
-	phys_addr_t early_kfence_pool;
 	int flags = NO_EXEC_MAPPINGS;
 	u64 i;
 
@@ -1154,48 +1201,54 @@ static void __init map_mem(pgd_t *pgdp)
 	BUILD_BUG_ON(pgd_index(direct_map_end - 1) == pgd_index(direct_map_end) &&
 		     pgd_index(_PAGE_OFFSET(VA_BITS_MIN)) != PTRS_PER_PGD - 1);
 
-	early_kfence_pool = arm64_kfence_alloc_pool();
+	arm64_kfence_map_pool();
 
-	linear_map_requires_bbml2 = !force_pte_mapping() && can_set_direct_map();
+	linear_map_requires_bbml3 = !force_pte_mapping() && can_set_direct_map();
 
 	if (force_pte_mapping())
 		flags |= NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS;
 
 	/*
-	 * Take care not to create a writable alias for the
-	 * read-only text and rodata sections of the kernel image.
-	 * So temporarily mark them as NOMAP to skip mappings in
-	 * the following for-loop
+	 * Map the linear alias of the [_text, __init_begin) interval first
+	 * so that its write permissions can be removed later without the need
+	 * to split any block mappings created by the loop below.
+	 *
+	 * Write permissions are needed for alternatives patching, and will be
+	 * removed later by mark_linear_text_alias_ro() above. This makes the
+	 * contents of the region accessible to subsystems such as hibernate,
+	 * but protects it from inadvertent modification or execution.
 	 */
-	memblock_mark_nomap(kernel_start, kernel_end - kernel_start);
+	__map_memblock(kernel_start, init_begin, pgprot_tagged(PAGE_KERNEL),
+		       flags);
+
+	/* Map the kernel data/bss so it can be remapped later */
+	__map_memblock(init_end, kernel_end, pgprot_tagged(PAGE_KERNEL),
+		       flags);
 
 	/* map all the memory banks */
 	for_each_mem_range(i, &start, &end) {
+		/*
+		 * for_each_mem_range may return sub-page-aligned boundaries
+		 * after memblock_mark_nomap() splits regions at byte precision.
+		 * __create_pgd_mapping_locked aligns phys down to PAGE_MASK,
+		 * which could accidentally map no-map memory on the boundary.
+		 * Round the mappable range inward: start UP, end DOWN, so
+		 * that the mapped area never overlaps with adjacent no-map
+		 * regions. The cost is at most one page of unmapped gap at
+		 * each boundary.
+		 */
+		start = PAGE_ALIGN(start);
+		end = end & PAGE_MASK;
 		if (start >= end)
-			break;
+			continue;
 		/*
 		 * The linear map must allow allocation tags reading/writing
 		 * if MTE is present. Otherwise, it has the same attributes as
 		 * PAGE_KERNEL.
 		 */
-		__map_memblock(pgdp, start, end, pgprot_tagged(PAGE_KERNEL),
+		__map_memblock(start, end, pgprot_tagged(PAGE_KERNEL),
 			       flags);
 	}
-
-	/*
-	 * Map the linear alias of the [_text, __init_begin) interval
-	 * as non-executable now, and remove the write permission in
-	 * mark_linear_text_alias_ro() below (which will be called after
-	 * alternative patching has completed). This makes the contents
-	 * of the region accessible to subsystems such as hibernate,
-	 * but protects it from inadvertent modification or execution.
-	 * Note that contiguous mappings cannot be remapped in this way,
-	 * so we should avoid them here.
-	 */
-	__map_memblock(pgdp, kernel_start, kernel_end,
-		       PAGE_KERNEL, NO_CONT_MAPPINGS);
-	memblock_clear_nomap(kernel_start, kernel_end - kernel_start);
-	arm64_kfence_map_pool(early_kfence_pool, pgdp);
 }
 
 void mark_rodata_ro(void)
@@ -1214,6 +1267,9 @@ void mark_rodata_ro(void)
 	update_mapping_prot(__pa_symbol(_text), (unsigned long)_text,
 			    (unsigned long)_stext - (unsigned long)_text,
 			    PAGE_KERNEL_RO);
+
+	/* Map the kernel data/bss as invalid in the linear map */
+	mark_linear_data_alias_valid(false);
 }
 
 static void __init declare_vma(struct vm_struct *vma,
@@ -1325,7 +1381,7 @@ void __init kpti_install_ng_mappings(void)
 	if (arm64_use_ng_mappings)
 		return;
 
-	init_idmap_kpti_bbml2_flag();
+	init_idmap_kpti_bbml3_flag();
 	stop_machine(__kpti_install_ng_mappings, NULL, cpu_online_mask);
 }
 
@@ -1386,7 +1442,7 @@ void __pi_map_range(phys_addr_t *pte, u64 start, u64 end, phys_addr_t pa,
 		    u64 va_offset);
 
 static u8 idmap_ptes[IDMAP_LEVELS - 1][PAGE_SIZE] __aligned(PAGE_SIZE) __ro_after_init,
-	  kpti_bbml2_ptes[IDMAP_LEVELS - 1][PAGE_SIZE] __aligned(PAGE_SIZE) __ro_after_init;
+	  kpti_bbml3_ptes[IDMAP_LEVELS - 1][PAGE_SIZE] __aligned(PAGE_SIZE) __ro_after_init;
 
 static void __init create_idmap(void)
 {
@@ -1398,17 +1454,17 @@ static void __init create_idmap(void)
 		       IDMAP_ROOT_LEVEL, (pte_t *)idmap_pg_dir, false,
 		       __phys_to_virt(ptep) - ptep);
 
-	if (linear_map_requires_bbml2 ||
+	if (linear_map_requires_bbml3 ||
 	    (IS_ENABLED(CONFIG_UNMAP_KERNEL_AT_EL0) && !arm64_use_ng_mappings)) {
-		phys_addr_t pa = __pa_symbol(&idmap_kpti_bbml2_flag);
+		phys_addr_t pa = __pa_symbol(&idmap_kpti_bbml3_flag);
 
 		/*
 		 * The KPTI G-to-nG conversion code needs a read-write mapping
 		 * of its synchronization flag in the ID map. This is also used
 		 * when splitting the linear map to ptes if a secondary CPU
-		 * doesn't support bbml2.
+		 * doesn't support bbml3.
 		 */
-		ptep = __pa_symbol(kpti_bbml2_ptes);
+		ptep = __pa_symbol(kpti_bbml3_ptes);
 		__pi_map_range(&ptep, pa, pa + sizeof(u32), pa, PAGE_KERNEL,
 			       IDMAP_ROOT_LEVEL, (pte_t *)idmap_pg_dir, false,
 			       __phys_to_virt(ptep) - ptep);
@@ -1417,7 +1473,7 @@ static void __init create_idmap(void)
 
 void __init paging_init(void)
 {
-	map_mem(swapper_pg_dir);
+	map_mem();
 
 	memblock_allow_resize();
 
@@ -1780,20 +1836,6 @@ static void free_empty_tables(unsigned long addr, unsigned long end,
 	} while (addr = next, addr < end);
 }
 #endif
-
-void __meminit vmemmap_set_pmd(pmd_t *pmdp, void *p, int node,
-			       unsigned long addr, unsigned long next)
-{
-	pmd_set_huge(pmdp, __pa(p), __pgprot(PROT_SECT_NORMAL));
-}
-
-int __meminit vmemmap_check_pmd(pmd_t *pmdp, int node,
-				unsigned long addr, unsigned long next)
-{
-	vmemmap_verify((pte_t *)pmdp, node, addr, next);
-
-	return pmd_leaf(READ_ONCE(*pmdp));
-}
 
 int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
 		struct vmem_altmap *altmap)

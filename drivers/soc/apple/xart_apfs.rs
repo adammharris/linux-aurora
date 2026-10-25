@@ -54,7 +54,7 @@ fn checksum(data: &[u8]) -> Result<u64> {
     let mut s1 = 0u64;
     let mut s2 = 0u64;
     for word in data[8..].chunks_exact(4) {
-        let value = u32::from_le_bytes(word.try_into().map_err(|_| EINVAL)?) as u64;
+        let value = u64::from(u32::from_le_bytes(word.try_into().map_err(|_| EINVAL)?));
         s1 = (s1 + value) % MOD;
         s2 = (s2 + s1) % MOD;
     }
@@ -88,11 +88,11 @@ fn valid_checkpoint(
     desc_base: u64,
     desc_count: u64,
 ) -> Result<()> {
-    if le64(sb, 112)? != desc_base || le32(sb, 104)? as u64 != desc_count {
+    if le64(sb, 112)? != desc_base || u64::from(le32(sb, 104)?) != desc_count {
         return Err(ENOTSUPP);
     }
-    let index = le32(sb, 136)? as u64;
-    let len = le32(sb, 140)? as u64;
+    let index = u64::from(le32(sb, 136)?);
+    let len = u64::from(le32(sb, 140)?);
     if index >= desc_count || len < 2 || len > desc_count {
         return Err(EINVAL);
     }
@@ -371,7 +371,7 @@ pub(crate) fn locate(file: &shim::StoreFile, writes_enabled: bool) -> Result<u64
     if desc_count_raw & (1 << 31) != 0 {
         return Err(ENOTSUPP);
     }
-    let desc_count = desc_count_raw as u64;
+    let desc_count = u64::from(desc_count_raw);
     let desc_base = le64(&base, 112)?;
     if desc_count == 0
         || desc_count > 1024

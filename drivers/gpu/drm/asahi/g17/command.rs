@@ -12,11 +12,18 @@ use crate::util::{AnyBitPattern, Reader};
 use core::ops::Range;
 use kernel::{prelude::*, uapi};
 
+const _: () = assert!(uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_AS_BUILD == 1 << 2);
+
 const MAX_ATTACHMENTS: usize = crate::microseq::MAX_ATTACHMENTS;
 const USC_WINDOW_SIZE: u64 = 1 << 32;
 const MAX_SAMPLERS: u32 = 1024;
 const RENDER_BASE_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_render, prior_cdm) + size_of::<u64>();
 const COMPUTE_BASE_SIZE: usize = core::mem::offset_of!(uapi::drm_asahi_cmd_compute, prior_cdm) + size_of::<u64>();
+/// The timestamp-copy arrays of the common command layout, which G17P does not implement.
+const RENDER_TIMESTAMP_COPIES: Range<usize> = core::mem::offset_of!(uapi::drm_asahi_cmd_render, ts_frag_end_copies)
+    ..core::mem::offset_of!(uapi::drm_asahi_cmd_render, prior_vdm);
+const COMPUTE_TIMESTAMP_COPIES: Range<usize> = core::mem::offset_of!(uapi::drm_asahi_cmd_compute, ts_end_copies)
+    ..core::mem::offset_of!(uapi::drm_asahi_cmd_compute, scs_layout);
 const SAMPLER_SIZE: u64 = 8;
 const PAGE_SIZE: u64 = 0x4000;
 const ZLS_METADATA_STRIDE: u64 = 0x80;
@@ -116,7 +123,7 @@ impl<'a> Parser<'a> {
             let bytes = self.bytes.get(start..end).ok_or(EINVAL)?;
             self.bytes = &self.bytes[end..];
             let barriers = [header.vdm_barrier, header.cdm_barrier];
-            match header.cmd_type as u32 {
+            match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER
                 | uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
                     if barriers.iter().zip(self.counts).any(|(&barrier, count)| {
@@ -126,10 +133,11 @@ impl<'a> Parser<'a> {
                     {
                         return Err(EINVAL);
                     }
-                    let payload = if header.cmd_type as u32
+                    let payload = if u32::from(header.cmd_type)
                         == uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER
                     {
                         self.counts[0] += 1;
+                        no_timestamp_copies(bytes, RENDER_TIMESTAMP_COPIES)?;
                         Payload::Render(
                             payload(&bytes[..bytes.len().min(RENDER_BASE_SIZE)])?,
                             [self.attachments[0], self.attachments[1]],
@@ -137,6 +145,7 @@ impl<'a> Parser<'a> {
                         )
                     } else {
                         self.counts[1] += 1;
+                        no_timestamp_copies(bytes, COMPUTE_TIMESTAMP_COPIES)?;
                         Payload::Compute(
                             payload(&bytes[..bytes.len().min(COMPUTE_BASE_SIZE)])?,
                             self.attachments[2],
@@ -167,6 +176,16 @@ impl<'a> Parser<'a> {
         }
         Ok(())
     }
+}
+
+/// Reject a command that asks for timestamp copies.
+fn no_timestamp_copies(bytes: &[u8], copies: Range<usize>) -> Result {
+    let end = copies.end.min(bytes.len());
+    let start = copies.start.min(end);
+    if bytes[start..end].iter().any(|&b| b != 0) {
+        return Err(EINVAL);
+    }
+    Ok(())
 }
 
 fn payload<T: AnyBitPattern>(bytes: &[u8]) -> Result<T> {
@@ -221,7 +240,7 @@ impl UscWindow {
         }
         require_range(
             space,
-            self.base + (tagged_offset & !7) as u64,
+            self.base + u64::from(tagged_offset & !7),
             4,
             Access::Read,
         )
@@ -289,12 +308,14 @@ fn surface(
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Validated {
     Render {
+        long_job: bool,
         pass: RenderPass,
         ray_query: [RayQueryStage; 2],
         attachments: [Attachments; 2],
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
     Compute {
+        long_job: bool,
         intersection: IntersectionTables,
         scratch: ScratchRequest,
         usc_base: u64,
@@ -304,6 +325,19 @@ pub(crate) enum Validated {
         sampler_count: u32,
         timestamps: uapi::drm_asahi_timestamps,
     },
+}
+
+impl Validated {
+    pub(crate) fn long_job(&self) -> bool {
+        match self {
+            Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job,
+        }
+    }
+    pub(crate) fn allow_long_job(&mut self) {
+        match self {
+            Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job = true,
+        }
+    }
 }
 
 impl Payload {
@@ -317,6 +351,7 @@ impl Payload {
     pub(crate) fn validate(
         &self,
         window: &UscWindow,
+        variant: &super::fw::Variant,
         space: &impl AddressSpace,
     ) -> Result<Validated> {
         match self {
@@ -390,7 +425,7 @@ impl Payload {
                     scissor_va: cmd.isp_scissor_base,
                     depth_bias_va: cmd.isp_dbias_base,
                     depth_bias_is_int: cmd.flags & DBIAS_INT != 0,
-                    few_primitives: cmd.flags & FEW_PRIMITIVES != 0,
+                    few_primitives: cmd.flags & FEW_PRIMITIVES != 0 && variant.few_primitives,
                     fragment_barriers: cmd.flags & FRAGMENT_BARRIERS != 0,
                     occlusion_query_va: cmd.isp_oclqry_base,
                     sampler_heap_va: cmd.sampler_heap,
@@ -423,6 +458,11 @@ impl Payload {
                     rsrc_spec_hi: cmd.flags & RSRC_SPEC_HI != 0,
                 };
                 for stage in ray_query {
+                    if (stage.intersection.enabled() || stage.scratch.enabled())
+                        && !variant.ray_traversal
+                    {
+                        return Err(refuse_ray_traversal());
+                    }
                     if stage.intersection.enabled() {
                         require_range(space, stage.intersection.pool, stage.intersection.pool_bytes, Access::Read)?;
                         let code = stage.intersection.default_program & 0x0000_ffff_ffff_ffff;
@@ -430,6 +470,8 @@ impl Payload {
                     }
                 }
                 Ok(Validated::Render {
+                    long_job: super::timeout::select(false,
+                        ray_query.map(|stage| stage.intersection.enabled()), false),
                     pass,
                     ray_query: *ray_query,
                     attachments: *attachments,
@@ -437,8 +479,8 @@ impl Payload {
                 })
             }
             Self::Compute(cmd, attachments, intersection) => {
-                if cmd.flags != 0
-                    || cmd.cdm_ctrl_stream_base & 3 != 0
+                let as_build = super::timeout::as_build(cmd.flags).ok_or(EINVAL)?;
+                if cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
                     || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
                     || !helper_is_empty(&cmd.helper)
@@ -453,14 +495,19 @@ impl Payload {
                 )?;
                 sampler(space, cmd.sampler_heap, cmd.sampler_count)?;
                 attachments.validate(space)?;
+                let scratch = ScratchRequest::new(cmd.scs_layout)?;
+                if (scratch.enabled() || intersection.enabled()) && !variant.ray_traversal {
+                    return Err(refuse_ray_traversal());
+                }
                 if intersection.enabled() {
                     require_range(space, intersection.pool, intersection.pool_bytes, Access::Read)?;
                     let code = intersection.default_program & 0x0000_ffff_ffff_ffff;
                     if code != 0 { require_range(space, code, 64, Access::Read)?; }
                 }
                 Ok(Validated::Compute {
+                    long_job: super::timeout::select(intersection.enabled(), [false; 2], as_build),
                     intersection: *intersection,
-                    scratch: ScratchRequest::new(cmd.scs_layout)?,
+                    scratch,
                     usc_base: window.base,
                     cdm_va: cmd.cdm_ctrl_stream_base,
                     cdm_end_va: cmd.cdm_ctrl_stream_end - 4,
@@ -471,4 +518,10 @@ impl Payload {
             }
         }
     }
+}
+
+/// Ray-traversal work on a firmware build that does not run it ([`super::fw::Variant`]).
+fn refuse_ray_traversal() -> Error {
+    kernel::pr_warn_once!("G17: ray-traversal work refused on this firmware\n");
+    Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32))
 }

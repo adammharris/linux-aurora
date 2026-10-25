@@ -108,14 +108,16 @@ struct drm_ane_bo_free {
 
 /**
  * struct drm_ane_submit - DRM_IOCTL_ANE_SUBMIT argument (ABI version 1)
- * @tsk_size: In. Size of the task microcode at the start of handles[0], not
- *	zero.
+ * @tsk_size: In. Size of the task microcode at the start of handles[0]: the
+ *	@td_count task descriptors of @td_size bytes. Not zero, at least
+ *	@td_count times @td_size, and smaller than handles[0].
  * @td_count: In. Number of task descriptors, 1 to 0xffff.
  * @td_size: In. Size of a task descriptor: a multiple of 4, 4 to 0x40000.
  * @handles: In. Buffer per tile: handles[0] holds the microcode and the
  *	weights, handles[1] must be 0 (the driver sets it from handles[0]),
  *	and 0 marks an unused tile.
- * @btsp_handle: In. Buffer with the bootstrap task descriptor.
+ * @btsp_handle: In. Buffer with a copy of the first task descriptor, at
+ *	least @td_size bytes. The engine starts from this copy.
  * @pad: Must be zero.
  *
  * A successful SUBMIT returns after the engine completed the work, with the

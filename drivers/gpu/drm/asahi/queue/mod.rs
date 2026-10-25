@@ -42,6 +42,7 @@ use crate::{
     alloc,
     buffer,
     channel,
+    driver::AsahiRegData,
     event,
     file,
     fw,
@@ -72,6 +73,7 @@ pub(crate) trait Queue: Send + Sync {
 
     fn submit(
         &mut self,
+        reg_data: &AsahiRegData<'_>,
         id: u64,
         syncs: KVec<file::SyncItem>,
         in_sync_count: usize,
@@ -260,7 +262,8 @@ impl QueueJob::ver {
 #[versions(AGX)]
 impl sched::JobImpl for QueueJob::ver {
     type TimeoutData = QueueTimeout;
-    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
+    const MODULE: Option<&'static kernel::ThisModule> =
+        Some(kernel::module::this_module::<crate::LocalModule>());
 
     fn timeout_data(&self) -> QueueTimeout {
         QueueTimeout { dev: self.dev.clone(), id: self.id }
@@ -350,80 +353,87 @@ impl sched::JobImpl for QueueJob::ver {
         // are "invisible" to the firmware. Incrementing the notifier threshold
         // earlier than this violates that which leads to circles like the
         // above. Deferring the increment to submit solves the race.
-        let gpu = match (*job.dev)
-            .gpu
-            .clone()
-            .arc_as_any()
-            .downcast::<gpu::GpuManager::ver>()
-        {
-            Ok(gpu) => gpu,
-            Err(_) => {
-                dev_crit!(job.dev.as_ref(), "GpuManager mismatched with QueueJob!\n");
-                return Err(EIO);
-            }
+        let dev = job.dev.clone();
+        let Some(guard) = dev.registration_guard() else {
+            return Err(ENODEV);
         };
 
-        if job.op_guard.is_none() {
-            job.op_guard = Some(gpu.start_op()?);
-        }
+        return guard.registration_data_with(|reg_data| {
+            let gpu = match reg_data
+                .gpu
+                .clone()
+                .arc_as_any()
+                .downcast::<gpu::GpuManager::ver>()
+            {
+                Ok(gpu) => gpu,
+                Err(_) => {
+                    dev_crit!(job.dev.as_ref(), "GpuManager mismatched with QueueJob!\n");
+                    return Err(EIO);
+                }
+            };
 
-        // First submit all the commands for each queue. This can fail.
-
-        let mut frag_job = None;
-        let mut frag_sub = None;
-        if let Some(sj) = job.sj_frag.as_mut() {
-            frag_job = sj.job.take();
-            if let Some(wqjob) = frag_job.as_mut() {
-                mod_dev_dbg!(job.dev, "QueueJob {}: Submit fragment\n", job.id);
-                frag_sub = Some(wqjob.submit()?);
+            if job.op_guard.is_none() {
+                job.op_guard = Some(gpu.start_op()?);
             }
-        }
 
-        let mut vtx_job = None;
-        let mut vtx_sub = None;
-        if let Some(sj) = job.sj_vtx.as_mut() {
-            vtx_job = sj.job.take();
-            if let Some(wqjob) = vtx_job.as_mut() {
-                mod_dev_dbg!(job.dev, "QueueJob {}: Submit vertex\n", job.id);
-                vtx_sub = Some(wqjob.submit()?);
+            // First submit all the commands for each queue. This can fail.
+
+            let mut frag_job = None;
+            let mut frag_sub = None;
+            if let Some(sj) = job.sj_frag.as_mut() {
+                frag_job = sj.job.take();
+                if let Some(wqjob) = frag_job.as_mut() {
+                    mod_dev_dbg!(job.dev, "QueueJob {}: Submit fragment\n", job.id);
+                    frag_sub = Some(wqjob.submit()?);
+                }
             }
-        }
 
-        let mut comp_job = None;
-        let mut comp_sub = None;
-        if let Some(sj) = job.sj_comp.as_mut() {
-            comp_job = sj.job.take();
-            if let Some(wqjob) = comp_job.as_mut() {
-                mod_dev_dbg!(job.dev, "QueueJob {}: Submit compute\n", job.id);
-                comp_sub = Some(wqjob.submit()?);
+            let mut vtx_job = None;
+            let mut vtx_sub = None;
+            if let Some(sj) = job.sj_vtx.as_mut() {
+                vtx_job = sj.job.take();
+                if let Some(wqjob) = vtx_job.as_mut() {
+                    mod_dev_dbg!(job.dev, "QueueJob {}: Submit vertex\n", job.id);
+                    vtx_sub = Some(wqjob.submit()?);
+                }
             }
-        }
 
-        // Prepared submissions still hold their workqueue locks and have not
-        // published cpu_wptr. Only count them after every fallible submit()
-        // succeeded, before the first run_job exposes commands to firmware.
-        job.notifier.threshold.with(|raw, _inner| {
-            raw.increase(job.notification_count);
+            let mut comp_job = None;
+            let mut comp_sub = None;
+            if let Some(sj) = job.sj_comp.as_mut() {
+                comp_job = sj.job.take();
+                if let Some(wqjob) = comp_job.as_mut() {
+                    mod_dev_dbg!(job.dev, "QueueJob {}: Submit compute\n", job.id);
+                    comp_sub = Some(wqjob.submit()?);
+                }
+            }
+
+            // Prepared submissions still hold their workqueue locks and have not
+            // published cpu_wptr. Only count them after every fallible submit()
+            // succeeded, before the first run_job exposes commands to firmware.
+            job.notifier.threshold.with(|raw, _inner| {
+                raw.increase(job.notification_count);
+            });
+
+            // Now we fully commit to running the job
+            mod_dev_dbg!(job.dev, "QueueJob {}: Run fragment\n", job.id);
+            frag_sub.map(|a| gpu.run_job(a)).transpose()?;
+
+            mod_dev_dbg!(job.dev, "QueueJob {}: Run vertex\n", job.id);
+            vtx_sub.map(|a| gpu.run_job(a)).transpose()?;
+
+            mod_dev_dbg!(job.dev, "QueueJob {}: Run compute\n", job.id);
+            comp_sub.map(|a| gpu.run_job(a)).transpose()?;
+
+            mod_dev_dbg!(job.dev, "QueueJob {}: Drop compute job\n", job.id);
+            core::mem::drop(comp_job);
+            mod_dev_dbg!(job.dev, "QueueJob {}: Drop vertex job\n", job.id);
+            core::mem::drop(vtx_job);
+            mod_dev_dbg!(job.dev, "QueueJob {}: Drop fragment job\n", job.id);
+            core::mem::drop(frag_job);
+
+            Ok(Some(Fence::from_fence(&job.fence)))
         });
-
-        // Now we fully commit to running the job
-        mod_dev_dbg!(job.dev, "QueueJob {}: Run fragment\n", job.id);
-        frag_sub.map(|a| gpu.run_job(a)).transpose()?;
-
-        mod_dev_dbg!(job.dev, "QueueJob {}: Run vertex\n", job.id);
-        vtx_sub.map(|a| gpu.run_job(a)).transpose()?;
-
-        mod_dev_dbg!(job.dev, "QueueJob {}: Run compute\n", job.id);
-        comp_sub.map(|a| gpu.run_job(a)).transpose()?;
-
-        mod_dev_dbg!(job.dev, "QueueJob {}: Drop compute job\n", job.id);
-        core::mem::drop(comp_job);
-        mod_dev_dbg!(job.dev, "QueueJob {}: Drop vertex job\n", job.id);
-        core::mem::drop(vtx_job);
-        mod_dev_dbg!(job.dev, "QueueJob {}: Drop fragment job\n", job.id);
-        core::mem::drop(frag_job);
-
-        Ok(Some(Fence::from_fence(&job.fence)))
     }
 
     fn timed_out(job: &mut QueueTimeout, _finished: bool) -> sched::Status {
@@ -460,7 +470,7 @@ impl Queue::ver {
     /// Create a new user queue.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: AsahiDevice,
         gpu: &dyn GpuManager,
         vm: mmu::Vm,
         alloc: &mut gpu::KernelAllocators,
@@ -503,14 +513,20 @@ impl Queue::ver {
 
         // Priorities are handled by the AGX scheduler, there is no meaning within a
         // per-queue scheduler. Use a single run queue wth Kernel priority.
-        let sched =
-            sched::Scheduler::new(dev.as_ref(), 1, WQ_SIZE, 0, 100000, c_str!("asahi_sched"))?;
+        let sched = sched::Scheduler::new(
+            dev.as_ref().as_ref(),
+            1,
+            WQ_SIZE,
+            0,
+            100000,
+            c_str!("asahi_sched"),
+        )?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 
         let buffer = buffer::Buffer::ver::new(gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
 
         let mut ret = Queue::ver {
-            dev: dev.into(),
+            dev: dev.clone(),
             _sched: sched,
             entity,
             vm,
@@ -520,10 +536,10 @@ impl Queue::ver {
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
             stats,
             inner: QueueInner::ver {
-                dev: dev.into(),
+                dev: dev.clone(),
                 ualloc,
                 gpu_context: Arc::new(
-                    workqueue::GpuContext::new(dev, alloc, buffer.any_ref())?,
+                    workqueue::GpuContext::new(dev.clone(), alloc, buffer.any_ref())?,
                     GFP_KERNEL,
                 )?,
 
@@ -538,13 +554,14 @@ impl Queue::ver {
         };
 
         // Rendering structures
-        let tvb_blocks = *module_parameters::initial_tvb_size.value();
+        let tvb_blocks = module_parameters::initial_tvb_size.value();
 
         ret.inner.buffer.ensure_blocks(tvb_blocks)?;
 
         ret.q_vtx = Some(SubQueue::ver {
             wq: workqueue::WorkQueue::ver::new(
-                dev,
+                dev.clone(),
+                gpu.get_cfg(),
                 alloc,
                 event_manager.clone(),
                 ret.inner.gpu_context.clone(),
@@ -558,7 +575,8 @@ impl Queue::ver {
 
         ret.q_frag = Some(SubQueue::ver {
             wq: workqueue::WorkQueue::ver::new(
-                dev,
+                dev.clone(),
+                gpu.get_cfg(),
                 alloc,
                 event_manager.clone(),
                 ret.inner.gpu_context.clone(),
@@ -573,7 +591,8 @@ impl Queue::ver {
         // Compute structures
         ret.q_comp = Some(SubQueue::ver {
             wq: workqueue::WorkQueue::ver::new(
-                dev,
+                dev.clone(),
+                gpu.get_cfg(),
                 alloc,
                 event_manager,
                 ret.inner.gpu_context.clone(),
@@ -593,6 +612,15 @@ impl Queue::ver {
 const SQ_RENDER: usize = 0;
 const SQ_COMPUTE: usize = 1;
 const SQ_COUNT: usize = 2;
+
+/// Bytes of a render command this queue implements. The fields from `ts_frag_end_copies` on
+/// belong to other runtimes and must be zero here, as must any bytes beyond the kernel's
+/// structure.
+const RENDER_SUPPORTED_SIZE: usize =
+    core::mem::offset_of!(uapi::drm_asahi_cmd_render, ts_frag_end_copies);
+/// Bytes of a compute command this queue implements; see [`RENDER_SUPPORTED_SIZE`].
+const COMPUTE_SUPPORTED_SIZE: usize =
+    core::mem::offset_of!(uapi::drm_asahi_cmd_compute, ts_end_copies);
 
 // SAFETY: All bit patterns are valid by construction.
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_header {}
@@ -636,15 +664,16 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
 
 #[versions(AGX)]
 impl Queue for Queue::ver {
-    fn submit(
+    fn submit<'drm>(
         &mut self,
+        reg_data: &AsahiRegData<'drm>,
         id: u64,
         mut syncs: KVec<file::SyncItem>,
         in_sync_count: usize,
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
-        let gpu = match (*self.dev)
+        let gpu = match reg_data
             .gpu
             .clone()
             .arc_as_any()
@@ -726,7 +755,22 @@ impl Queue for Queue::ver {
 
         while !cmdbuf.is_empty() {
             let header: uapi::drm_asahi_cmd_header = cmdbuf.read()?;
-            cmdbuf.skip(header.size as usize);
+            let payload_size = header.size as usize;
+            match header.cmd_type as u32 {
+                uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
+                    let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(payload_size)?;
+                    if render.ts_frag_end_copies.iter().any(|ts| ts.handle != 0 || ts.offset != 0) {
+                        return Err(EINVAL);
+                    }
+                }
+                uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
+                    let compute: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(payload_size)?;
+                    if compute.ts_end_copies.iter().any(|ts| ts.handle != 0 || ts.offset != 0) {
+                        return Err(EINVAL);
+                    }
+                }
+                _ => cmdbuf.skip(payload_size),
+            }
             nr_commands += 1;
 
             match header.cmd_type as u32 {
@@ -853,9 +897,14 @@ impl Queue for Queue::ver {
 
             match header.cmd_type as u32 {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
-                    let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(header_size)?;
+                    let render: uapi::drm_asahi_cmd_render = cmdbuf
+                        .read_supported(header_size, RENDER_SUPPORTED_SIZE)
+                        .inspect_err(|_| {
+                            cls_pr_debug!(Errors, "Unsupported render command fields\n")
+                        })?;
 
                     self.inner.submit_render(
+                        &gpu,
                         &mut job,
                         &render,
                         &vertex_attachments,
@@ -878,9 +927,14 @@ impl Queue for Queue::ver {
                     )?;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
-                    let compute: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(header_size)?;
+                    let compute: uapi::drm_asahi_cmd_compute = cmdbuf
+                        .read_supported(header_size, COMPUTE_SUPPORTED_SIZE)
+                        .inspect_err(|_| {
+                            cls_pr_debug!(Errors, "Unsupported compute command fields\n")
+                        })?;
 
                     self.inner.submit_compute(
+                        &gpu,
                         &mut job,
                         &compute,
                         &compute_attachments,

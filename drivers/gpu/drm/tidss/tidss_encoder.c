@@ -76,7 +76,7 @@ static int tidss_bridge_atomic_check(struct drm_bridge *bridge,
 static const struct drm_bridge_funcs tidss_bridge_funcs = {
 	.attach				= tidss_bridge_attach,
 	.atomic_check			= tidss_bridge_atomic_check,
-	.atomic_reset			= drm_atomic_helper_bridge_reset,
+	.atomic_create_state			= drm_atomic_helper_bridge_create_state,
 	.atomic_duplicate_state		= drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state		= drm_atomic_helper_bridge_destroy_state,
 };
@@ -121,12 +121,6 @@ int tidss_encoder_create(struct tidss_device *tidss,
 	if (IS_ERR(connector)) {
 		dev_err(tidss->dev, "bridge_connector create failed\n");
 		return PTR_ERR(connector);
-	}
-
-	ret = drm_connector_attach_encoder(connector, enc);
-	if (ret) {
-		dev_err(tidss->dev, "attaching encoder to connector failed\n");
-		return ret;
 	}
 
 	t_enc->connector = connector;

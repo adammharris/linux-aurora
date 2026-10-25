@@ -575,8 +575,13 @@ struct tomoyo_mini_stat {
 
 /* Structure for dumping argv[] and envp[] of "struct linux_binprm". */
 struct tomoyo_page_dump {
+#ifdef CONFIG_MM_SUBPAGE
 	unsigned long pos;    /* First cached virtual byte, or ULONG_MAX. */
 	char *data;           /* Buffer for one native page of virtual bytes. */
+#else
+	struct page *page;    /* Previously dumped page. */
+	char *data;           /* Contents of "page". Size is PAGE_SIZE. */
+#endif
 };
 
 /* Structure for attribute checks in addition to pathname checks. */

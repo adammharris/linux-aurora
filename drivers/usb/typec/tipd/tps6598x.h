@@ -147,15 +147,25 @@
 #define APPLE_CD_REG_INT_STATUS_UPDATE			BIT(8)
 #define APPLE_CD_REG_INT_PLUG_EVENT			BIT(1)
 
+/*
+ * SN201202x: the DP SID status register changed, that is the DisplayPort
+ * status the partner sent last (DP Status Update or Attention).
+ */
+#define SN201202X_INT_DP_SID_UPDATE			BIT_ULL(37)
+
 /* TPS_REG_SYSTEM_POWER_STATE states */
 #define TPS_SYSTEM_POWER_STATE_S0	0x00
 #define TPS_SYSTEM_POWER_STATE_S3	0x03
 #define TPS_SYSTEM_POWER_STATE_S4	0x04
 #define TPS_SYSTEM_POWER_STATE_S5	0x05
 
-/* TPS_REG_POWER_STATUS bits */
-#define TPS_POWER_STATUS_CONNECTION(x)  TPS_FIELD_GET(BIT(0), (x))
-#define TPS_POWER_STATUS_SOURCESINK(x)	TPS_FIELD_GET(BIT(1), (x))
+/* TPS_REG_POWER_STATUS bits (masks shared by TPS_FIELD_GET accessors and FIELD_PREP) */
+#define TPS_POWER_STATUS_CONNECTION_MASK	BIT(0)
+#define TPS_POWER_STATUS_SOURCESINK_MASK	BIT(1)
+#define TPS_POWER_STATUS_CONNECTION(x) \
+	TPS_FIELD_GET(TPS_POWER_STATUS_CONNECTION_MASK, (x))
+#define TPS_POWER_STATUS_SOURCESINK(x) \
+	TPS_FIELD_GET(TPS_POWER_STATUS_SOURCESINK_MASK, (x))
 #define TPS_POWER_STATUS_BC12_DET(x)	TPS_FIELD_GET(BIT(2), (x))
 
 #define TPS_POWER_STATUS_TYPEC_CURRENT_MASK GENMASK(3, 2)
@@ -291,6 +301,16 @@
 #define TPS_TASK_TIMEOUT		1
 #define TPS_TASK_REJECTED		3
 
+enum tipd_hw_variant {
+	TIPD_VARIANT_INVALID = 0,
+	TIPD_VARIANT_CD321X,
+	TIPD_VARIANT_TPS6598X,
+	TIPD_VARIANT_TPS25750,
+	TIPD_VARIANT_SN201202X,
+	TIPD_VARIANT_TPS66993,
+	TIPD_VARIANT_MAX,
+};
+
 struct tps6598x;
 
 struct tipd_data {
@@ -308,6 +328,7 @@ struct tipd_data {
 	int (*init)(struct tps6598x *tps);
 	int (*switch_power_state)(struct tps6598x *tps, u8 target_state);
 	bool (*read_data_status)(struct tps6598x *tps);
+	bool (*read_power_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
 	void (*prepare)(struct tps6598x *tps);
@@ -315,6 +336,8 @@ struct tipd_data {
 };
 
 struct tps6598x {
+	/* Native H17 routes retain ENOSPC admission and their own HPD path. */
+	u8 h17_display:1;
 	struct device *dev;
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
@@ -384,6 +407,10 @@ struct cd321x_status {
 	struct tps6598x_dp_sid_status_reg dp_sid_status;
 	struct tps6598x_intel_vid_status_reg intel_vid_status;
 	struct tps6598x_usb4_status_reg usb4_status;
+	/* SN201202x: what the DP status showed since the last update */
+	bool dp_sid_event;
+	bool dp_sid_hpd_low;
+	bool dp_sid_irq;
 };
 
 struct cd321x {
@@ -401,10 +428,14 @@ struct cd321x {
 	bool state_valid;
 	u32 dp_status;
 	u32 dp_conf;
+	/* SN201202x: the partner's DP status is current for this DP connection */
+	bool dp_sid_valid;
 	struct typec_thunderbolt_switch *tbt_switch;
 	struct notifier_block tbt_notifier;
 	bool tbt_notifier_registered;
 	atomic_t link_event;
+	atomic_t ready_event;
+	atomic_t restore_event;
 	bool display_route_active;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
@@ -422,16 +453,14 @@ struct cd321x {
 struct sn201202x {
 	struct cd321x cd;
 	bool polled;
+	bool select_polled;
 	struct completion select_completion;
 	struct completion sleep_completion;
 	struct completion wake_completion;
 	struct spmi_device *sdev;
 };
 
-extern const struct tipd_data tipd_cd321x_data;
-extern const struct tipd_data tipd_tps6598x_data;
-extern const struct tipd_data tipd_tps25750_data;
-extern const struct tipd_data tipd_sn201202x_data;
+extern const struct tipd_data *tipd_hw_variants[];
 extern const struct regmap_config tps6598x_regmap_config;
 
 int tipd_init(struct tps6598x *tps);

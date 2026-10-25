@@ -6,7 +6,7 @@ Firmware, MMIO and USB role operations are synthetic leaves. The concurrency
 case executes production transactions with real pthread connector/fabric locks.
 """
 import quiesce
-from common import block
+from common import block, apple_function
 
 
 def controls(ROOT):
@@ -35,7 +35,7 @@ def controls(ROOT):
     dcp=(ROOT/'drivers/gpu/drm/apple/dcp.c').read_text()
     actual=base.replace(block(base,'int main('),block(base,'int main(').replace('int main(','int __attribute__((unused)) prior_main(',1),1)
     actual=actual.replace('struct typec_mux_state { void *alt;', 'struct typec_altmode { unsigned svid; };\nstruct typec_mux_state { struct typec_altmode *alt;',1)
-    actual=actual.replace('struct connector { bool connected; };','struct encoder { unsigned possible_crtcs; };\nstruct connector { bool connected; void *dcp; struct encoder *port_encoder; unsigned candidate_crtcs; };\n#define apple_connector connector\nstruct mux_control { int unused; };',1)
+    actual=actual.replace('struct connector { bool connected; };','struct encoder { unsigned possible_crtcs; };\nstruct connector { bool connected,edid_live,edid_invalidation_pending; void *dcp; struct encoder *port_encoder; unsigned candidate_crtcs; int bl_sync_wq; };\n#define apple_connector connector\nstruct mux_control { int unused; };',1)
     actual=actual.replace('struct apple_dcp { int external_lock,external_error;', '''struct apple_dcp { int external_lock,external_error;
      bool external_power_attempted,dptx_tunnel,tb_clock_ok,fixed_route_selected;
      int tb_lock; unsigned typec_generation,dptx_dfp_port,dptx_phy,fixed_dptx_phy,fixed_mux_index;
@@ -43,10 +43,14 @@ def controls(ROOT):
      struct mux_control *xbar;
      struct apple_dcp_typec_route *active_typec_route,*typec_routes;
      struct connector *connector,*fixed_connector;int connector_type,fixed_connector_type;
+     struct mux_control *direct_xbar_up; bool external_native, ext_dead; int fw_compat; unsigned long long tb_generation;
+     int modes_lock; unsigned long long modes_generation; bool modes_admitted,modes_provisional;
+     struct { int iomfb_method_profile; } hw;
     ''',1)
     actual=actual.replace('bool applied_valid,safe_pending,dp_wanted,dp_hpd,hpd;', 'struct typec_altmode *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,dp_wanted,dp_hpd,hpd;',1)
-    actual=actual.replace('void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel;', 'struct mux_control *xbar,*active_xbar; void *phy; unsigned dptx_phy,tunnel_dpin,mux_index;bool deactivate_xbar_done; int deactivate_error;bool xbar_up,selected,tunnel;',1)
+    actual=actual.replace('void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel;', 'struct mux_control *xbar,*active_xbar; void *phy; unsigned dptx_phy,tunnel_dpin,mux_index;unsigned long long tunnel_generation;bool deactivate_xbar_done; int deactivate_error;bool xbar_up,selected,tunnel;',1)
     extra=r'''
+    /* actual DCP leaves */
     #define WRITE_ONCE(x,v) ((x)=(v))
     #define USB_TYPEC_DP_SID 0xff01
     #define TYPEC_DP_STATE_A 10
@@ -61,21 +65,57 @@ def controls(ROOT):
     static int gpiod_get_value_cansleep(void *p);
     static int dcp_dpxbar_preselect(struct mux_control *m,int s) { (void)m;(void)s;return 0; }
     static int dcp_dpxbar_tunnel_select_source(struct mux_control *m,int s) { (void)m;(void)s;return 0; }
-    static int apple_atc_dp_tunnel_rate(void *p,unsigned n,unsigned rate) { (void)p;(void)n;(void)rate;return 0; }
+    static int __attribute__((unused)) apple_atc_dp_tunnel_rate(void *p,unsigned n,unsigned rate) { (void)p;(void)n;(void)rate;return 0; }
     static int xbar_error,xbar_calls;
 static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar_calls++;return xbar_error; }
     static int mux_control_select(struct mux_control *m,unsigned n) { (void)m;(void)n;return 0; }
     static void dpavservep_detach(struct apple_dcp *d) { (void)d; }
     static void dcp_firmware_metadata_connection(struct apple_dcp *d,unsigned n,bool c) { (void)d;(void)n;(void)c; }
     static bool dcp_typec_keep_order(void) { return false; }
-    static struct apple_dcp_typec_route *dcp_typec_lowest_free(struct apple_dcp_typec_port *p) { (void)p;return &route; }
+    static struct apple_dcp_typec_route * __attribute__((unused)) dcp_typec_lowest_free(struct apple_dcp_typec_port *p) { (void)p;return &route; }
+    static struct apple_dcp_typec_route * __attribute__((unused)) dcp_typec_free_route(struct apple_dcp_typec_port *p) { (void)p;return &route; }
     static int connect_calls;
     static int dcp_dptx_connect_oob(void *dev,unsigned n) { (void)dev;(void)n;connect_calls++;display.external_cable=true;display.dptxport[0].connected=true;display.typec_cable_connected=true;connector.connected=true;return 0; }
     static void dcp_retrain_oob(struct connector *c) { (void)c; }
+    static bool dcp_typec_sink_relink(struct apple_dcp *d) { (void)d;return false; }
     '''
+    # Catalogue/EDID ownership: deactivation ends the Type-C attachment of the
+    # pipeline's modes and moves the connector's pipeline through the real helpers.
+    extra+='''
+    struct platform_device;
+    #ifndef DCP_IOMFB_METHODS_H17P_EXTERNAL
+    #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
+    #endif
+    /* T6030 external processors (dcp->external_native) are not in these scenarios. */
+    static void __attribute__((unused)) dcp_external_sink_irq(struct apple_dcp *d) { (void)d;assert(!"T6030 external sink IRQ"); }
+    static bool __attribute__((unused)) iomfb_v14_7_external_failed(struct apple_dcp *d) { (void)d;assert(!"T6030 external state");return false; }
+    /* fw_compat is UNKNOWN here: never H17P, 14.7 or 26.6. */
+    #ifndef DCP_FIRMWARE_H17P
+    #define DCP_FIRMWARE_H17P 5
+    #endif
+    /* No route here is a tunnel, and no IRQ_HPD arrives for a disconnected sink. */
+    static int __attribute__((unused)) dcp_route_clock_rate(struct apple_dcp_typec_route *r,void *phy,unsigned dpin,u8 rate) { (void)r;(void)phy;(void)dpin;(void)rate;assert(!"tunnel pixel clock");return -EINVAL; }
+    static int __attribute__((unused)) dcp_dptx_recover_irq(struct apple_dcp *d) { (void)d;assert(!"IRQ_HPD recovery");return -EINVAL; }
+    static int __attribute__((unused)) of_property_read_string(void *np,const char *name,const char **out) { (void)np;(void)name;(void)out;return -EINVAL; }
+    '''+''.join(apple_function(ROOT,name) for name in ('apple_connector_invalidate_edid','apple_connector_set_pipeline','dcp_modes_end_typec','dcp_typec_port_busy'))
     pos=actual.index('static int dcp_typec_route_deactivate(')
     actual=actual[:pos]+extra+actual[pos:]
-    actual=actual.replace(block(actual,'static bool dcp_typec_route_available('), 'static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *r) { (void)r;return false; }\n'+block(dcp,'static bool dcp_typec_route_available('),1)
+    # The fabric core split: availability is the real dcp_fabric_available() over
+    # the real ownership (SAFE lease included) and HDMI presence of the pipeline.
+    available=''.join(block(dcp,marker)+'\n' for marker in (
+        'static bool dcp_typec_safe_held(struct apple_dcp *dcp)\n{', 'bool dcp_typec_dual_stream(void)\n{',
+        'static bool dcp_hdmi_settle_enabled(struct apple_dcp *dcp)\n{',
+        'static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp)\n{') if marker in dcp)
+    # Route-follow: the fixed output, or a failed T6030 external processor, keeps the route busy.
+    available+=apple_function(ROOT,'dcp_typec_route_busy')
+    if available:
+        actual=actual.replace('struct apple_dcp { int external_lock,external_error;','struct apple_dcp { int external_lock,external_error;\n     struct dcp_fabric_presence hdmi_presence; int hdmi_presence_lock; unsigned nr_typec_routes;',1)
+        available='''#define atomic_read(p) (*(p))
+    #define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
+    #define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
+    static int dcp_dual_stream_routes;
+    '''+available
+    actual=actual.replace(block(actual,'static bool dcp_typec_route_available('), 'static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *r) { (void)r;return false; }\n'+available+block(dcp,'static bool dcp_typec_route_available('),1)
     actual=actual.replace(block(actual,'static int dcp_typec_route_deactivate('),block(dcp,dcp.rindex('static int dcp_typec_route_deactivate(')),1)
     pos=actual.index('static struct typec_mux_dev phy_provider')
     actual=actual[:pos]+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+block(dcp,'static int dcp_typec_route_set(')+'\n'+actual[pos:]
@@ -148,10 +188,10 @@ static int late_finish_error(struct typec_mux_dev *m,struct typec_mux_state *s) 
     concurrent=concurrent.replace('#define scoped_guard(k,l) for(int once=((void)(l),1);once;once=0)','')
     locks=r'''
     #include <pthread.h>
-    static pthread_mutex_t fabric_mutex=PTHREAD_MUTEX_INITIALIZER,external_mutex=PTHREAD_MUTEX_INITIALIZER,tb_mutex=PTHREAD_MUTEX_INITIALIZER;
+    static pthread_mutex_t fabric_mutex=PTHREAD_MUTEX_INITIALIZER,external_mutex=PTHREAD_MUTEX_INITIALIZER,tb_mutex=PTHREAD_MUTEX_INITIALIZER,modes_mutex=PTHREAD_MUTEX_INITIALIZER;
     struct real_guard { pthread_mutex_t *mutex; bool held; };
     static struct real_guard take_lock(int *key) {
-     pthread_mutex_t *m=key==&dcp_typec_fabric_lock?&fabric_mutex:key==&display.external_lock?&external_mutex:&tb_mutex;
+     pthread_mutex_t *m=key==&dcp_typec_fabric_lock?&fabric_mutex:key==&display.external_lock?&external_mutex:key==&display.modes_lock?&modes_mutex:&tb_mutex;
      assert(pthread_mutex_lock(m)==0);return (struct real_guard){m,true};
     }
     static void drop_lock(struct real_guard *g) { if(g->held){g->held=false;assert(pthread_mutex_unlock(g->mutex)==0);} }
@@ -159,7 +199,8 @@ static int late_finish_error(struct typec_mux_dev *m,struct typec_mux_state *s) 
     #define scoped_guard(k,l) for(struct real_guard __attribute__((cleanup(drop_lock))) _scope=take_lock(l);_scope.held;drop_lock(&_scope))
     static bool observed_unquiesced_safe;
     '''
-    pos=concurrent.index('static int dcp_typec_route_deactivate(')
+    # Before the DCP leaves: the extracted helpers take real locks too.
+    pos=concurrent.index('/* actual DCP leaves */')
     concurrent=concurrent[:pos]+locks+concurrent[pos:]
     concurrent=concurrent.replace("(void)m;(void)s;event('L');phy_calls++;", "(void)m;if(s->mode==TYPEC_STATE_SAFE&&display.dptxport[0].connected)observed_unquiesced_safe=true;event('L');phy_calls++;",1)
     concurrent+=r'''
@@ -275,8 +316,8 @@ def probe(root):
     core = (root / 'drivers/usb/typec/tipd/core.c').read_text()
     unit = quiesce.make_unit(root)
     unit = unit.replace(block(unit, 'int main('), block(unit, 'int main(').replace('int main(', 'int __attribute__((unused)) prior_main(', 1), 1)
-    unit = unit.replace('struct tipd_data {', 'struct fwnode_handle;\nstruct tipd_data { unsigned irq_mask1; int (*init)(struct tps6598x *); int (*switch_power_state)(struct tps6598x *, int); int (*register_port)(struct tps6598x *, struct fwnode_handle *); bool (*read_data_status)(struct tps6598x *); int (*connect)(struct tps6598x *,u32); void (*ready)(struct tps6598x *); void *irq_handler;')
-    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool dbma_at_probe,wakeup;')
+    unit = unit.replace('struct tipd_data {', 'struct fwnode_handle;\nstruct tipd_data { unsigned irq_mask1; int (*init)(struct tps6598x *); int (*switch_power_state)(struct tps6598x *, int); int (*register_port)(struct tps6598x *, struct fwnode_handle *); bool (*read_data_status)(struct tps6598x *); bool (*read_power_status)(struct tps6598x *); int (*connect)(struct tps6598x *,u32); void (*ready)(struct tps6598x *); void *irq_handler;')
+    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool dbma_at_probe,wakeup; u32 status;')
     helpers = r"""
 #undef dev_err
 #define dev_err(...) ((void)0)
@@ -301,12 +342,13 @@ def probe(root):
 #define enable_irq_wake(...) ((void)0)
 #define dev_err_probe(...) (-EINVAL)
 struct fwnode_handle { int unused; };
-static int connect_error,irq_error,register_error,node_puts,mux_get_error;
+static int connect_error,irq_error,register_error,node_puts,mux_get_error,controller_mode;
 static void *devm_gpiod_get_optional(void *d,const char *s,int v) { (void)d;(void)s;(void)v;return NULL; }
 static void msleep(unsigned ms) { (void)ms; }
 static bool device_is_compatible(void *d,const char *s) { (void)d;(void)s;return false; }
 static int tps6598x_read32(struct tps6598x *t,int reg,u32 *v) { (void)t;(void)reg;*v=1;return 0; }
-static int tps6598x_check_mode(struct tps6598x *t) { (void)t;return 0; }
+static int tps6598x_check_mode(struct tps6598x *t) { (void)t;return controller_mode; }
+static int apply_patch(struct tps6598x *t) { (void)t;return 0; }
 static int tps6598x_write64(struct tps6598x *t,int reg,unsigned v) { (void)t;(void)reg;(void)v;return 0; }
 static bool tps6598x_read_status(struct tps6598x *t,u32 *s) { (void)t;*s=TPS_STATUS_PLUG_PRESENT;return true; }
 static bool tps6598x_read_power_status(struct tps6598x *t) { (void)t;return true; }
@@ -327,10 +369,14 @@ static int register_port(struct tps6598x *t,struct fwnode_handle *f) { (void)t;(
 static bool read_data_status(struct tps6598x *t) { (void)t;return true; }
 static int connect(struct tps6598x *t,u32 status) { (void)t;(void)status;return connect_error; }
 """
+    helpers += '\n#define of_machine_is_compatible(name) (!strcmp((name), \"apple,t8140\"))\n#define BIT_ULL(n) (1ULL << (n))\n#define SN201202X_INT_DP_SID_UPDATE BIT_ULL(37)\n'
+    helpers += block(core, 'static bool cd321x_uses_dp_sid(') + '\n' + block(core, 'static u64 cd321x_irq_mask(') + '\n'
     unit += helpers + block(core, 'int tipd_init(') + r"""
 static void probe_initial(struct cd321x *c) {
- initial(c);ordinary_port=true;phy_provider.safe_after_role=true;c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.connect=connect;
+ initial(c);ordinary_port=true;phy_provider.safe_after_role=true;c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.read_power_status=tps6598x_read_power_status;data.connect=connect;
  connect_error=irq_error=register_error=node_puts=mux_get_error=0;
+ /* tipd_init() resets only a controller it patched (stable a2b95607926d, mainline c5df31f10880) */
+ controller_mode=TPS_MODE_PTCH;data.init=apply_patch;
 }
 int main(void) {
  struct cd321x c;
@@ -340,11 +386,13 @@ int main(void) {
  assert(tipd_init(&c.tps)==-EAGAIN&&reset_calls==0&&gpio_calls==0&&phy_calls==0&&port.owner==&route&&port.safe_pending);
  probe_initial(&c);irq_error=-ENOSPC;
  assert(tipd_init(&c.tps)==-ENOSPC&&reset_calls==1&&!port.owner&&!port.safe_pending&&unregisters==1);
+ probe_initial(&c);irq_error=-ENOSPC;controller_mode=0;
+ assert(tipd_init(&c.tps)==-ENOSPC&&reset_calls==0&&!port.owner&&!port.safe_pending&&unregisters==1);
  probe_initial(&c);mux_get_error=-ENODEV;
  assert(tipd_init(&c.tps)==-ENODEV&&reset_calls==0&&stops==0&&phy_calls==0&&unregisters==0&&node_puts==1);
  probe_initial(&c);register_error=-EIO;
  assert(tipd_init(&c.tps)==-EIO&&reset_calls==0&&stops==0&&phy_calls==0&&unregisters==0);
- puts("PASS actual probe rollback preserves primary errors and blocks reset after SAFE/role/registration errors");
+ puts("PASS actual probe rollback preserves primary errors, blocks reset after SAFE/role/registration errors and resets only a patched controller");
 }
 """
     return unit

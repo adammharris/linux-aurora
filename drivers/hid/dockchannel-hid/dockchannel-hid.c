@@ -12,9 +12,14 @@
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
 #include <linux/hid.h>
+#include <linux/mfd/macsmc.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/soc/apple/dockchannel.h>
+#include <linux/soc/apple/rtkit-helper.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/of.h>
@@ -26,9 +31,12 @@
 
 #define MAX_INTERFACES 16
 
-/* Data + checksum */
-#define MAX_PKT_SIZE (0xffff + 4)
+/* Complete frame, including the largest aligned body and its checksum. */
+#define MAX_PKT_SIZE (8 + 0xfffc + 4)
+#define DCHID_RING_SIZE SZ_2M
+#define DCHID_RING_HEADER_SIZE 8
 
+#define DCHID_CHANNEL_NOTIFY 0x00
 #define DCHID_CHANNEL_CMD 0x11
 #define DCHID_CHANNEL_REPORT 0x12
 
@@ -75,6 +83,7 @@ struct dchid_init_hdr {
 #define INIT_TERMINATOR		2
 #define INIT_PRODUCT_NAME	7
 
+#define CMD_REGISTER_RING 0x91
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
@@ -105,6 +114,10 @@ struct dchid_gpio_ack {
 	u32 retcode;
 	u8 cmd[];
 } __packed;
+
+/* Multi-touch report 0x75: byte 23 bit 0 is the firmware's button state. */
+#define MT_REPORT_ID		0x75
+#define MT_REPORT_BUTTON	23
 
 #define STM_REPORT_ID		0x10
 #define STM_REPORT_SERIAL	0x11
@@ -184,11 +197,22 @@ struct dockchannel_hid {
 	struct device *dev;
 	struct dockchannel *dc;
 	struct device_link *helper_link;
+	struct apple_smc *afe_smc;
 	bool stopping;
+	bool inherited_mtp;
+	/* Between the system sleep suspend and resume callbacks */
+	bool suspended;
 
 	/* Held from probe on when the multi-touch interface uses power method 2 */
 	struct gpio_desc *afe_reset;
 
+	struct mutex ring_mutex;
+	bool use_ring;
+	bool ring_registered;
+	int ring_error;
+	void *ring;
+	dma_addr_t ring_dma;
+	u32 ring_read;
 	bool id_ready;
 	struct dchid_stm_id device_id;
 	char serial[64];
@@ -428,9 +452,84 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
 	u8 msg[DCHID_PM1_CMD_SIZE];
+	u8 msg2[DCHID_PM2_CMD_SIZE];
+	int ret;
 
-	dchid_pm1_command(iface->index, state, msg);
-	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	if (!iface->dchid->use_ring) {
+		dchid_pm1_command(iface->index, state, msg);
+		return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	}
+
+	/*
+	 * T8132 boot capture: state 0 then 2, each with byte 4 equal to 0
+	 * then 1. This is only the observed provisioning sequence, not a
+	 * contract for suspend, wake, or arbitrary interface power changes.
+	 */
+	dchid_pm2_command(iface->index, state, false, msg2);
+	ret = dchid_comm_cmd(iface->dchid, msg2, sizeof(msg2));
+	if (ret < 0)
+		return ret;
+
+#if IS_REACHABLE(CONFIG_MFD_MACSMC)
+	if (iface->dchid->afe_smc && iface->index == 1) {
+		/*
+		 * J616s macOS power sequence: gp1c high + 50 ms when turning
+		 * off, low with no added delay when turning on. These are
+		 * pKW4 function payloads, not gpio-macsmc CMD_OUTPUT values.
+		 * The host operation sits between WillChange and HasChanged.
+		 */
+		__le32 value = cpu_to_le32(0x00010000 | (state == 0));
+
+		ret = apple_smc_write(iface->dchid->afe_smc, SMC_KEY(gp1c),
+				      &value, sizeof(value));
+		if (ret < 0) {
+			dev_err(iface->dchid->dev,
+				"AFE power sequence failed: %d; reboot required\n", ret);
+			return ret;
+		}
+		if (state == 0)
+			msleep(50);
+	}
+#endif
+	dchid_pm2_command(iface->index, state, true, msg2);
+	return dchid_comm_cmd(iface->dchid, msg2, sizeof(msg2));
+}
+
+static int dchid_register_ring(struct dockchannel_hid *dchid)
+{
+	struct {
+		u8 cmd;
+		u8 reserved[2];
+		u64 addr;
+		u32 size;
+	} __packed msg = {
+		.cmd = CMD_REGISTER_RING,
+		.addr = dchid->ring_dma,
+		.size = DCHID_RING_SIZE,
+	};
+	/* Observed in both macOS and standalone T8132 bringup before 0x91. */
+	u8 prepare[] = { 0xc1, 0x02 };
+	int ret = 0;
+
+	if (!dchid->use_ring)
+		return 0;
+
+	mutex_lock(&dchid->ring_mutex);
+	ret = dchid->ring_error;
+	if (!dchid->ring_registered) {
+		ret = dchid_comm_cmd(dchid, prepare, sizeof(prepare));
+		if (ret < 0) {
+			mutex_unlock(&dchid->ring_mutex);
+			return ret;
+		}
+		/* The registration ACK itself arrives through the ring. */
+		dma_wmb();
+		WRITE_ONCE(dchid->ring_registered, true);
+		ret = dchid_comm_cmd(dchid, &msg, sizeof(msg));
+		dchid->ring_error = ret;
+	}
+	mutex_unlock(&dchid->ring_mutex);
+	return ret;
 }
 
 /*
@@ -560,6 +659,11 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 	if (iface->firmware_managed_reset)
 		return -EINVAL;
 
+	if (iface->dchid->use_ring) {
+		dev_err_once(iface->dchid->dev, "T8132 SMC reset GPIO operation is not established\n");
+		return -EOPNOTSUPP;
+	}
+
 	if (iface->gpio)
 		return 0;
 
@@ -602,14 +706,17 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	dev_dbg(iface->dchid->dev, "Starting interface %s\n", iface->name);
 
 	iface->starting = true;
+	ret = dchid_register_ring(iface->dchid);
+	if (ret < 0)
+		goto err;
 
 	/* Look to see if we need firmware */
 	ret = dchid_get_firmware(iface, &fw, &size);
 	if (ret < 0)
 		goto err;
 
-	/* If we need a GPIO, make sure we have it. */
-	if (iface->gpio_announced) {
+	/* T8132 startup does not use the older host GPIO reset. */
+	if (!iface->dchid->use_ring && iface->gpio_announced) {
 		ret = dchid_request_gpio(iface);
 		if (ret < 0)
 			goto err;
@@ -620,6 +727,18 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		/* Send firmware to the device */
 		dev_dbg(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
+		/* Retained MTP must see AFE reset throughout firmware upload. */
+		if (iface->dchid->inherited_mtp &&
+		    iface->power_method == DCHID_POWER_METHOD_2) {
+			if (iface->firmware_managed_reset) {
+				ret = -EINVAL;
+				goto err;
+			}
+			ret = gpiod_set_value_cansleep(iface->dchid->afe_reset, 1);
+			if (ret < 0)
+				goto err;
+			fsleep(50 * USEC_PER_MSEC);
+		}
 		ret = dchid_send_firmware(iface, fw, size);
 		if (ret < 0) {
 			dev_err(iface->dchid->dev, "Failed to send %s firmware\n", iface->name);
@@ -629,15 +748,20 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		/* After loading firmware, multi-touch needs a reset */
 		dev_dbg(iface->dchid->dev, "Resetting %s\n", iface->name);
 		if (iface->power_method == DCHID_POWER_METHOD_2) {
-			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
-			if (ret < 0)
-				goto err;
+			/* The retained session is already off while reset is asserted. */
+			if (!iface->dchid->inherited_mtp) {
+				ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
+				if (ret < 0)
+					goto err;
+			}
 			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_ON);
 			if (ret < 0)
 				goto err;
 		} else {
-			dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
-			dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
+			ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
+			/* After a failed AFE power-off the trackpad stays off: no retry. */
+			if (ret >= 0 || !iface->dchid->afe_smc || iface->index != 1)
+				dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
 		}
 	}
 
@@ -725,6 +849,9 @@ static int dchid_raw_request(struct hid_device *hdev,
 
 	if (READ_ONCE(iface->dchid->stopping))
 		return -ESHUTDOWN;
+	/* Fail fast: an answer that arrives in suspend-to-idle is not waited for. */
+	if (READ_ONCE(iface->dchid->suspended))
+		return -EBUSY;
 
 	switch (reqtype) {
 	case HID_REQ_GET_REPORT:
@@ -985,7 +1112,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 			break;
 	}
 
-	if (hdr->more_packets)
+	if (hdr->more_packets || (dchid->use_ring && !iface->hid_desc))
 		return;
 
 	/* We need to enable STM first, since it'll give us the device IDs */
@@ -1188,13 +1315,157 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	complete(&iface->out_complete);
 }
 
+/*
+ * Whether a report should wake the system: any keyboard report, and a
+ * multi-touch report only while the trackpad is clicked. Touches, the
+ * accelerometer and the other interfaces do not wake it.
+ */
+static bool dchid_wake_report(struct dchid_iface *iface, void *data)
+{
+	struct dchid_subhdr *shdr = data;
+	u8 *payload = data + sizeof(*shdr);
+
+	if (FIELD_GET(FLAGS_GROUP, shdr->flags) != HID_INPUT_REPORT)
+		return false;
+	if (!strcmp(iface->name, "keyboard"))
+		return shdr->length > 0;
+	return !strcmp(iface->name, "multi-touch") &&
+	       shdr->length > MT_REPORT_BUTTON && payload[0] == MT_REPORT_ID &&
+	       (payload[MT_REPORT_BUTTON] & 1);
+}
+
+/* Return the complete frame size, or reject a lost framing boundary. */
+static int dchid_frame_size(const struct dchid_hdr *hdr)
+{
+	size_t length = hdr->length;
+
+	if (hdr->hdr_len != sizeof(*hdr) || !IS_ALIGNED(length, 4))
+		return -EPROTO;
+	return sizeof(*hdr) + length + sizeof(u32);
+}
+
+/*
+ * Both receive transports pass complete frames here. Header bytes 6/7 and
+ * application padding are opaque, checksum-covered data, not required zeroes.
+ */
+static int dchid_dispatch(struct dockchannel_hid *dchid, struct dchid_hdr *hdr,
+			  void *data, bool fifo)
+{
+	struct dchid_iface *iface;
+	struct dchid_work *work;
+	u32 checksum;
+
+	if (!dchid_verify_checksum(hdr, data, &checksum)) {
+		dev_err(dchid->dev, "Checksum mismatch (iface %d): 0x%08x != 0xffffffff\n",
+			hdr->iface, checksum);
+		return 0;
+	}
+
+	if (dchid->use_ring && hdr->channel == DCHID_CHANNEL_NOTIFY) {
+		/* A FIFO notification has no application subheader or report ID. */
+		return fifo && !hdr->length && hdr->iface == IFACE_COMM;
+	}
+
+	if (hdr->iface >= MAX_INTERFACES || hdr->length < sizeof(struct dchid_subhdr))
+		return 0;
+	iface = dchid->ifaces[hdr->iface];
+	if (!iface) {
+		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n", hdr->iface);
+		return 0;
+	}
+
+	switch (hdr->channel) {
+	case DCHID_CHANNEL_CMD:
+		dchid_handle_ack(iface, hdr, data);
+		return 0;
+	case DCHID_CHANNEL_REPORT:
+		/* pm_wakeup_hard_event() does nothing while wakeup is disabled. */
+		if (READ_ONCE(dchid->suspended) &&
+		    hdr->length >= sizeof(struct dchid_subhdr) +
+				   ((struct dchid_subhdr *)data)->length &&
+		    dchid_wake_report(iface, data))
+			pm_wakeup_hard_event(dchid->dev);
+		break;
+	default:
+		dev_warn(dchid->dev, "Unknown channel 0x%x, treating as report...\n",
+			 hdr->channel);
+		break;
+	}
+
+	work = kzalloc(sizeof(*work) + hdr->length, GFP_KERNEL);
+	if (!work)
+		return 0;
+	work->hdr = *hdr;
+	work->iface = iface;
+	memcpy(work->data, data, hdr->length);
+	INIT_WORK(&work->work, dchid_packet_work);
+	queue_work(iface->wq, &work->work);
+	return 0;
+}
+
+static void dchid_ring_copy(struct dockchannel_hid *dchid, void *dst,
+			    u32 offset, size_t length)
+{
+	size_t first = min_t(size_t, length,
+			     DCHID_RING_SIZE - DCHID_RING_HEADER_SIZE - offset);
+	void *data = dchid->ring + DCHID_RING_HEADER_SIZE;
+
+	memcpy(dst, data + offset, first);
+	memcpy(dst + first, data, length - first);
+}
+
+static int dchid_drain_ring(struct dockchannel_hid *dchid)
+{
+	const u32 capacity = DCHID_RING_SIZE - DCHID_RING_HEADER_SIZE;
+	u32 *indices = dchid->ring;
+	u32 producer, consumer, available;
+	int size;
+
+	if (!READ_ONCE(dchid->ring_registered)) {
+		/* The firmware can notify before it has the ring address: nothing to read. */
+		dev_dbg(dchid->dev, "Ring notification before registration\n");
+		return 0;
+	}
+
+	while (1) {
+		producer = READ_ONCE(indices[0]);
+		consumer = READ_ONCE(indices[1]);
+		if (producer >= capacity || consumer != dchid->ring_read ||
+		    !IS_ALIGNED(producer, 4))
+			return -EPROTO;
+		/* Read only the bytes published by this producer snapshot. */
+		dma_rmb();
+		available = producer >= consumer ? producer - consumer :
+			    capacity - consumer + producer;
+		if (available < sizeof(struct dchid_hdr))
+			return 0;
+		dchid_ring_copy(dchid, dchid->pkt_buf, consumer,
+				sizeof(struct dchid_hdr));
+		size = dchid_frame_size((void *)dchid->pkt_buf);
+		if (size < 0)
+			return size;
+		if (available < size)
+			return 0;
+		dchid_ring_copy(dchid, dchid->pkt_buf, consumer, size);
+		dchid_dispatch(dchid, (void *)dchid->pkt_buf,
+			       dchid->pkt_buf + sizeof(struct dchid_hdr), false);
+		consumer += size;
+		if (consumer >= capacity)
+			consumer -= capacity;
+		dchid->ring_read = consumer;
+		/* All frame reads must complete before the producer can reuse it. */
+		mb();
+		WRITE_ONCE(indices[1], consumer);
+		cond_resched();
+	}
+	return 0;
+}
+
 static void dchid_handle_packet(void *cookie, size_t avail)
 {
 	struct dockchannel_hid *dchid = cookie;
 	struct dchid_hdr hdr;
-	struct dchid_work *work;
-	struct dchid_iface *iface;
-	u32 checksum;
+	int ret;
 
 	if (READ_ONCE(dchid->stopping))
 		return;
@@ -1203,58 +1474,20 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 		dev_err(dchid->dev, "Read failed (header)\n");
 		return;
 	}
-
 	if (hdr.hdr_len != sizeof(hdr)) {
 		dev_err(dchid->dev, "Bad header length %d\n", hdr.hdr_len);
 		goto done;
 	}
-
-	if (dockchannel_recv(dchid->dc, dchid->pkt_buf, hdr.length + 4) != (hdr.length + 4)) {
+	if (dockchannel_recv(dchid->dc, dchid->pkt_buf, hdr.length + 4) != hdr.length + 4) {
 		dev_err(dchid->dev, "Read failed (body)\n");
 		goto done;
 	}
 
-	if (!dchid_verify_checksum(&hdr, dchid->pkt_buf, &checksum)) {
-		dev_err(dchid->dev, "Checksum mismatch (iface %d): 0x%08x != 0xffffffff\n",
-			hdr.iface, checksum);
-		goto done;
+	if (dchid_dispatch(dchid, &hdr, dchid->pkt_buf, true)) {
+		ret = dchid_drain_ring(dchid);
+		if (ret < 0)
+			dev_err(dchid->dev, "Receive ring failed: %d\n", ret);
 	}
-
-
-	if (hdr.iface >= MAX_INTERFACES) {
-		dev_err(dchid->dev, "Bad iface %d\n", hdr.iface);
-		goto done;
-	}
-
-	iface = dchid->ifaces[hdr.iface];
-
-	if (!iface) {
-		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n", hdr.iface);
-		goto done;
-	}
-
-	switch (hdr.channel) {
-		case DCHID_CHANNEL_CMD:
-			dchid_handle_ack(iface, &hdr, dchid->pkt_buf);
-			goto done;
-		case DCHID_CHANNEL_REPORT:
-			break;
-		default:
-			dev_warn(dchid->dev, "Unknown channel 0x%x, treating as report...\n",
-				 hdr.channel);
-			break;
-	}
-
-	work = kzalloc(sizeof(*work) + hdr.length, GFP_KERNEL);
-	if (!work)
-		goto done;
-
-	work->hdr = hdr;
-	work->iface = iface;
-	memcpy(work->data, dchid->pkt_buf, hdr.length);
-	INIT_WORK(&work->work, dchid_packet_work);
-
-	queue_work(iface->wq, &work->work);
 
 done:
 	if (!READ_ONCE(dchid->stopping))
@@ -1262,11 +1495,63 @@ done:
 				  sizeof(struct dchid_hdr));
 }
 
+/* AFE power through SMC key gp1c, for boards whose device tree links the SMC. */
+static int dchid_bind_afe_smc(struct dockchannel_hid *dchid)
+{
+	struct device *dev = dchid->dev;
+#if IS_REACHABLE(CONFIG_MFD_MACSMC)
+	struct device_node *node;
+	struct platform_device *pdev;
+	struct device_link *link;
+	struct apple_smc_key_info info;
+	int ret;
+#endif
+
+	if (!of_find_property(dev->of_node, "apple,afe-smc", NULL))
+		return 0;
+	if (!of_device_is_compatible(dev->of_node, "apple,t6041-dockchannel-hid"))
+		return -EINVAL;
+#if !IS_REACHABLE(CONFIG_MFD_MACSMC)
+	return -EOPNOTSUPP;
+#else
+	node = of_parse_phandle(dev->of_node, "apple,afe-smc", 0);
+	if (!node)
+		return -EINVAL;
+	/* What macsmc binds to: its driver data is read as an apple_smc below */
+	if (!of_device_is_compatible(node, "apple,t8103-smc") &&
+	    !of_device_is_compatible(node, "apple,smc")) {
+		of_node_put(node);
+		return -EINVAL;
+	}
+	pdev = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!pdev)
+		return -EPROBE_DEFER;
+	link = device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
+	put_device(&pdev->dev);
+	if (!link)
+		return -EINVAL;
+	if (link->supplier->links.status != DL_DEV_DRIVER_BOUND)
+		return -EPROBE_DEFER;
+	dchid->afe_smc = dev_get_drvdata(link->supplier);
+	if (!dchid->afe_smc)
+		return -EPROBE_DEFER;
+	ret = apple_smc_get_key_info(dchid->afe_smc, SMC_KEY(gp1c), &info);
+	if (ret < 0)
+		return ret;
+	if (info.size != 4 || !(info.flags & APPLE_SMC_WRITABLE))
+		return -EINVAL;
+	dev_info(dev, "AFE power sequence via SMC gp1c\n");
+	return 0;
+#endif
+}
+
 static int dockchannel_hid_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct dockchannel_hid *dchid;
 	struct device_node *child, *helper;
+	struct fwnode_handle *stm;
 	struct platform_device *helper_pdev;
 	struct property *prop;
 	int ret;
@@ -1281,6 +1566,16 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	stm = device_get_named_child_node(dev, "stm");
+	dchid->id_ready = !stm || !fwnode_device_is_available(stm);
+	fwnode_handle_put(stm);
+	mutex_init(&dchid->ring_mutex);
+	/* The M4 Pro (J616s) MTP uses the same 26.6.2 firmware transport as T8132. */
+	dchid->use_ring = of_device_is_compatible(dev->of_node, "apple,t6041-dockchannel-hid");
+
+	ret = dchid_bind_afe_smc(dchid);
+	if (ret)
+		return dev_err_probe(dev, ret, "AFE power sequence preflight failed\n");
 
 	/*
 	 * The STM interface reports the machine's vendor and product IDs,
@@ -1377,6 +1672,8 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 
 	if (dchid->helper_link->supplier->links.status != DL_DEV_DRIVER_BOUND)
 		return -EPROBE_DEFER;
+	dchid->inherited_mtp =
+		apple_rtkit_helper_preserves_input(dchid->helper_link->supplier);
 
 	/* Now it is safe to begin initializing */
 	dchid->dc = dockchannel_init(pdev);
@@ -1385,16 +1682,23 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * Keyboard and trackpad input wakes the system. The coprocessor keeps
-	 * running across suspend-to-idle and keeps sending reports through
-	 * the FIFO, so its receive interrupt is the wake interrupt. Without
-	 * it the machine still works, it just cannot be woken from here.
+	 * A keypress or a trackpad click wakes the system. The coprocessor
+	 * keeps running across suspend-to-idle and keeps sending through the
+	 * FIFO, so received frames are classified (dchid_wake_report()) and
+	 * other traffic does not wake it. Without a wakeup source the machine
+	 * still works, it just cannot be woken from here.
 	 */
 	ret = dockchannel_init_wakeup(dchid->dc);
 	if (ret)
 		dev_warn(dev, "Failed to set up wakeup: %d\n", ret);
 
-	dchid->new_iface_wq = alloc_workqueue("dchid-new", WQ_MEM_RECLAIM, 0);
+	if (dchid->use_ring) {
+		dchid->ring = dmam_alloc_coherent(dev, DCHID_RING_SIZE, &dchid->ring_dma,
+						  GFP_KERNEL);
+		if (!dchid->ring)
+			return -ENOMEM;
+	}
+	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", 0);
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 
@@ -1442,6 +1746,31 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
 	}
 }
 
+/*
+ * The coprocessor keeps running across suspend-to-idle: there is no known
+ * sleep command for it, and its RTKit session and the trackpad AFE power
+ * sequence are not restartable. Only mark the sleep window, in which input
+ * may wake the system and requests from the HID core fail fast.
+ */
+static int dockchannel_hid_suspend(struct device *dev)
+{
+	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+
+	WRITE_ONCE(dchid->suspended, true);
+	return 0;
+}
+
+static int dockchannel_hid_resume(struct device *dev)
+{
+	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+
+	WRITE_ONCE(dchid->suspended, false);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(dockchannel_hid_pm_ops, dockchannel_hid_suspend,
+				dockchannel_hid_resume);
+
 static const struct of_device_id dockchannel_hid_of_match[] = {
 	{ .compatible = "apple,dockchannel-hid" },
 	{},
@@ -1455,6 +1784,7 @@ static struct platform_driver dockchannel_hid_driver = {
 		.of_match_table = dockchannel_hid_of_match,
 		/* The coprocessor announces its interfaces only once per boot. */
 		.suppress_bind_attrs = true,
+		.pm = pm_sleep_ptr(&dockchannel_hid_pm_ops),
 	},
 	.probe = dockchannel_hid_probe,
 	.remove = dockchannel_hid_remove,

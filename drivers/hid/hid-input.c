@@ -398,6 +398,8 @@ static const struct hid_device_id hid_battery_quirks[] = {
 	  HID_BATTERY_QUIRK_AVOID_QUERY },
 	{ HID_I2C_DEVICE(USB_VENDOR_ID_ELAN, I2C_DEVICE_ID_CHROMEBOOK_TROGDOR_POMPOM),
 	  HID_BATTERY_QUIRK_AVOID_QUERY },
+	{ HID_I2C_DEVICE(USB_VENDOR_ID_ELAN, I2C_DEVICE_ID_SURFACE_PRO_12IN),
+	  HID_BATTERY_QUIRK_IGNORE },
 	/*
 	 * Elan HID touchscreens seem to all report a non present battery,
 	 * set HID_BATTERY_QUIRK_IGNORE for all Elan I2C and USB HID devices.
@@ -2327,7 +2329,19 @@ static inline void hidinput_configure_usages(struct hid_input *hidinput,
  * Read all reports and initialize the absolute field values.
  */
 
-int hidinput_connect(struct hid_device *hid, unsigned int force)
+static bool hid_has_ff_input(struct hid_device *hdev)
+{
+	struct hid_input *hidinput;
+
+	list_for_each_entry(hidinput, &hdev->inputs, list) {
+		if (test_bit(EV_FF, hidinput->input->evbit))
+			return true;
+	}
+
+	return false;
+}
+
+int hidinput_connect(struct hid_device *hid, unsigned int connect_mask)
 {
 	struct hid_driver *drv = hid->driver;
 	struct hid_report *report;
@@ -2340,7 +2354,7 @@ int hidinput_connect(struct hid_device *hid, unsigned int force)
 
 	hid->status &= ~HID_STAT_DUP_DETECTED;
 
-	if (!force) {
+	if (!(connect_mask & HID_CONNECT_HIDINPUT_FORCE)) {
 		for (i = 0; i < hid->maxcollection; i++) {
 			struct hid_collection *col = &hid->collection[i];
 			if (col->type == HID_COLLECTION_APPLICATION ||
@@ -2405,6 +2419,11 @@ int hidinput_connect(struct hid_device *hid, unsigned int force)
 			hidinput_cleanup_hidinput(hid, hidinput);
 			continue;
 		}
+
+		if (list_is_first(&hidinput->list, &hid->inputs) &&
+		    (connect_mask & HID_CONNECT_FF) && hid->ff_init &&
+		    !hid_has_ff_input(hid))
+			hid->ff_init(hid);
 
 		if (input_register_device(hidinput->input))
 			goto out_unwind;

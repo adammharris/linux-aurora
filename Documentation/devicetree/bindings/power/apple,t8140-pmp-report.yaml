@@ -14,15 +14,20 @@ description: |
   The PMP running bit qualifies the per-cluster fast-die effort. Lane 1
   tracks P-cluster load in Linux measurements. Lane 0 is assigned to the
   E cluster from the Apple device tree order and has not been observed
-  changing. Only documented report entries may be read; the aperture is
-  not a contiguous readable array of registers.
+  changing. The T6041 report has three lanes: E, P0 and P1. Only
+  documented report entries may be read; the aperture is not a
+  contiguous readable array of registers.
 
 properties:
   compatible:
-    const: apple,t8140-pmp-v2-report
+    enum:
+      - apple,t6041-pmp-v2-report
+      - apple,t8140-pmp-v2-report
 
   reg:
     maxItems: 1
+
+  nonposted-mmio: true
 
   power-domains:
     maxItems: 1
@@ -32,6 +37,12 @@ properties:
 
   '#size-cells':
     const: 0
+
+  apple,pmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PMP that publishes this report, on SoCs where the host starts the
+      PMP after a display handoff.
 
 patternProperties:
   '^report@[0-9a-f]+$':
@@ -45,9 +56,11 @@ patternProperties:
 
     properties:
       compatible:
-        items:
+        oneOf:
           - const: apple,t8140-pmp-v2-report-entry
-          - const: apple,t6000-pmp-v2-report-entry
+          - items:
+              - const: apple,t6041-pmp-v2-report-entry
+              - const: apple,t6000-pmp-v2-report-entry
 
       reg:
         maxItems: 1
@@ -65,6 +78,20 @@ patternProperties:
       apple,always-on:
         type: boolean
         description: Report the device as on from probe.
+
+      apple,no-ack:
+        type: boolean
+        description:
+          The PMP does not acknowledge this entry's requests; the host sets
+          and clears the request bit without waiting for an acknowledgement.
+
+      apple,soc-device-record:
+        type: boolean
+        description:
+          The request and acknowledge bits are indexed by the index of the
+          PMP soc-device record (apple,tunable-soc-device on the PMP) that
+          holds this entry's device ID, instead of by reg. Only valid on a
+          report whose PMP the host starts.
 
     required:
       - compatible
@@ -91,8 +118,7 @@ examples:
             #size-cells = <0>;
 
             report@9 {
-                compatible = "apple,t8140-pmp-v2-report-entry",
-                             "apple,t6000-pmp-v2-report-entry";
+                compatible = "apple,t8140-pmp-v2-report-entry";
                 reg = <0x9>;
                 label = "pmp-gfx";
                 #power-domain-cells = <0>;

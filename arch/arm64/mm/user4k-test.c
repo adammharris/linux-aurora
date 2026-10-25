@@ -15,6 +15,7 @@
 #include <linux/cgroup.h>
 #include <linux/delay.h>
 #include <linux/binfmts.h>
+#include <linux/hugetlb.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/iova_bitmap.h>
@@ -23,6 +24,7 @@
 #include <linux/falloc.h>
 #include <linux/shmem_fs.h>
 #include <linux/seq_file.h>
+#include <linux/swap_ops.h>
 #include <linux/kthread.h>
 #include <linux/khugepaged.h>
 #include <linux/mm.h>
@@ -33,6 +35,8 @@
 #include <linux/memcontrol.h>
 #include <linux/pagemap.h>
 #include <linux/pagewalk.h>
+#include <linux/personality.h>
+#include <linux/prctl.h>
 #include <linux/perf_event.h>
 #include <linux/preempt.h>
 #include <linux/rmap.h>
@@ -42,6 +46,7 @@
 #include <linux/umh.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/uio.h>
+#include <linux/syscalls.h>
 
 #include <asm/cpufeature.h>
 #include <asm/daifflags.h>
@@ -1631,18 +1636,20 @@ static void user4k_vma_offsets_test(struct kunit *test)
 static void user4k_vma_intervals_test(struct kunit *test)
 {
 	struct vm_area_struct *vmas = kunit_kcalloc(test, 3, sizeof(*vmas), GFP_KERNEL);
-	struct rb_root_cached root = RB_ROOT_CACHED;
+	struct address_space *mapping = kunit_kzalloc(test, sizeof(*mapping), GFP_KERNEL);
 	struct vm_area_struct *vma;
 	unsigned int i, count = 0;
 
 	KUNIT_ASSERT_NOT_NULL(test, vmas);
+	KUNIT_ASSERT_NOT_NULL(test, mapping);
+	mapping->i_mmap = RB_ROOT_CACHED;
 	for (i = 0; i < 3; i++) {
 		vmas[i].vm_start = TEST_VA + i * SZ_8K;
 		vmas[i].vm_end = vmas[i].vm_start + SZ_4K;
 		vma_set_page_offset(&vmas[i], (struct vm_page_offset) { 77, i * SZ_4K });
-		vma_interval_tree_insert(&vmas[i], &root);
+		mapping_rmap_tree_insert(&vmas[i], mapping);
 	}
-	vma_interval_tree_foreach(vma, &root, 77, 77) {
+	mapping_rmap_tree_foreach(vma, mapping, 77, 77) {
 		unsigned long address = vma_address_at_offset(vma,
 						(struct vm_page_offset) { 77, SZ_4K });
 
@@ -1651,11 +1658,11 @@ static void user4k_vma_intervals_test(struct kunit *test)
 		count++;
 	}
 	KUNIT_EXPECT_EQ(test, count, 3U);
-	KUNIT_EXPECT_PTR_EQ(test, vma_interval_tree_iter_first(&root, 76, 76), NULL);
-	KUNIT_EXPECT_PTR_EQ(test, vma_interval_tree_iter_first(&root, 78, 78), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, mapping_rmap_tree_iter_first(mapping, 76, 76), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, mapping_rmap_tree_iter_first(mapping, 78, 78), NULL);
 	for (i = 0; i < 3; i++)
-		vma_interval_tree_remove(&vmas[i], &root);
-	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&root.rb_root));
+		mapping_rmap_tree_remove(&vmas[i], mapping);
+	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&mapping->i_mmap.rb_root));
 }
 
 static void user4k_vma_mm_free(void *arg)
@@ -1881,7 +1888,10 @@ static void user4k_vma_copy_shrink_test(struct kunit *test)
 		struct vm_page_offset pos = vm_page_offset_add(initial, i == 2 ? 0 : (i + 1) * SZ_4K);
 
 		mmap_write_lock(mm);
-		dest = copy_vma(&source, addr, SZ_4K, pos, &need_locks);
+		pgoff_t anon_pgoff = __linear_anon_page_index(source,
+					start + (i == 2 ? 0 : (i + 1) * SZ_4K));
+
+		dest = copy_vma(&source, addr, SZ_4K, pos, anon_pgoff, &need_locks, false);
 		mmap_write_unlock(mm);
 		KUNIT_ASSERT_NOT_NULL(test, dest);
 		KUNIT_EXPECT_EQ(test, mm->map_count, 2);
@@ -1895,17 +1905,17 @@ static void user4k_vma_copy_shrink_test(struct kunit *test)
 	mmap_write_lock(mm);
 	{
 		VMA_ITERATOR(vmi, mm, dest->vm_start);
-		struct vm_page_offset pos = vma_page_offset_at(dest, target);
 
+		/* Since Linux 7.3 vma_shrink() only moves the end of a VMA. */
 		vma_iter_load(&vmi);
-		ret = vma_shrink(&vmi, dest, target, dest->vm_end, pos);
+		ret = vma_shrink(&vmi, dest, target + SZ_4K);
 	}
 	mmap_write_unlock(mm);
 	KUNIT_ASSERT_EQ(test, ret, 0);
-	KUNIT_EXPECT_EQ(test, dest->vm_start, target);
-	KUNIT_EXPECT_EQ(test, dest->vm_end, target + 2 * SZ_4K);
-	KUNIT_EXPECT_EQ(test, dest->vm_pgoff, 77UL + 4 / TEST_SLOTS);
-	KUNIT_EXPECT_EQ(test, vma_subpage_offset(dest), (4 % TEST_SLOTS) * SZ_4K);
+	KUNIT_EXPECT_EQ(test, dest->vm_start, target - SZ_4K);
+	KUNIT_EXPECT_EQ(test, dest->vm_end, target + SZ_4K);
+	KUNIT_EXPECT_EQ(test, dest->vm_pgoff, 77UL + 3 / TEST_SLOTS);
+	KUNIT_EXPECT_EQ(test, vma_subpage_offset(dest), (3 % TEST_SLOTS) * SZ_4K);
 }
 
 struct anon_slot_fixture {
@@ -1995,6 +2005,8 @@ static struct anon_slot_fixture *anon_slot_fixture_create_from(struct kunit *tes
 		mmap_write_lock(parent->mm);
 		mmap_write_lock_nested(f->mm, SINGLE_DEPTH_NESTING);
 		vma_set_page_offset(vma, vma_page_offset_at(parent->vma, TEST_VA));
+		/* As vm_area_init_from(): forked anon folios keep their index. */
+		__vma_set_anon_pgoff(vma, vma_start_anon_pgoff(parent->vma));
 		ret = anon_vma_fork(vma, parent->vma);
 	} else {
 		mmap_write_lock(f->mm);
@@ -2034,7 +2046,7 @@ static void user4k_anon_rmap_test(struct kunit *test)
 	struct anon_slot_fixture *f = anon_slot_fixture_create(test);
 	struct folio *folio = NULL;
 	unsigned int i;
-	vm_flags_t flags;
+	vma_flags_t flags;
 	int ret, bad_offset = 0, bad_index = 0;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -2147,7 +2159,7 @@ static void user4k_anon_fork_rmap_test(struct kunit *test)
 	struct anon_slot_fixture *child;
 	struct mm_subpage *slot;
 	struct folio *folio;
-	vm_flags_t flags;
+	vma_flags_t flags;
 	int ret;
 	unsigned int i;
 
@@ -2190,7 +2202,7 @@ static void user4k_nonlinear_rmap_reuse_test(struct kunit *test)
 	struct folio *folio;
 	struct anon_vma_chain *avc;
 	phys_addr_t phys;
-	vm_flags_t flags;
+	vma_flags_t flags;
 	int ret;
 
 	KUNIT_ASSERT_NOT_NULL(test, a);
@@ -2236,10 +2248,12 @@ static void user4k_nonlinear_rmap_reuse_test(struct kunit *test)
 	mmap_write_lock(c->mm);
 	anon_vma_lock_write(c->vma->anon_vma);
 	list_for_each_entry(avc, &c->vma->anon_vma_chain, same_vma)
-		anon_vma_interval_tree_remove(avc, &avc->anon_vma->rb_root);
+		anon_rmap_tree_remove(avc, avc->anon_vma);
+	/* Linux 7.3 keys the anon_vma tree by the anonymous page offset. */
 	c->vma->vm_pgoff += 9;
+	c->vma->__vm_anon_pgoff_lo += 9;
 	list_for_each_entry(avc, &c->vma->anon_vma_chain, same_vma)
-		anon_vma_interval_tree_insert(avc, &avc->anon_vma->rb_root);
+		anon_rmap_tree_insert(avc, avc->anon_vma);
 	anon_vma_unlock_write(c->vma->anon_vma);
 	mmap_write_unlock(c->mm);
 #ifdef CONFIG_FAILSLAB
@@ -2862,7 +2876,7 @@ static void user64k_anon_zap_batch_test(struct kunit *test)
 
 	/* The reference walker must consume logical PTEs and native mapcounts. */
 	{
-		vm_flags_t flags;
+		vma_flags_t flags;
 		bool young;
 
 		folio_lock(f->folio);
@@ -3077,7 +3091,7 @@ static void user4k_swap_encoding_test(struct kunit *test)
 					if (flags & 1)
 						pte = pte_swp_mkexclusive(pte);
 					if (flags & 2)
-						pte = pte_swp_mkuffd_wp(pte);
+						pte = pte_swp_mkuffd(pte);
 					KUNIT_EXPECT_FALSE(test, pte_present(pte));
 					KUNIT_EXPECT_EQ(test, softleaf_from_pte(pte).val, entry.val);
 					KUNIT_EXPECT_EQ(test, pte_swp_subpage_offset(pte), slot * (unsigned int)SZ_4K);
@@ -3230,14 +3244,14 @@ static void user4k_mmap_region_offsets_test(struct kunit *test)
 	/* Only the full native-sized lengths are used before accounting conversion. */
 	kthread_use_mm(mm);
 	mmap_write_lock(mm);
-	result[0] = mmap_region(file, start + PAGE_SIZE, PAGE_SIZE, flags,
+	result[0] = mmap_region(file, start + PAGE_SIZE, PAGE_SIZE, legacy_to_vma_flags(flags),
 			       (struct vm_page_offset) { 1, SZ_4K }, NULL);
-	result[1] = mmap_region(file, start + 2 * PAGE_SIZE, PAGE_SIZE, flags,
+	result[1] = mmap_region(file, start + 2 * PAGE_SIZE, PAGE_SIZE, legacy_to_vma_flags(flags),
 			       (struct vm_page_offset) { 2, SZ_4K }, NULL);
-	result[2] = mmap_region(file, start, PAGE_SIZE, flags,
+	result[2] = mmap_region(file, start, PAGE_SIZE, legacy_to_vma_flags(flags),
 			       (struct vm_page_offset) { 0, SZ_4K }, NULL);
 	/* Adjacent virtual bytes with a different file offset must not merge. */
-	result[3] = mmap_region(file, start + 3 * PAGE_SIZE, PAGE_SIZE, flags,
+	result[3] = mmap_region(file, start + 3 * PAGE_SIZE, PAGE_SIZE, legacy_to_vma_flags(flags),
 			       (struct vm_page_offset) { 3, 2 * SZ_4K }, NULL);
 	mmap_write_unlock(mm);
 	kthread_unuse_mm(mm);
@@ -3706,7 +3720,7 @@ static void user4k_mmap_accounting_test(struct kunit *test)
 	before = test_commit_baseline(test);
 	kthread_use_mm(mm);
 	mmap_write_lock(mm);
-	mapped = mmap_region(NULL, start, 3 * SZ_4K, flags,
+	mapped = mmap_region(NULL, start, 3 * SZ_4K, legacy_to_vma_flags(flags),
 			     (struct vm_page_offset) { start >> PAGE_SHIFT, SZ_4K }, NULL);
 	mmap_write_unlock(mm);
 	if (!IS_ERR_VALUE(mapped)) {
@@ -3980,7 +3994,7 @@ static void user4k_mlock_repair_test(struct kunit *test)
 			struct file *file = test_cache_file(test, PAGE_SIZE, true);
 			struct folio *folio;
 			unsigned long addr, offset;
-			vm_flags_t flags = 0;
+			vma_flags_t flags = EMPTY_VMA_FLAGS;
 			int maps, ret;
 
 			KUNIT_ASSERT_NOT_NULL(test, mm);
@@ -4029,7 +4043,7 @@ static void user4k_mlock_repair_test(struct kunit *test)
 			lru_add_drain_all();
 			if (walker) {
 				KUNIT_EXPECT_GE(test, ret, 0);
-				KUNIT_EXPECT_TRUE(test, flags & VM_LOCKED);
+				KUNIT_EXPECT_TRUE(test, vma_flags_test(&flags, VMA_LOCKED_BIT));
 			}
 			KUNIT_EXPECT_TRUE(test, folio_test_mlocked(folio));
 			KUNIT_EXPECT_EQ(test, folio_mapcount(folio), maps);
@@ -4059,7 +4073,7 @@ asmlinkage long __arm64_sys_mremap(const struct pt_regs *regs);
 static unsigned long test_mremap(unsigned long old, unsigned long old_len,
 		unsigned long new_len, unsigned long flags, unsigned long new)
 {
-	struct pt_regs regs = { .regs = { old, old_len, new_len, flags, new } };
+	struct pt_regs regs = { .regs = { old, old_len, new_len, flags, new }, .orig_x0 = old };
 
 	return __arm64_sys_mremap(&regs);
 }
@@ -5176,7 +5190,7 @@ static void user4k_msync_offsets_test(struct kunit *test)
 	const struct file_operations *original_ops;
 	void *original_private;
 	struct test_fsync_record records[3] = {}, record = {};
-	struct pt_regs regs = { .regs = { TEST_VA + SZ_4K, 1, MS_SYNC } };
+	struct pt_regs regs = { .regs = { TEST_VA + SZ_4K, 1, MS_SYNC }, .orig_x0 = TEST_VA + SZ_4K };
 	long result[3];
 	unsigned int i;
 
@@ -5198,6 +5212,7 @@ static void user4k_msync_offsets_test(struct kunit *test)
 	kthread_use_mm(vma->vm_mm);
 	for (i = 0; i < ARRAY_SIZE(result); i++) {
 		regs.regs[0] = vma->vm_start + i * SZ_4K;
+		regs.orig_x0 = regs.regs[0];
 		result[i] = __arm64_sys_msync(&regs);
 		records[i] = record;
 	}
@@ -5375,6 +5390,165 @@ static void user4k_exec_arguments_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, bprm->argc, 0);
 		KUNIT_EXPECT_EQ(test, bprm->vma_pages, 0UL);
 	}
+}
+
+/* Stage two strings at the top of a fresh exec stack in @mm. */
+static unsigned long test_stage_exec_strings(struct kunit *test,
+		struct linux_binprm *bprm, struct mm_struct *mm)
+{
+	unsigned long initial;
+
+	bprm->mm = mm;
+	KUNIT_ASSERT_EQ(test, create_init_stack_vma(mm, &bprm->vma, &bprm->p), 0);
+	initial = bprm->p;
+	bprm->argmin = initial - SZ_2M;
+	bprm->rlim_stack.rlim_cur = SZ_8M;
+	bprm->rlim_stack.rlim_max = RLIM_INFINITY;
+	KUNIT_ASSERT_EQ(test, copy_string_kernel("arg", bprm), 0);
+	KUNIT_ASSERT_EQ(test, copy_string_kernel("setid-image", bprm), 0);
+	return initial - bprm->p;
+}
+
+static void test_expect_exec_strings(struct kunit *test,
+		struct linux_binprm *bprm, unsigned long copied)
+{
+	char buf[16] = {};
+
+	KUNIT_ASSERT_EQ(test, copied, sizeof("setid-image") + sizeof("arg"));
+	KUNIT_ASSERT_EQ(test, access_remote_vm(bprm->mm, bprm->p, buf, copied, 0),
+			(int)copied);
+	KUNIT_EXPECT_STREQ(test, buf, "setid-image");
+	KUNIT_EXPECT_STREQ(test, buf + sizeof("setid-image"), "arg");
+}
+
+/*
+ * A set-user-ID, set-group-ID or secure-exec image must not run with the
+ * caller's unprivileged granule preference: it is restaged at the granule
+ * it gets without one, with the staged arguments intact.
+ */
+static void user4k_exec_privileged_test(struct kunit *test)
+{
+	unsigned int privileged;
+
+	if (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN)) {
+		kunit_skip(test, "borrowed-mm stack setup requires hardware opt-in");
+		return;
+	}
+	for (privileged = 0; privileged < 3; privileged++) {
+		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
+		struct mm_struct *mm = test_vma_mm(test);
+		unsigned long copied;
+
+		KUNIT_ASSERT_NOT_NULL(test, bprm);
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		copied = test_stage_exec_strings(test, bprm, mm);
+		bprm->secure_page_shift = PAGE_SHIFT;
+		if (privileged == 1)
+			bprm->per_clear = PER_CLEAR_ON_SETID;
+		else if (privileged == 2)
+			bprm->secureexec = 1;
+		/* A replacement drops the staging mm's reference. */
+		mmget(mm);
+		KUNIT_ASSERT_EQ(test, bprm_secure_page_size(bprm), 0);
+		if (bprm->mm != mm)
+			KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+					user4k_vma_mm_free, bprm->mm), 0);
+		else
+			mmput(mm);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm),
+				privileged ? PAGE_SHIFT : 12U);
+		KUNIT_EXPECT_PTR_EQ(test, bprm->vma->vm_mm, bprm->mm);
+		test_expect_exec_strings(test, bprm, copied);
+	}
+}
+
+/* The arch selection records the preference-free granule for begin_new_exec(). */
+static void user4k_exec_secure_granule_test(struct kunit *test)
+{
+	unsigned int saved = current->exec_page_shift;
+	unsigned int compat;
+
+	if (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN)) {
+		kunit_skip(test, "borrowed-mm stack setup requires hardware opt-in");
+		return;
+	}
+	if (!cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE)) {
+		kunit_skip(test, "no 4K translation granule");
+		return;
+	}
+	for (compat = 0; compat < 2; compat++) {
+		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
+		struct mm_struct *mm = mm_alloc_exec_page_shift(PAGE_SHIFT);
+		unsigned long copied;
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, bprm);
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		copied = test_stage_exec_strings(test, bprm, mm);
+		current->exec_page_shift = 12;
+		ret = arm64_bprm_prepare_mm(bprm, compat);
+		current->exec_page_shift = saved;
+		KUNIT_ASSERT_EQ(test, ret, 0);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), 12U);
+		/* AArch32 always uses 4K when available; AArch64 defaults to native. */
+		KUNIT_EXPECT_EQ(test, bprm->secure_page_shift, compat ? 12U : PAGE_SHIFT);
+		bprm->per_clear = PER_CLEAR_ON_SETID;
+		mm = bprm->mm;
+		/* Keep the staging mm alive across a possible replacement. */
+		mmget(mm);
+		KUNIT_ASSERT_EQ(test, bprm_secure_page_size(bprm), 0);
+		mmput(mm);
+		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, user4k_vma_mm_free,
+				bprm->mm), 0);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), compat ? 12U : PAGE_SHIFT);
+		test_expect_exec_strings(test, bprm, copied);
+	}
+}
+
+/* HugeTLB tables use native geometry; a small-granule mm must not map them. */
+static void user4k_hugetlb_refused_test(struct kunit *test)
+{
+#ifdef CONFIG_HUGETLBFS
+	const unsigned long prot = PROT_READ | PROT_WRITE;
+	const unsigned long flags = MAP_SHARED | MAP_NORESERVE | MAP_FIXED_NOREPLACE;
+	const unsigned long addr = SZ_1G;
+	struct mm_struct *small, *native;
+	unsigned long len, result[3];
+	struct file *file;
+
+	if (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN)) {
+		kunit_skip(test, "borrowed-mm mapping fixture requires hardware opt-in");
+		return;
+	}
+	len = huge_page_size(&default_hstate);
+	file = hugetlb_file_setup(HUGETLB_ANON_FILE, len, mk_vma_flags(VMA_NORESERVE_BIT),
+				  HUGETLB_ANONHUGE_INODE, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	small = test_vma_mm(test);
+	native = mm_alloc();
+	KUNIT_ASSERT_NOT_NULL(test, small);
+	KUNIT_ASSERT_NOT_NULL(test, native);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, user4k_vma_mm_free, native), 0);
+
+	kthread_use_mm(small);
+	result[0] = vm_mmap(file, addr, len, prot, flags, 0);
+	result[1] = ksys_mmap_pgoff(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS |
+				    MAP_HUGETLB | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
+				    -1, 0);
+	kthread_unuse_mm(small);
+	kthread_use_mm(native);
+	result[2] = vm_mmap(file, addr, len, prot, flags, 0);
+	kthread_unuse_mm(native);
+	fput(file);
+
+	KUNIT_EXPECT_EQ(test, result[0], (unsigned long)-EINVAL);
+	KUNIT_EXPECT_EQ(test, result[1], (unsigned long)-EINVAL);
+	KUNIT_EXPECT_EQ(test, small->map_count, 0);
+	/* The same mapping is accepted with native tables. */
+	KUNIT_EXPECT_EQ(test, result[2], addr);
+#else
+	kunit_skip(test, "requires CONFIG_HUGETLBFS");
+#endif
 }
 
 static struct vm_area_struct *test_special_vma(struct mm_struct *mm,
@@ -5663,6 +5837,8 @@ static void user4k_remap_pfn_range_test(struct kunit *test)
 			KUNIT_ASSERT_NOT_ERR_OR_NULL(test, vma);
 			vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 			mmap_write_lock(mm);
+			/* The mmap_prepare compat path modifies an attached VMA. */
+			vma_start_write(vma);
 			if (shape >= 2) {
 				phys_addr_t base = PFN_PHYS(folio_pfn(folio)) + physical_offset;
 				unsigned long available = folio_size(folio) - physical_offset;
@@ -6244,10 +6420,12 @@ static void user4k_futex_wake_test(struct kunit *test)
 		until = jiffies + 5 * HZ;
 		kthread_use_mm(vmas[round ^ 1]->vm_mm);
 		wrong = futex_wake((u32 __user *)(addresses[round ^ 1] + 4),
-				   FLAGS_SIZE_32 | FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY);
+				   FLAGS_SIZE_32 | FLAGS_SHARED, NULL, 1,
+					  FUTEX_BITSET_MATCH_ANY);
 		do {
 			woke = futex_wake((u32 __user *)addresses[round ^ 1],
-					  FLAGS_SIZE_32 | FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY);
+					  FLAGS_SIZE_32 | FLAGS_SHARED, NULL, 1,
+					  FUTEX_BITSET_MATCH_ANY);
 			if (woke || completion_done(&w->done))
 				break;
 			schedule_timeout_uninterruptible(1);
@@ -8767,7 +8945,7 @@ static void user4k_bio_fragments_test(struct kunit *test)
 	kthread_unuse_mm(vma->vm_mm);
 	KUNIT_EXPECT_EQ(test, ret, (int)TEST_SLOTS);
 	kthread_use_mm(vma->vm_mm);
-	ret = bio_iov_iter_get_pages(state->bio, &iter, 511);
+	ret = bio_iov_iter_get_pages(state->bio, &iter, 0, 511);
 	kthread_unuse_mm(vma->vm_mm);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, state->bio->bi_iter.bi_size, bytes);
@@ -8818,7 +8996,7 @@ static void user4k_bio_trim_test(struct kunit *test)
 	for (i = 0; i < 1024; i++) {
 		iov_iter_ubuf(&iter, ITER_DEST, (void __user *)(TEST_VA + SZ_4K - 256), 512);
 		kthread_use_mm(vma->vm_mm);
-		ret = bio_iov_iter_get_pages(state->bio, &iter, 511);
+		ret = bio_iov_iter_get_pages(state->bio, &iter, 0, 511);
 		kthread_unuse_mm(vma->vm_mm);
 		KUNIT_ASSERT_EQ(test, ret, -EFAULT);
 		KUNIT_EXPECT_EQ(test, iov_iter_count(&iter), 512UL);
@@ -8936,7 +9114,7 @@ asmlinkage long __arm64_sys_mprotect(const struct pt_regs *regs);
 
 static long test_mprotect(unsigned long start, unsigned long len, unsigned long prot)
 {
-	struct pt_regs regs = { .regs = { start, len, prot } };
+	struct pt_regs regs = { .regs = { start, len, prot }, .orig_x0 = start };
 
 	return __arm64_sys_mprotect(&regs);
 }
@@ -9402,7 +9580,7 @@ asmlinkage long __arm64_sys_madvise(const struct pt_regs *regs);
 
 static long test_madvise(unsigned long addr, unsigned long size, unsigned long behavior)
 {
-	struct pt_regs regs = { .regs = { addr, size, behavior } };
+	struct pt_regs regs = { .regs = { addr, size, behavior }, .orig_x0 = addr };
 
 	return __arm64_sys_madvise(&regs);
 }
@@ -9799,7 +9977,7 @@ static void user4k_nonlinear_rmap_test(struct kunit *test)
 	struct mm_subpage *slot;
 	struct folio *folio, *dst;
 	phys_addr_t phys;
-	vm_flags_t flags;
+	vma_flags_t flags;
 	unsigned int succeeded = 0, side;
 	int ret, unmapped = -1;
 	bool isolated;
@@ -12088,7 +12266,7 @@ static void user4k_swap_suite_exit(struct kunit_suite *suite)
 static void test_shmem_uffd_swap(struct kunit *test, unsigned int mode)
 {
 	const unsigned long missing = GENMASK(PAGE_SIZE / SZ_4K - 1, mode == 3 ? 2 : 1);
-	struct swap_iocb *plug = NULL;
+	struct swap_io_ctx ctx = {};
 	struct file *file;
 	struct folio *folio;
 	void *entry;
@@ -12118,9 +12296,8 @@ static void test_shmem_uffd_swap(struct kunit *test, unsigned int mode)
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, folio);
 	/* Match pageout(): submitted data is clean unless writeout redirties it. */
 	KUNIT_EXPECT_TRUE(test, folio_clear_dirty_for_io(folio));
-	ret = shmem_writeout(folio, &plug, &folios);
-	if (plug)
-		swap_write_unplug(plug);
+	ret = shmem_writeout(&ctx, folio, &folios);
+	swap_write_submit(&ctx);
 	if (ret == AOP_WRITEPAGE_ACTIVATE)
 		folio_unlock(folio);
 	folio_wait_writeback(folio);
@@ -12200,7 +12377,7 @@ static void user4k_shmem_uffd_swap_alloc_fail_test(struct kunit *test)
 		pgoff_t index = attempt == 1 ? 1 : 64;
 		const unsigned long missing = GENMASK(PAGE_SIZE / SZ_4K - 1, 1);
 		struct file *file = test_cache_file(test, (index + 1) * PAGE_SIZE, false);
-		struct swap_iocb *plug = NULL;
+		struct swap_io_ctx ctx = {};
 		struct folio *folio;
 		unsigned int pending;
 		unsigned long pfn;
@@ -12225,15 +12402,14 @@ static void user4k_shmem_uffd_swap_alloc_fail_test(struct kunit *test)
 		/* Fail this task's selected allocation and its allocator retries. */
 		WRITE_ONCE(current->make_it_fail, 1);
 		WRITE_ONCE(current->fail_nth, attempt);
-		ret = shmem_writeout(folio, &plug, &folios);
+		ret = shmem_writeout(&ctx, folio, &folios);
 		pending = READ_ONCE(current->fail_nth);
 		WRITE_ONCE(current->fail_nth, 0);
 		WRITE_ONCE(current->make_it_fail, 0);
 		KUNIT_EXPECT_EQ(test, pending, 0U);
 		KUNIT_EXPECT_EQ(test, ret, AOP_WRITEPAGE_ACTIVATE);
 		if (ret != AOP_WRITEPAGE_ACTIVATE) {
-			if (plug)
-				swap_write_unplug(plug);
+			swap_write_submit(&ctx);
 			folio_wait_writeback(folio);
 			folio_put(folio);
 			return;
@@ -12250,16 +12426,15 @@ static void user4k_shmem_uffd_swap_alloc_fail_test(struct kunit *test)
 			KUNIT_EXPECT_PTR_EQ(test, xa_find(&SHMEM_I(file_inode(file))->uffd_missing,
 					&cursor, ULONG_MAX, XA_PRESENT), NULL);
 		}
-		KUNIT_EXPECT_PTR_EQ(test, plug, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, ctx.sio, NULL);
 		KUNIT_EXPECT_TRUE(test, list_empty(&folios));
 		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(folio), 0xb6, SZ_4K), NULL);
 		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(folio) + SZ_4K, 0, PAGE_SIZE - SZ_4K), NULL);
 		/* No restart or cache repair: retry exactly the retained folio. */
 		KUNIT_EXPECT_EQ(test, folio_pfn(folio), pfn);
 		KUNIT_EXPECT_TRUE(test, folio_clear_dirty_for_io(folio));
-		ret = shmem_writeout(folio, &plug, &folios);
-		if (plug)
-			swap_write_unplug(plug);
+		ret = shmem_writeout(&ctx, folio, &folios);
+		swap_write_submit(&ctx);
 		if (ret == AOP_WRITEPAGE_ACTIVATE)
 			folio_unlock(folio);
 		folio_wait_writeback(folio);
@@ -12301,7 +12476,7 @@ static void user4k_shmem_uffd_swap_charge_test(struct kunit *test)
 	struct mem_cgroup *memcg, *saved;
 	struct file *file;
 	struct folio *folio;
-	struct swap_iocb *plug = NULL;
+	struct swap_io_ctx ctx = {};
 	void *entry;
 	const unsigned long missing = GENMASK(PAGE_SIZE / SZ_4K - 1, 1);
 	int ret;
@@ -12340,10 +12515,9 @@ static void user4k_shmem_uffd_swap_charge_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, folio_clear_dirty_for_io(folio));
 	/* Reclaim from the root charge domain, not the folio's cgroup. */
 	saved = set_active_memcg(root_mem_cgroup);
-	ret = shmem_writeout(folio, &plug, &folios);
+	ret = shmem_writeout(&ctx, folio, &folios);
 	set_active_memcg(saved);
-	if (plug)
-		swap_write_unplug(plug);
+	swap_write_submit(&ctx);
 	if (ret == AOP_WRITEPAGE_ACTIVATE)
 		folio_unlock(folio);
 	folio_wait_writeback(folio);
@@ -13068,8 +13242,13 @@ static void user64k_anon_swap_race_test(struct kunit *test)
 		}
 		part = entry;
 		part.val += nr - 1;
-		blocker = read_swap_cache_async(part, GFP_KERNEL, vma,
-						TEST_VA + SZ_64K - PAGE_SIZE, NULL);
+		{
+			struct swap_io_ctx ctx = {};
+
+			blocker = read_swap_cache_async(&ctx, part, GFP_KERNEL, vma,
+							TEST_VA + SZ_64K - PAGE_SIZE);
+			swap_read_submit(&ctx);
+		}
 		KUNIT_ASSERT_NOT_NULL(test, blocker);
 		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, test_folio_put, blocker), 0);
 		KUNIT_EXPECT_EQ(test, folio_size(blocker), cold ? PAGE_SIZE : (unsigned long)SZ_64K);
@@ -13402,7 +13581,7 @@ static void user64k_anon_swap_extent_test(struct kunit *test)
 		saved->synchronous = saved->si->flags & SWP_SYNCHRONOUS_IO;
 		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, test_coarse_restore_io_mode, saved), 0);
 		file = !(saved->si->flags & SWP_BLKDEV);
-		KUNIT_ASSERT_FALSE(test, saved->si->flags & SWP_FS_OPS);
+		KUNIT_ASSERT_PTR_EQ(test, saved->si->ops, &swap_bdev_ops);
 		first = swap_extent_sector(entry, &run);
 		if (file) {
 			unsigned long remaining;
@@ -13425,14 +13604,24 @@ static void user64k_anon_swap_extent_test(struct kunit *test)
 		spin_unlock(&saved->si->lock);
 		folio_lock(folio);
 		folio_clear_dirty_for_io(folio);
-		__swap_writepage(folio, NULL);
+		{
+			struct swap_io_ctx ctx = {};
+
+			__swap_writepage(&ctx, folio);
+			swap_write_submit(&ctx);
+		}
 		folio_wait_writeback(folio);
 		folio_lock(folio);
 		KUNIT_EXPECT_FALSE(test, folio_test_dirty(folio));
 		/* A full-folio read must reconstruct all physical runs, not warm cache. */
 		memset(folio_address(folio), 0, SZ_64K);
 		folio_clear_uptodate(folio);
-		swap_read_folio(folio, NULL);
+		{
+			struct swap_io_ctx ctx = {};
+
+			swap_read_folio(&ctx, folio);
+			swap_read_submit(&ctx);
+		}
 		folio_lock(folio);
 		KUNIT_EXPECT_TRUE(test, folio_test_uptodate(folio));
 		for (i = 0; i < SZ_64K / SZ_4K; i++)
@@ -13579,6 +13768,141 @@ static void user4k_exec_granule_policy_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, arm64_exec_page_shift(false, true, native[i], 12),
 				12U);
 	}
+}
+
+/* Exec page-size requests are refused unless booted with user4k=on. */
+static void user4k_page_size_request_test(struct kunit *test)
+{
+	static const struct {
+		unsigned long size;
+		int off, on, on_no4k;
+	} cases[] = {
+		{ 0, 0, 0, 0 },
+		{ PAGE_SIZE, 0, 0, 0 },
+		{ SZ_4K, -EINVAL, 12, -EOPNOTSUPP },
+		{ SZ_8K, -EINVAL, -EINVAL, -EINVAL },
+		{ SZ_2M, -EINVAL, -EINVAL, -EINVAL },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		unsigned long size = cases[i].size;
+
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, false, true, true),
+				cases[i].off);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, false, false, false),
+				cases[i].off);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, true, true, true),
+				cases[i].on);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, true, false, false),
+				cases[i].on_no4k);
+	}
+	/* Larger-than-native process granules are never offered. */
+	if (PAGE_SIZE == SZ_16K) {
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(SZ_64K, false, true, true),
+				-EINVAL);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(SZ_64K, true, true, true),
+				-EINVAL);
+	}
+}
+
+asmlinkage long __arm64_sys_prctl(const struct pt_regs *regs);
+
+static long test_prctl(unsigned long option, unsigned long arg2)
+{
+	struct pt_regs regs = { .regs = { option, arg2 }, .orig_x0 = option };
+
+	return __arm64_sys_prctl(&regs);
+}
+
+/* Both SET prctls follow the boot switch; native requests always succeed. */
+static void user4k_boot_switch_prctl_test(struct kunit *test)
+{
+	static const unsigned long options[][2] = {
+		{ PR_AURORA_SET_EXEC_PAGE_SIZE, PR_AURORA_GET_EXEC_PAGE_SIZE },
+		{ PR_AURORA_SET_DEFAULT_PAGE_SIZE, PR_AURORA_GET_DEFAULT_PAGE_SIZE },
+	};
+	unsigned int saved_exec = current->exec_page_shift;
+	unsigned int saved_default = current->default_exec_page_shift;
+	bool has_4k = cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE);
+	long expect = !user4k_enabled() ? -EINVAL : has_4k ? 0 : -EOPNOTSUPP;
+	unsigned int i;
+
+	/* Without user4k=on the CPUs report no 4K user granule either. */
+	if (!user4k_enabled())
+		KUNIT_EXPECT_FALSE(test, has_4k);
+	for (i = 0; i < ARRAY_SIZE(options); i++) {
+		unsigned long set = options[i][0], get = options[i][1];
+
+		current->exec_page_shift = 0;
+		current->default_exec_page_shift = 0;
+		KUNIT_EXPECT_EQ(test, test_prctl(set, SZ_4K), expect);
+		KUNIT_EXPECT_EQ(test, test_prctl(get, 0), expect ? 0L : (long)SZ_4K);
+		if (PAGE_SIZE == SZ_16K) {
+			KUNIT_EXPECT_EQ(test, test_prctl(set, SZ_64K), (long)-EINVAL);
+			KUNIT_EXPECT_EQ(test, test_prctl(get, 0), expect ? 0L : (long)SZ_4K);
+		}
+		KUNIT_EXPECT_EQ(test, test_prctl(set, PAGE_SIZE), 0L);
+		KUNIT_EXPECT_EQ(test, test_prctl(set, 0), 0L);
+		KUNIT_EXPECT_EQ(test, test_prctl(get, 0), 0L);
+	}
+	current->exec_page_shift = saved_exec;
+	current->default_exec_page_shift = saved_default;
+}
+
+/* With the switch off, exec ignores any preference and stays native. */
+static void user4k_boot_switch_exec_test(struct kunit *test)
+{
+	unsigned int saved_exec = current->exec_page_shift;
+	unsigned int saved_default = current->default_exec_page_shift;
+	struct mm_struct *mm;
+	unsigned int compat;
+
+	mm = mm_alloc_exec_page_shift(12);
+	KUNIT_ASSERT_NOT_NULL(test, mm);
+	KUNIT_EXPECT_EQ(test, mm_page_shift(mm), user4k_enabled() ? 12U : PAGE_SHIFT);
+	mmput(mm);
+	/* With user4k=on, user4k_exec_secure_granule_test covers staging. */
+	if (user4k_enabled())
+		return;
+	for (compat = 0; compat < 2; compat++) {
+		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, bprm);
+		mm = mm_alloc_exec_page_shift(PAGE_SHIFT);
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		bprm->mm = mm;
+		current->exec_page_shift = 12;
+		current->default_exec_page_shift = 12;
+		ret = arm64_bprm_prepare_mm(bprm, compat);
+		current->exec_page_shift = saved_exec;
+		current->default_exec_page_shift = saved_default;
+		KUNIT_EXPECT_EQ(test, ret, 0);
+		KUNIT_EXPECT_PTR_EQ(test, bprm->mm, mm);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), PAGE_SHIFT);
+		/* AArch32 also keeps the native granule. */
+		KUNIT_EXPECT_EQ(test, bprm->secure_page_shift, PAGE_SHIFT);
+		mmput(mm);
+	}
+}
+
+/* Native pages never have a 4K owner; without user4k=on there is no record. */
+static void user4k_boot_switch_page_ext_test(struct kunit *test)
+{
+	struct mm_subpage_mapcounts counts;
+	struct page *page = alloc_page(GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	memset(&counts, 0xff, sizeof(counts));
+	KUNIT_EXPECT_EQ(test, mm_subpage_file_mapcounts(page, &counts), 0U);
+	for (i = 0; i < MM_SUBPAGES_PER_PAGE; i++)
+		KUNIT_EXPECT_EQ(test, counts.slots[i], 0U);
+	KUNIT_EXPECT_NULL(test, mm_subpage_get_from_phys(page_to_phys(page)));
+	if (!user4k_enabled())
+		KUNIT_EXPECT_EQ(test, mm_subpage_shmem_missing(page), 0UL);
+	__free_page(page);
 }
 
 static void user_granule_zero_region_test(struct kunit *test)
@@ -14324,6 +14648,9 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_mremap_resize_test),
 	KUNIT_CASE(user4k_stack_relocate_test),
 	KUNIT_CASE(user4k_exec_arguments_test),
+	KUNIT_CASE(user4k_exec_privileged_test),
+	KUNIT_CASE(user4k_exec_secure_granule_test),
+	KUNIT_CASE(user4k_hugetlb_refused_test),
 	KUNIT_CASE(user4k_special_mapping_test),
 	KUNIT_CASE(native_callback_mapping_test),
 	KUNIT_CASE(user4k_callback_mapping_test),
@@ -14439,12 +14766,27 @@ static struct kunit_suite user4k_test_suite = {
 	.test_cases = user4k_test_cases,
 };
 
+/* Safe with or without user4k=on; the other suites need user4k=on. */
+static struct kunit_case user4k_policy_cases[] = {
+	KUNIT_CASE(user4k_page_size_request_test),
+	KUNIT_CASE(user4k_boot_switch_prctl_test),
+	KUNIT_CASE(user4k_boot_switch_exec_test),
+	KUNIT_CASE(user4k_boot_switch_page_ext_test),
+	{}
+};
+
+static struct kunit_suite user4k_policy_suite = {
+	.name = "arm64-user4k-policy",
+	.test_cases = user4k_policy_cases,
+};
+
 #if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
-kunit_test_suites(&user4k_test_suite, &user4k_swap_suite, &user4k_shmem_swap_suite,
-		  &user4k_coarse_shmem_suite,
+kunit_test_suites(&user4k_policy_suite, &user4k_test_suite, &user4k_swap_suite,
+		  &user4k_shmem_swap_suite, &user4k_coarse_shmem_suite,
 		  &user4k_nonlinear_swap_suite);
 #else
-kunit_test_suites(&user4k_test_suite, &user4k_swap_suite, &user4k_nonlinear_swap_suite);
+kunit_test_suites(&user4k_policy_suite, &user4k_test_suite, &user4k_swap_suite,
+		  &user4k_nonlinear_swap_suite);
 #endif
 
 MODULE_LICENSE("GPL");

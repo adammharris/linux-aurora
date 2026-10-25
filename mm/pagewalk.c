@@ -128,6 +128,7 @@ static int walk_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
 	pmd = pmd_offset_mm(walk->mm, pud, addr);
 	do {
 again:
+		walk->action = ACTION_SUBTREE;
 		next = pmd_addr_end_mm(walk->mm, addr, end);
 		if (pmd_none(*pmd)) {
 			if (has_install)
@@ -139,8 +140,6 @@ again:
 			if (!has_install)
 				continue;
 		}
-
-		walk->action = ACTION_SUBTREE;
 
 		/*
 		 * This implies that each ->pmd_entry() handler
@@ -198,6 +197,7 @@ static int walk_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
 	pud = pud_offset_mm(walk->mm, p4d, addr);
 	do {
  again:
+		walk->action = ACTION_SUBTREE;
 		next = pud_addr_end_mm(walk->mm, addr, end);
 		if (pud_none(*pud)) {
 			if (has_install)
@@ -209,8 +209,6 @@ static int walk_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
 			if (!has_install)
 				continue;
 		}
-
-		walk->action = ACTION_SUBTREE;
 
 		if (ops->pud_entry)
 			err = ops->pud_entry(pud, addr, next, walk);
@@ -771,6 +769,36 @@ int walk_page_vma(struct vm_area_struct *vma, const struct mm_walk_ops *ops,
 	return __walk_page_range(vma->vm_start, vma->vm_end, &walk);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+/* Clip native file indices to the VMA's exact byte interval. */
+static bool walk_mapping_clip(struct vm_area_struct *vma, pgoff_t first_index,
+			      pgoff_t last_index, unsigned long *start_addr,
+			      unsigned long *end_addr)
+{
+	*start_addr = first_index <= vma_start_pgoff(vma) ? vma->vm_start :
+		vma_address_at_offset(vma, (struct vm_page_offset) { first_index, 0 });
+	*end_addr = last_index >= vma_last_pgoff(vma) ? vma->vm_end :
+		vma_address_at_offset(vma, (struct vm_page_offset) { last_index + 1, 0 });
+	return !IS_ERR_VALUE(*start_addr) && !IS_ERR_VALUE(*end_addr) &&
+	       *start_addr < *end_addr;
+}
+#else
+/* Clip to the vma */
+static bool walk_mapping_clip(struct vm_area_struct *vma, pgoff_t first_index,
+			      pgoff_t last_index, unsigned long *start_addr,
+			      unsigned long *end_addr)
+{
+	pgoff_t vba = vma_start_pgoff(vma);
+	pgoff_t vea = vba + vma_pages(vma);
+	pgoff_t cba = max(first_index, vba);
+	pgoff_t cea = min(last_index + 1, vea);
+
+	*start_addr = ((cba - vba) << PAGE_SHIFT) + vma->vm_start;
+	*end_addr = ((cea - vba) << PAGE_SHIFT) + vma->vm_start;
+	return *start_addr < *end_addr;
+}
+#endif
+
 /**
  * walk_page_mapping - walk all memory areas mapped into a struct address_space.
  * @mapping: Pointer to the struct address_space
@@ -816,20 +844,19 @@ int walk_page_mapping(struct address_space *mapping, pgoff_t first_index,
 
 	if (!check_ops_safe(ops))
 		return -EINVAL;
-	if (!nr)
-		return 0;
-	if (check_add_overflow(first_index, nr - 1, &last_index))
-		return -EINVAL;
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE)) {
+		if (!nr)
+			return 0;
+		if (check_add_overflow(first_index, nr - 1, &last_index))
+			return -EINVAL;
+	} else {
+		last_index = first_index + nr - 1;
+	}
 
 	lockdep_assert_held(&mapping->i_mmap_rwsem);
-	vma_interval_tree_foreach(vma, &mapping->i_mmap, first_index,
-				  last_index) {
-		/* Clip native file indices to the VMA's exact byte interval. */
-		start_addr = first_index <= vma->vm_pgoff ? vma->vm_start :
-			vma_address_at_offset(vma, (struct vm_page_offset) { first_index, 0 });
-		end_addr = last_index >= vma_last_pgoff(vma) ? vma->vm_end :
-			vma_address_at_offset(vma, (struct vm_page_offset) { last_index + 1, 0 });
-		if (IS_ERR_VALUE(start_addr) || IS_ERR_VALUE(end_addr) || start_addr >= end_addr)
+	mapping_rmap_tree_foreach(vma, mapping, first_index, last_index) {
+		if (!walk_mapping_clip(vma, first_index, last_index,
+				       &start_addr, &end_addr))
 			continue;
 
 		walk.vma = vma;

@@ -36,6 +36,8 @@ struct dwc3_properties {
  *		be ignored by the DWC3 core, as they are managed by the glue
  * @skip_core_init_mode: Skip the finial initialization of the target mode, as
  *		it must be managed by the glue
+ * @initial_role: Optional known role to program before low-level core init.
+ *		Requires skip_core_init_mode. USB_ROLE_NONE preserves the default.
  * @properties: dwc3 software manage properties
  */
 struct dwc3_probe_data {
@@ -43,6 +45,7 @@ struct dwc3_probe_data {
 	struct resource *res;
 	bool ignore_clocks_and_resets;
 	bool skip_core_init_mode;
+	enum usb_role initial_role;
 	struct dwc3_properties properties;
 };
 

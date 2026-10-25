@@ -68,6 +68,50 @@ static inline void mt7932_band_capabilities(struct ieee80211_supported_band *ban
 	 */
 }
 
+/* Two-stream station HE profile.
+ * Use standard capabilities, with the existing qualified HT/VHT aggregation
+ * limits projected into HE 6 GHz capabilities. Do not advertise 160 MHz.
+ */
+static inline void mt7932_he_6g_capabilities(struct ieee80211_sband_iftype_data *data,
+					     const struct ieee80211_supported_band *band5)
+{
+	struct ieee80211_sta_he_cap *he = &data->he_cap;
+	u16 cap;
+	u32 vht = band5->vht_cap.cap;
+
+	memset(data, 0, sizeof(*data));
+	data->types_mask = BIT(NL80211_IFTYPE_STATION);
+	he->has_he = true;
+	he->he_cap_elem.mac_cap_info[0] = IEEE80211_HE_MAC_CAP0_HTC_HE;
+	he->he_cap_elem.mac_cap_info[1] = IEEE80211_HE_MAC_CAP1_TF_MAC_PAD_DUR_16US;
+	he->he_cap_elem.mac_cap_info[3] = IEEE80211_HE_MAC_CAP3_OMI_CONTROL |
+		IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_EXT_3;
+	he->he_cap_elem.mac_cap_info[4] = IEEE80211_HE_MAC_CAP4_AMSDU_IN_AMPDU;
+	he->he_cap_elem.phy_cap_info[0] =
+		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G;
+	he->he_cap_elem.phy_cap_info[1] = IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD |
+		IEEE80211_HE_PHY_CAP1_DEVICE_CLASS_A |
+		IEEE80211_HE_PHY_CAP1_HE_LTF_AND_GI_FOR_HE_PPDUS_0_8US;
+	he->he_cap_elem.phy_cap_info[2] = IEEE80211_HE_PHY_CAP2_NDP_4x_LTF_AND_3_2US |
+		IEEE80211_HE_PHY_CAP2_STBC_TX_UNDER_80MHZ |
+		IEEE80211_HE_PHY_CAP2_STBC_RX_UNDER_80MHZ;
+	he->he_cap_elem.phy_cap_info[9] =
+		IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_16US <<
+		__bf_shf(IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_MASK);
+	he->he_mcs_nss_supp.rx_mcs_80 = cpu_to_le16(0xfffa);
+	he->he_mcs_nss_supp.tx_mcs_80 = cpu_to_le16(0xfffa);
+	he->he_mcs_nss_supp.rx_mcs_160 = cpu_to_le16(0xffff);
+	he->he_mcs_nss_supp.tx_mcs_160 = cpu_to_le16(0xffff);
+	he->he_mcs_nss_supp.rx_mcs_80p80 = cpu_to_le16(0xffff);
+	he->he_mcs_nss_supp.tx_mcs_80p80 = cpu_to_le16(0xffff);
+	cap = FIELD_PREP(IEEE80211_HE_6GHZ_CAP_MIN_MPDU_START, band5->ht_cap.ampdu_density) |
+		FIELD_PREP(IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP,
+			   FIELD_GET(IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK, vht)) |
+		FIELD_PREP(IEEE80211_HE_6GHZ_CAP_MAX_MPDU_LEN,
+			   FIELD_GET(IEEE80211_VHT_CAP_MAX_MPDU_MASK, vht));
+	data->he_6ghz_capa.capa = cpu_to_le16(cap);
+}
+
 /* Inspect unmodified generated request IEs. Absence permits legacy peers;
  * presence must match the registered profile. The metadata exporter separately
  * bounds and rejects duplicate capability IEs; repeat these checks here so
@@ -77,7 +121,7 @@ static inline bool mt7932_assoc_phy_valid(const struct ieee80211_supported_band 
 					const u8 *ies, size_t length)
 {
 	size_t offset = 0;
-	bool ht_seen = false, vht_seen = false;
+	bool ht_seen = false, vht_seen = false, he_seen = false;
 
 	while (offset < length) {
 		const u8 *body;
@@ -90,7 +134,11 @@ static inline bool mt7932_assoc_phy_valid(const struct ieee80211_supported_band 
 		if (size > length - offset - 2)
 			return false;
 		body = ies + offset + 2;
-		if (id == WLAN_EID_HT_CAPABILITY) {
+		if (id == WLAN_EID_EXTENSION && size && body[0] == WLAN_EID_EXT_HE_CAPABILITY) {
+			if (he_seen || !ieee80211_he_capa_size_ok(body + 1, size - 1))
+				return false;
+			he_seen = true;
+		} else if (id == WLAN_EID_HT_CAPABILITY) {
 			const struct ieee80211_sta_ht_cap *ht = &band->ht_cap;
 			u16 expected = ht->cap;
 
@@ -130,7 +178,8 @@ static inline bool mt7932_assoc_phy_valid(const struct ieee80211_supported_band 
 		}
 		offset += size + 2;
 	}
-	return !vht_seen || ht_seen;
+	return band->band == NL80211_BAND_6GHZ ? he_seen && !ht_seen && !vht_seen :
+		!vht_seen || ht_seen;
 }
 
 #endif

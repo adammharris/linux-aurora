@@ -11,12 +11,6 @@
 
 static struct vfsmount *erofs_ishare_mnt;
 
-static inline bool erofs_is_ishare_inode(struct inode *inode)
-{
-	/* assumed FS_ONDEMAND is excluded with FS_PAGE_CACHE_SHARE feature */
-	return inode->i_sb->s_type == &erofs_anon_fs_type;
-}
-
 static int erofs_ishare_iget5_eq(struct inode *inode, void *data)
 {
 	struct erofs_inode_fingerprint *fp1 = &EROFS_I(inode)->fingerprint;
@@ -60,6 +54,7 @@ bool erofs_ishare_fill_inode(struct inode *inode)
 		si->i_mapping->a_ops = aops;
 		si->i_mode = 0444 | S_IFREG;
 		si->i_size = inode->i_size;
+		mapping_set_large_folios(si->i_mapping);
 		unlock_new_inode(si);
 	} else {
 		kfree(fp.opaque);
@@ -154,6 +149,13 @@ static int erofs_ishare_mmap(struct file *file, struct vm_area_struct *vma)
 	return generic_file_readonly_mmap(file, vma);
 }
 
+static ssize_t erofs_ishare_splice_read(struct file *in, loff_t *ppos,
+					struct pipe_inode_info *pipe,
+					size_t len, unsigned int flags)
+{
+	return filemap_splice_read(in->private_data, ppos, pipe, len, flags);
+}
+
 static int erofs_ishare_fadvise(struct file *file, loff_t offset,
 				loff_t len, int advice)
 {
@@ -162,12 +164,12 @@ static int erofs_ishare_fadvise(struct file *file, loff_t offset,
 
 const struct file_operations erofs_ishare_fops = {
 	.open		= erofs_ishare_file_open,
-	.llseek		= generic_file_llseek,
+	.llseek		= erofs_file_llseek,
 	.read_iter	= erofs_ishare_file_read_iter,
 	.mmap		= erofs_ishare_mmap,
 	.release	= erofs_ishare_file_release,
 	.get_unmapped_area = thp_get_unmapped_area,
-	.splice_read	= filemap_splice_read,
+	.splice_read	= erofs_ishare_splice_read,
 	.fadvise	= erofs_ishare_fadvise,
 };
 
@@ -177,7 +179,7 @@ struct inode *erofs_real_inode(struct inode *inode, bool *need_iput)
 	struct inode *realinode;
 
 	*need_iput = false;
-	if (!erofs_is_ishare_inode(inode))
+	if (inode->i_sb != erofs_ishare_mnt->mnt_sb)
 		return inode;
 
 	vi_share = EROFS_I(inode);

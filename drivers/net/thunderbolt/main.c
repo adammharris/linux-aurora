@@ -23,6 +23,7 @@
 #include <linux/workqueue.h>
 
 #include <net/ip6_checksum.h>
+#include <net/page_pool/helpers.h>
 
 #include "trace.h"
 
@@ -39,7 +40,7 @@
 #define TBNET_MATCH_FRAGS_ID	BIT(1)
 #define TBNET_64K_FRAMES	BIT(2)
 #define TBNET_MAX_MTU		SZ_64K
-#define TBNET_FRAME_SIZE	SZ_4K
+#define TBNET_FRAME_SIZE	TB_MAX_FRAME_SIZE
 #define TBNET_MAX_PAYLOAD_SIZE	\
 	(TBNET_FRAME_SIZE - sizeof(struct thunderbolt_ip_frame_header))
 /* Rx packets need to hold space for skb_shared_info */
@@ -145,6 +146,8 @@ struct tbnet_ring {
 	unsigned int cons;
 	unsigned int prod;
 	struct tb_ring *ring;
+	/* Rx only: buffer pool with permanent DMA mappings */
+	struct page_pool *pool;
 };
 
 /**
@@ -154,6 +157,9 @@ struct tbnet_ring {
  * @handler: ThunderboltIP configuration protocol handler
  * @dev: Networking device
  * @napi: NAPI structure for Rx polling
+ * @napi_enabled: NAPI state protected by @connection_lock
+ * @poll_lock: Fences ring access after NAPI ownership is released
+ * @rings_started: Ring state protected by @connection_lock
  * @stats: Network statistics
  * @skb: Network packet that is currently processed on Rx path
  * @command_id: ID used for next configuration protocol packet
@@ -162,10 +168,11 @@ struct tbnet_ring {
  *		    host
  * @local_transmit_path: HopID we are using to send out packets
  * @remote_transmit_path: HopID the other end is using to send packets to us
- * @connection_lock: Lock serializing access to @login_sent,
- *		     @login_received and @transmit_path.
+ * @connection_lock: Lock serializing login state, connection setup,
+ *		     teardown and NAPI enable state.
  * @login_retries: Number of login retries currently done
  * @login_work: Worker to send ThunderboltIP login packets
+ * @rx_refill_work: Worker to reschedule Rx polling after a refill failure
  * @connected_work: Worker that finalizes the ThunderboltIP connection
  *		    setup and enables DMA paths for high speed data
  *		    transfers
@@ -185,6 +192,9 @@ struct tbnet {
 	struct tb_protocol_handler handler;
 	struct net_device *dev;
 	struct napi_struct napi;
+	bool napi_enabled;
+	spinlock_t poll_lock;
+	bool rings_started;
 	struct tbnet_stats stats;
 	struct sk_buff *skb;
 	atomic_t command_id;
@@ -195,6 +205,7 @@ struct tbnet {
 	struct mutex connection_lock;
 	int login_retries;
 	struct delayed_work login_work;
+	struct delayed_work rx_refill_work;
 	struct work_struct connected_work;
 	struct work_struct disconnect_work;
 	struct thunderbolt_ip_frame_header rx_hdr;
@@ -328,42 +339,31 @@ static void stop_login(struct tbnet *net)
 	netdev_dbg(net->dev, "login stopped\n");
 }
 
-static inline unsigned int tbnet_frame_size(const struct tbnet_frame *tf)
-{
-	return tf->frame.size ? : TBNET_FRAME_SIZE;
-}
-
 static void tbnet_free_buffers(struct tbnet_ring *ring)
 {
 	unsigned int i;
 
 	for (i = 0; i < TBNET_RING_SIZE; i++) {
-		struct device *dma_dev = tb_ring_dma_device(ring->ring);
 		struct tbnet_frame *tf = &ring->frames[i];
-		enum dma_data_direction dir;
-		unsigned int order;
-		size_t size;
 
 		if (!tf->page)
 			continue;
 
-		if (ring->ring->is_tx) {
-			dir = DMA_TO_DEVICE;
-			order = 0;
-			size = TBNET_FRAME_SIZE;
+		if (ring->pool) {
+			page_pool_put_full_page(ring->pool, tf->page, false);
 		} else {
-			dir = DMA_FROM_DEVICE;
-			order = TBNET_RX_PAGE_ORDER;
-			size = TBNET_RX_PAGE_SIZE;
+			struct device *dma_dev = tb_ring_dma_device(ring->ring);
+
+			trace_tbnet_free_frame(i, tf->page,
+					       tf->frame.buffer_phy,
+					       DMA_TO_DEVICE);
+
+			if (tf->frame.buffer_phy)
+				dma_unmap_page(dma_dev, tf->frame.buffer_phy,
+					       TBNET_FRAME_SIZE, DMA_TO_DEVICE);
+			__free_page(tf->page);
 		}
 
-		trace_tbnet_free_frame(i, tf->page, tf->frame.buffer_phy, dir);
-
-		if (tf->frame.buffer_phy)
-			dma_unmap_page(dma_dev, tf->frame.buffer_phy, size,
-				       dir);
-
-		__free_pages(tf->page, order);
 		tf->page = NULL;
 	}
 
@@ -371,16 +371,27 @@ static void tbnet_free_buffers(struct tbnet_ring *ring)
 	ring->prod = 0;
 }
 
+static void tbnet_disable_napi(struct tbnet *net)
+{
+	if (net->napi_enabled) {
+		napi_disable(&net->napi);
+		/* NAPI ownership can end before the poll's final IRQ rearm. */
+		spin_lock_bh(&net->poll_lock);
+		spin_unlock_bh(&net->poll_lock);
+		net->napi_enabled = false;
+	}
+	cancel_delayed_work_sync(&net->rx_refill_work);
+}
+
 static void tbnet_tear_down(struct tbnet *net, bool send_logout)
 {
-	netif_carrier_off(net->dev);
-	netif_stop_queue(net->dev);
-
 	stop_login(net);
 
 	mutex_lock(&net->connection_lock);
+	netif_carrier_off(net->dev);
+	netif_stop_queue(net->dev);
 
-	if (net->login_sent && net->login_received) {
+	if (net->rings_started) {
 		int ret, retries = TBNET_LOGOUT_RETRIES;
 
 		while (send_logout && retries-- > 0) {
@@ -409,14 +420,28 @@ static void tbnet_tear_down(struct tbnet *net, bool send_logout)
 		if (ret)
 			netdev_warn(net->dev, "failed to disable DMA paths\n");
 
+		/* A poll may still own a completed frame or partial packet. */
+		tbnet_disable_napi(net);
+
+		/* Free any partially assembled packet; its fragments are
+		 * page pool pages that must go back before buffer teardown.
+		 */
+		dev_kfree_skb_any(net->skb);
+		net->skb = NULL;
+
 		tb_ring_stop(net->rx_ring.ring);
 		tb_ring_stop(net->tx_ring.ring);
+		net->rings_started = false;
 		tbnet_free_buffers(&net->rx_ring);
 		tbnet_free_buffers(&net->tx_ring);
 
 		tb_xdomain_release_in_hopid(net->xd, net->remote_transmit_path);
 		net->remote_transmit_path = 0;
 	}
+
+	tbnet_disable_napi(net);
+	dev_kfree_skb_any(net->skb);
+	net->skb = NULL;
 
 	net->login_retries = 0;
 	net->login_sent = false;
@@ -514,47 +539,41 @@ static int tbnet_alloc_rx_buffers(struct tbnet *net, unsigned int nbuffers)
 	int ret;
 
 	while (nbuffers--) {
-		struct device *dma_dev = tb_ring_dma_device(ring->ring);
 		unsigned int index = ring->prod & (TBNET_RING_SIZE - 1);
 		struct tbnet_frame *tf = &ring->frames[index];
-		dma_addr_t dma_addr;
+		struct page *page;
 
 		if (tf->page)
 			break;
 
-		/* Allocate page (order > 0) so that it can hold maximum
-		 * ThunderboltIP frame (4kB) and the additional room for
-		 * SKB shared info required by build_skb().
+		/* Allocate room for the maximum ThunderboltIP frame (4kB)
+		 * and the additional room for
+		 * SKB shared info required by build_skb().  The pool keeps
+		 * the DMA mapping alive across recycles.
 		 */
-		tf->page = dev_alloc_pages(TBNET_RX_PAGE_ORDER);
-		if (!tf->page) {
-			ret = -ENOMEM;
-			goto err_free;
-		}
+		page = page_pool_dev_alloc_pages(ring->pool);
+		if (!page)
+			return -ENOMEM;
 
-		dma_addr = dma_map_page(dma_dev, tf->page, 0,
-					TBNET_RX_PAGE_SIZE, DMA_FROM_DEVICE);
-		if (dma_mapping_error(dma_dev, dma_addr)) {
-			ret = -ENOMEM;
-			goto err_free;
-		}
-
-		tf->frame.buffer_phy = dma_addr;
+		tf->page = page;
+		tf->frame.buffer_phy = page_pool_get_dma_addr(page);
 		tf->dev = net->dev;
 
-		trace_tbnet_alloc_rx_frame(index, tf->page, dma_addr,
+		trace_tbnet_alloc_rx_frame(index, tf->page,
+					   tf->frame.buffer_phy,
 					   DMA_FROM_DEVICE);
 
-		tb_ring_rx(ring->ring, &tf->frame);
+		ret = tb_ring_rx(ring->ring, &tf->frame);
+		if (ret) {
+			page_pool_put_full_page(ring->pool, tf->page, false);
+			tf->page = NULL;
+			return ret;
+		}
 
 		ring->prod++;
 	}
 
 	return 0;
-
-err_free:
-	tbnet_free_buffers(ring);
-	return ret;
 }
 
 static struct tbnet_frame *tbnet_get_tx_buffer(struct tbnet *net)
@@ -573,7 +592,7 @@ static struct tbnet_frame *tbnet_get_tx_buffer(struct tbnet *net)
 	tf->frame.size = 0;
 
 	dma_sync_single_for_cpu(dma_dev, tf->frame.buffer_phy,
-				tbnet_frame_size(tf), DMA_TO_DEVICE);
+				tb_ring_frame_size(&tf->frame), DMA_TO_DEVICE);
 
 	return tf;
 }
@@ -631,28 +650,32 @@ static int tbnet_alloc_tx_buffers(struct tbnet *net)
 	return 0;
 }
 
+static void tbnet_connect_failed_locked(struct tbnet *net)
+{
+	/* Leave login_received set: only the peer can make it true again. */
+	lockdep_assert_held(&net->connection_lock);
+	net->login_sent = false;
+}
+
 static void tbnet_connected_work(struct work_struct *work)
 {
 	struct tbnet *net = container_of(work, typeof(*net), connected_work);
-	bool connected;
 	int ret;
 
-	if (netif_carrier_ok(net->dev))
-		return;
-
 	mutex_lock(&net->connection_lock);
-	connected = net->login_sent && net->login_received;
-	mutex_unlock(&net->connection_lock);
-
-	if (!connected)
-		return;
+	if (netif_carrier_ok(net->dev) ||
+	    !net->login_sent || !net->login_received)
+		goto out_unlock;
 
 	netdev_dbg(net->dev, "login successful, enabling paths\n");
 
 	ret = tb_xdomain_alloc_in_hopid(net->xd, net->remote_transmit_path);
 	if (ret != net->remote_transmit_path) {
 		netdev_err(net->dev, "failed to allocate Rx HopID\n");
-		return;
+		if (ret >= 0)
+			tb_xdomain_release_in_hopid(net->xd, ret);
+		tbnet_connect_failed_locked(net);
+		goto out_unlock;
 	}
 
 	/* Both logins successful so enable the rings, high-speed DMA
@@ -664,6 +687,7 @@ static void tbnet_connected_work(struct work_struct *work)
 	 */
 	tb_ring_start(net->tx_ring.ring);
 	tb_ring_start(net->rx_ring.ring);
+	net->rings_started = true;
 
 	ret = tbnet_alloc_rx_buffers(net, TBNET_RING_SIZE);
 	if (ret)
@@ -671,7 +695,15 @@ static void tbnet_connected_work(struct work_struct *work)
 
 	ret = tbnet_alloc_tx_buffers(net);
 	if (ret)
-		goto err_free_rx_buffers;
+		goto err_stop_rings;
+
+	if (!net->napi_enabled) {
+		napi_enable(&net->napi);
+		net->napi_enabled = true;
+	}
+
+	/* An interrupt while NAPI was disabled may have masked the ring. */
+	tb_ring_poll_complete(net->rx_ring.ring);
 
 	ret = tb_xdomain_enable_paths(net->xd, net->local_transmit_path,
 				      net->tx_ring.ring->hop,
@@ -679,23 +711,26 @@ static void tbnet_connected_work(struct work_struct *work)
 				      net->rx_ring.ring->hop);
 	if (ret) {
 		netdev_err(net->dev, "failed to enable DMA paths\n");
-		goto err_free_tx_buffers;
+		goto err_stop_rings;
 	}
 
 	netif_carrier_on(net->dev);
 	netif_start_queue(net->dev);
 
 	netdev_dbg(net->dev, "network traffic started\n");
-	return;
+	goto out_unlock;
 
-err_free_tx_buffers:
-	tbnet_free_buffers(&net->tx_ring);
-err_free_rx_buffers:
-	tbnet_free_buffers(&net->rx_ring);
 err_stop_rings:
+	tbnet_disable_napi(net);
 	tb_ring_stop(net->rx_ring.ring);
 	tb_ring_stop(net->tx_ring.ring);
+	net->rings_started = false;
+	tbnet_free_buffers(&net->rx_ring);
+	tbnet_free_buffers(&net->tx_ring);
 	tb_xdomain_release_in_hopid(net->xd, net->remote_transmit_path);
+	tbnet_connect_failed_locked(net);
+out_unlock:
+	mutex_unlock(&net->connection_lock);
 }
 
 static void tbnet_login_work(struct work_struct *work)
@@ -755,7 +790,7 @@ static bool tbnet_check_frame(struct tbnet *net, const struct tbnet_frame *tf,
 	}
 
 	/* Should be greater than just header i.e. contains data */
-	size = tbnet_frame_size(tf);
+	size = tb_ring_frame_size(&tf->frame);
 	if (size <= sizeof(*hdr)) {
 		net->stats.rx_length_errors++;
 		return false;
@@ -815,12 +850,25 @@ static bool tbnet_check_frame(struct tbnet *net, const struct tbnet_frame *tf,
 	return true;
 }
 
+static void tbnet_rx_refill_work(struct work_struct *work)
+{
+	struct tbnet *net = container_of(work, struct tbnet, rx_refill_work.work);
+
+	napi_schedule(&net->napi);
+}
+
 static int tbnet_poll(struct napi_struct *napi, int budget)
 {
 	struct tbnet *net = container_of(napi, struct tbnet, napi);
-	unsigned int cleaned_count = tbnet_available_buffers(&net->rx_ring);
-	struct device *dma_dev = tb_ring_dma_device(net->rx_ring.ring);
+	unsigned int cleaned_count;
+	struct device *dma_dev;
 	unsigned int rx_packets = 0;
+
+	if (!budget)
+		return 0;
+
+	cleaned_count = TBNET_RING_SIZE - tbnet_available_buffers(&net->rx_ring);
+	dma_dev = tb_ring_dma_device(net->rx_ring.ring);
 
 	while (rx_packets < budget) {
 		const struct thunderbolt_ip_frame_header *hdr;
@@ -845,9 +893,6 @@ static int tbnet_poll(struct napi_struct *napi, int budget)
 		if (!frame)
 			break;
 
-		dma_unmap_page(dma_dev, frame->buffer_phy,
-			       TBNET_RX_PAGE_SIZE, DMA_FROM_DEVICE);
-
 		tf = container_of(frame, typeof(*tf), frame);
 
 		page = tf->page;
@@ -855,11 +900,14 @@ static int tbnet_poll(struct napi_struct *napi, int budget)
 		net->rx_ring.cons++;
 		cleaned_count++;
 
+		dma_sync_single_for_cpu(dma_dev, page_pool_get_dma_addr(page),
+					TBNET_FRAME_SIZE, DMA_FROM_DEVICE);
+
 		hdr = page_address(page);
 		if (!tbnet_check_frame(net, tf, hdr)) {
 			trace_tbnet_invalid_rx_ip_frame(hdr->frame_size,
 				hdr->frame_id, hdr->frame_index, hdr->frame_count);
-			__free_pages(page, TBNET_RX_PAGE_ORDER);
+			page_pool_put_full_page(net->rx_ring.pool, page, true);
 			dev_kfree_skb_any(net->skb);
 			net->skb = NULL;
 			continue;
@@ -874,11 +922,13 @@ static int tbnet_poll(struct napi_struct *napi, int budget)
 			skb = build_skb(page_address(page),
 					TBNET_RX_PAGE_SIZE);
 			if (!skb) {
-				__free_pages(page, TBNET_RX_PAGE_ORDER);
+				page_pool_put_full_page(net->rx_ring.pool,
+							page, true);
 				net->stats.rx_errors++;
 				break;
 			}
 
+			skb_mark_for_recycle(skb);
 			skb_reserve(skb, hdr_size);
 			skb_put(skb, frame_size);
 
@@ -897,9 +947,11 @@ static int tbnet_poll(struct napi_struct *napi, int budget)
 		       le32_to_cpu(net->rx_hdr.frame_count) - 1;
 
 		rx_packets++;
-		net->stats.rx_bytes += frame_size;
 
 		if (last) {
+			/* Before eth_type_trans() pulls the Ethernet header. */
+			net->stats.rx_packets++;
+			net->stats.rx_bytes += skb->len;
 			skb->protocol = eth_type_trans(skb, net->dev);
 			trace_tbnet_rx_skb(skb);
 			napi_gro_receive(&net->napi, skb);
@@ -907,17 +959,21 @@ static int tbnet_poll(struct napi_struct *napi, int budget)
 		}
 	}
 
-	net->stats.rx_packets += rx_packets;
-
 	if (cleaned_count)
 		tbnet_alloc_rx_buffers(net, cleaned_count);
+
+	/* An empty Rx ring cannot interrupt when memory becomes available. */
+	if (tbnet_available_buffers(&net->rx_ring) < TBNET_RING_SIZE)
+		queue_delayed_work(system_dfl_wq, &net->rx_refill_work,
+				   msecs_to_jiffies(100));
 
 	if (rx_packets >= budget)
 		return budget;
 
-	napi_complete_done(napi, rx_packets);
-	/* Re-enable the ring interrupt */
-	tb_ring_poll_complete(net->rx_ring.ring);
+	spin_lock(&net->poll_lock);
+	if (napi_complete_done(napi, rx_packets))
+		tb_ring_poll_complete(net->rx_ring.ring);
+	spin_unlock(&net->poll_lock);
 
 	return rx_packets;
 }
@@ -937,6 +993,7 @@ static int tbnet_open(struct net_device *dev)
 	struct tb_ring *ring;
 	unsigned int flags;
 	int hopid;
+	int ret;
 
 	netif_carrier_off(dev);
 
@@ -977,20 +1034,47 @@ static int tbnet_open(struct net_device *dev)
 	}
 	net->rx_ring.ring = ring;
 
+	{
+		struct page_pool_params pp_params = {
+			.order = TBNET_RX_PAGE_ORDER,
+			.pool_size = TBNET_RING_SIZE,
+			.nid = NUMA_NO_NODE,
+			.dev = tb_ring_dma_device(ring),
+			.napi = &net->napi,
+			.dma_dir = DMA_FROM_DEVICE,
+			.max_len = TBNET_FRAME_SIZE,
+			.netdev = dev,
+			.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+		};
+
+		net->rx_ring.pool = page_pool_create(&pp_params);
+		if (IS_ERR(net->rx_ring.pool)) {
+			ret = PTR_ERR(net->rx_ring.pool);
+			net->rx_ring.pool = NULL;
+			goto err_free_rx_ring;
+		}
+	}
+
 	tb_ring_throttling(net->tx_ring.ring, TBNET_THROTTLING);
 	tb_ring_throttling(net->rx_ring.ring, TBNET_THROTTLING);
 
-	napi_enable(&net->napi);
+	/* connected_work enables NAPI after priming both rings. */
 	start_login(net);
 
 	return 0;
+
+err_free_rx_ring:
+	tb_ring_free(net->rx_ring.ring);
+	net->rx_ring.ring = NULL;
+	tb_xdomain_release_out_hopid(xd, hopid);
+	tb_ring_free(net->tx_ring.ring);
+	net->tx_ring.ring = NULL;
+	return ret;
 }
 
 static int tbnet_stop(struct net_device *dev)
 {
 	struct tbnet *net = netdev_priv(dev);
-
-	napi_disable(&net->napi);
 
 	cancel_work_sync(&net->disconnect_work);
 	tbnet_tear_down(net, true);
@@ -1001,6 +1085,11 @@ static int tbnet_stop(struct net_device *dev)
 	tb_xdomain_release_out_hopid(net->xd, net->local_transmit_path);
 	tb_ring_free(net->tx_ring.ring);
 	net->tx_ring.ring = NULL;
+
+	if (net->rx_ring.pool) {
+		page_pool_destroy(net->rx_ring.pool);
+		net->rx_ring.pool = NULL;
+	}
 
 	return 0;
 }
@@ -1030,7 +1119,8 @@ static bool tbnet_xmit_csum_and_map(struct tbnet *net, struct sk_buff *skb,
 						hdr->frame_index, hdr->frame_count);
 			dma_sync_single_for_device(dma_dev,
 				frames[i]->frame.buffer_phy,
-				tbnet_frame_size(frames[i]), DMA_TO_DEVICE);
+				tb_ring_frame_size(&frames[i]->frame),
+						   DMA_TO_DEVICE);
 		}
 
 		return true;
@@ -1104,7 +1194,7 @@ static bool tbnet_xmit_csum_and_map(struct tbnet *net, struct sk_buff *skb,
 	 */
 	for (i = 0; i < frame_count; i++) {
 		dma_sync_single_for_device(dma_dev, frames[i]->frame.buffer_phy,
-			tbnet_frame_size(frames[i]), DMA_TO_DEVICE);
+			tb_ring_frame_size(&frames[i]->frame), DMA_TO_DEVICE);
 	}
 
 	return true;
@@ -1354,7 +1444,7 @@ static void tbnet_generate_mac(struct net_device *dev)
 	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
 }
 
-static int tbnet_probe(struct tb_service *svc, const struct tb_service_id *id)
+static int tbnet_probe(struct tb_service *svc)
 {
 	struct tb_xdomain *xd = tb_service_parent(svc);
 	struct net_device *dev;
@@ -1369,9 +1459,11 @@ static int tbnet_probe(struct tb_service *svc, const struct tb_service_id *id)
 
 	net = netdev_priv(dev);
 	INIT_DELAYED_WORK(&net->login_work, tbnet_login_work);
+	INIT_DELAYED_WORK(&net->rx_refill_work, tbnet_rx_refill_work);
 	INIT_WORK(&net->connected_work, tbnet_connected_work);
 	INIT_WORK(&net->disconnect_work, tbnet_disconnect_work);
 	mutex_init(&net->connection_lock);
+	spin_lock_init(&net->poll_lock);
 	atomic_set(&net->command_id, 0);
 	atomic_set(&net->frame_id, 0);
 	net->svc = svc;
@@ -1474,7 +1566,7 @@ static DEFINE_SIMPLE_DEV_PM_OPS(tbnet_pm_ops, tbnet_suspend, tbnet_resume);
 
 static const struct tb_service_id tbnet_ids[] = {
 	{ TB_SERVICE("network", 1) },
-	{ },
+	{ }
 };
 MODULE_DEVICE_TABLE(tbsvc, tbnet_ids);
 

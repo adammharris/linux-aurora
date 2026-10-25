@@ -11,10 +11,16 @@
 
 #include "t6030.dtsi"
 #include "t603x-j514-j516.dtsi"
+#include "t603x-j514s-j516s-usb4.dtsi"
+#include "t603x-j514s-j516s-hdmi.dtsi"
 
 / {
 	compatible = "apple,j514s", "apple,t6030", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M3 Pro, Nov 2023)";
+
+	chosen {
+		asahi,t6030-dispext = "1";
+	};
 };
 
 &framebuffer0 {
@@ -65,7 +71,17 @@
 
 &jack_codec {
 	reset-gpios = <&pinctrl_nub 21 GPIO_ACTIVE_HIGH>;
-	interrupts-extended = <&pinctrl_ap 100 IRQ_TYPE_LEVEL_LOW>;
+	interrupts-extended = <&pinctrl_ap 196 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&dcp {
+	panel {
+		compatible = "apple,panel-j514", "apple,panel-mini-led", "apple,panel";
+		width-mm = <302>;
+		height-mm = <196>;
+		adj-height-mm = <189>;
+		apple,max-brightness = <500>;
+	};
 };
 
 &aop_audio {

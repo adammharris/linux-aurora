@@ -23,7 +23,7 @@
 #include "shim.h"
 
 /* The contract version; see Documentation/ABI/testing/sysfs-driver-apple-sep. */
-#define SEP_DIAG_ABI			1
+#define SEP_DIAG_ABI			2
 
 #define SEP_DIAG_ATTACH_PENDING		0
 #define SEP_DIAG_ATTACH_ATTACHED	1
@@ -64,6 +64,9 @@ static struct {
 	bool cold;
 	bool sepos13;
 	bool xart;
+	/* The xART guard's effective level (0: none runs), and its list. */
+	unsigned int xart_guard;
+	bool xart_guard_list;
 
 	atomic_t attach;
 	atomic_t endpoints;
@@ -71,6 +74,10 @@ static struct {
 	atomic_t keybag;
 	atomic_t sensor;
 	atomic_t touchid;
+	atomic_t sensor_attach;
+	atomic_t restore;
+	atomic_t xart_refusals;
+	atomic_t matching;
 } sep_diag;
 
 static unsigned int sep_diag_sensor(void)
@@ -233,6 +240,106 @@ static ssize_t touchid_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(touchid);
 
+static ssize_t sensor_attach_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.sensor_attach)) {
+	case SEP_DIAG_SENSOR_ATTACH_ATTACHED:
+		state = "attached";
+		break;
+	case SEP_DIAG_SENSOR_ATTACH_RETRYING:
+		state = "retrying";
+		break;
+	case SEP_DIAG_SENSOR_ATTACH_NOT_READY:
+		state = "not-ready";
+		break;
+	default:
+		state = "unknown";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(sensor_attach);
+
+static ssize_t restore_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.restore)) {
+	case SEP_DIAG_RESTORE_RESTORED:
+		state = "restored";
+		break;
+	case SEP_DIAG_RESTORE_EMPTY:
+		state = "empty";
+		break;
+	case SEP_DIAG_RESTORE_UNPROVEN:
+		state = "unproven";
+		break;
+	default:
+		state = "unknown";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(restore);
+
+static ssize_t xart_guard_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", sep_diag.xart_guard);
+}
+static DEVICE_ATTR_RO(xart_guard);
+
+static ssize_t xart_guard_list_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	const char *state;
+
+	if (!sep_diag.xart_guard)
+		state = "none";
+	else if (sep_diag.xart_guard_list)
+		state = "loaded";
+	else
+		state = "unavailable";
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(xart_guard_list);
+
+static ssize_t xart_guard_refusals_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)atomic_read(&sep_diag.xart_refusals));
+}
+static DEVICE_ATTR_RO(xart_guard_refusals);
+
+static ssize_t matching_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.matching)) {
+	case SEP_DIAG_MATCHING_USABLE:
+		state = "usable";
+		break;
+	case SEP_DIAG_MATCHING_UNVERIFIED:
+		state = "unverified";
+		break;
+	case SEP_DIAG_MATCHING_BLOCKED:
+		state = "blocked";
+		break;
+	default:
+		state = "unknown";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(matching);
+
 static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_abi.attr,
 	&dev_attr_profile.attr,
@@ -245,6 +352,12 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_keybag.attr,
 	&dev_attr_sensor.attr,
 	&dev_attr_touchid.attr,
+	&dev_attr_sensor_attach.attr,
+	&dev_attr_restore.attr,
+	&dev_attr_xart_guard.attr,
+	&dev_attr_xart_guard_list.attr,
+	&dev_attr_xart_guard_refusals.attr,
+	&dev_attr_matching.attr,
 	NULL
 };
 
@@ -292,8 +405,8 @@ void sep_diag_set_keybag(int state)
 }
 
 /*
- * Called from the SPI probe and remove of the one sensor device, which the
- * driver core never runs concurrently. A bring-up result racing this store is
+ * Called from the SPI probe and remove of the one sensor device (sensor_shim.c),
+ * which the driver core never runs concurrently. A bring-up result racing this store is
  * either overwritten by it or, arriving later, refused by the bind check below.
  */
 void sep_diag_set_sensor_bound(bool bound)
@@ -349,6 +462,36 @@ void sep_diag_set_touchid(bool started)
 {
 	atomic_set(&sep_diag.touchid,
 		   started ? SEP_DIAG_TOUCHID_STARTED : SEP_DIAG_TOUCHID_FAILED);
+}
+
+void sep_diag_set_sensor_attach(int state)
+{
+	atomic_set(&sep_diag.sensor_attach, state);
+}
+
+void sep_diag_set_restore(int state)
+{
+	atomic_set(&sep_diag.restore, state);
+}
+
+/*
+ * Called at probe, before sep_diag_register() adds the group. matching is
+ * derived in xart_guard.rs (MatchFacts), which has KUnit tests for each case.
+ */
+void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
+			     int matching)
+{
+	sep_diag.xart_guard = level;
+	sep_diag.xart_guard_list = list_loaded;
+	atomic_set(&sep_diag.xart_refusals, 0);
+	atomic_set(&sep_diag.matching, matching);
+}
+
+/* With matching as the refusal leaves it. */
+void sep_diag_xart_guard_refused(int matching)
+{
+	atomic_inc(&sep_diag.xart_refusals);
+	atomic_set(&sep_diag.matching, matching);
 }
 
 /*

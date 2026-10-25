@@ -1,0 +1,1078 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (16-inch, M4 Pro, Nov 2024)
+ *
+ * target-type: J616s
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6040.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/thermal/thermal.h>
+
+/ {
+	compatible = "apple,j616s", "apple,t6040", "apple,arm-platform";
+	model = "Apple MacBook Pro (16-inch, M4 Pro, Nov 2024)";
+	chassis-type = "laptop";
+
+	aliases {
+		keyboard = &keyboard;
+		wifi0 = "/pcie@1cb0000000/pci@0,0/wifi@0,0";
+		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
+		/* used by the loader to hand over the display */
+		dcp = &dcp;
+		disp0 = &display;
+		/* the boot loader finds the GPU node through this alias */
+		gpu = &gpu;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			/* Format properties will be added by loader */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* The loader adds its own reservations */
+
+		/*
+		 * iBoot loads the ISP firmware below the kernel's memory. Its
+		 * segments are the ADT's isp0 segment-ranges (macOS 26.6.2,
+		 * iBoot mBoot-18000.161.10), mapped where the firmware runs them:
+		 * 0x100_0000_0000 onwards, its 32 MiB main memory. The driver
+		 * checks that the coprocessor's reset vector is this text before
+		 * it starts the firmware.
+		 */
+		isp_fw_text: isp-firmware-text@10000c44000 {
+			reg = <0x100 0x00c44000 0x0 0xca8000>;
+			iommu-addresses = <&isp 0x100 0x0 0x0 0xca8000>;
+			no-map;
+		};
+
+		isp_fw_data: isp-firmware-data@10001e7c000 {
+			reg = <0x100 0x01e7c000 0x0 0x1344000>;
+			iommu-addresses = <&isp 0x100 0xca8000 0x0 0x1344000>;
+			no-map;
+		};
+
+		/* the firmware's main memory, the driver allocates above it */
+		isp_heap: isp-heap {
+			iommu-addresses = <&isp 0x100 0x0 0x0 0x2000000>;
+		};
+
+		/*
+		 * Data segment of the loaded GPU firmware (ADT sgx gfx-data-*); it
+		 * places its crash log here.
+		 */
+		gpu_fw_data: gpu-fw-data@10001d44000 {
+			reg = <0x100 0x01d44000 0x0 0x138000>;
+			no-map;
+		};
+
+		/*
+		 * The UAT ranges (ADT sgx gpu-region-*, gfx-shared-region-*,
+		 * gfx-shared-l2-region-*, gfx-handoff-*). They stay no-map until
+		 * the boot loader adds them to /memory.
+		 */
+		uat_ttbs: uat-ttbs@10bfffb8000 {
+			reg = <0x10b 0xfffb8000 0x0 0x4000>;
+			no-map;
+		};
+
+		uat_pagetables: uat-pagetables@10bfff78000 {
+			reg = <0x10b 0xfff78000 0x0 0x40000>;
+			no-map;
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables@10bfff74000 {
+			reg = <0x10b 0xfff74000 0x0 0x4000>;
+			no-map;
+		};
+
+		uat_handoff: uat-handoff@10bfff70000 {
+			reg = <0x10b 0xfff70000 0x0 0x4000>;
+			no-map;
+		};
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0 0 0 0>; /* To be filled by loader */
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "apple::kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+		};
+	};
+
+	/*
+	 * GPU performance states, one opp-microvolt cell per cluster (ADT
+	 * /arm-io/sgx perf-states and perf-states1). The operating points are
+	 * binned per device: these are this unit's values until the boot
+	 * loader fills them in. Entries keep the order of the GPU performance
+	 * states, which is not sorted by frequency.
+	 */
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <125000 125000>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <605000 585000>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <618000000>;
+			opp-microvolt = <655000 640000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <796000000>;
+			opp-microvolt = <690000 690000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <924000000>;
+			opp-microvolt = <715000 725000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <952000000>;
+			opp-microvolt = <755000 770000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <1056000000>;
+			opp-microvolt = <755000 770000>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <1062000000>;
+			opp-microvolt = <795000 810000>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <1182000000>;
+			opp-microvolt = <795000 810000>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <1182000000>;
+			opp-microvolt = <845000 860000>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <1312000000>;
+			opp-microvolt = <845000 860000>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <1242000000>;
+			opp-microvolt = <900000 915000>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <1380000000>;
+			opp-microvolt = <900000 915000>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <1326000000>;
+			opp-microvolt = <945000 960000>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <1470000000>;
+			opp-microvolt = <945000 960000>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <1578000000>;
+			opp-microvolt = <1030000 1045000>;
+		};
+	};
+
+	/* The GPU's CS clock domain (ADT cs-perf-states) */
+	gpu_cs_opp: opp-table-gpucs {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <24000000>;
+			opp-microvolt = <555000>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <555000>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <618000000>;
+			opp-microvolt = <620000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <796000000>;
+			opp-microvolt = <660000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <992000000>;
+			opp-microvolt = <715000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <1188000000>;
+			opp-microvolt = <780000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <1380000000>;
+			opp-microvolt = <870000>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <1470000000>;
+			opp-microvolt = <910000>;
+		};
+	};
+
+	/* The GPU's AFR clock domain (ADT afr-perf-states) */
+	gpu_afr_opp: opp-table-gpuafr {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <24000000>;
+			opp-microvolt = <555000>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <555000>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <618000000>;
+			opp-microvolt = <620000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <796000000>;
+			opp-microvolt = <660000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <992000000>;
+			opp-microvolt = <715000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <1188000000>;
+			opp-microvolt = <780000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <1380000000>;
+			opp-microvolt = <870000>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <1470000000>;
+			opp-microvolt = <910000>;
+		};
+	};
+
+	/*
+	 * CPU die temperature: SMC key TCMz (CPU die max), sensor 0 of
+	 * smc_hwmon. The PMP's fast die-temperature limit regulates (TCMz
+	 * settles near 111 C); this zone is the backstop above it: passive at
+	 * 113 C, critical (orderly shutdown) at 118 C, polled once a second as
+	 * the SMC refreshes TCMz. The cpufreq cooling device sits on a
+	 * cluster's policy CPU, so each map lists every CPU of its cluster.
+	 */
+	thermal-zones {
+		cpu-die-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
+
+			trips {
+				cpu_die_passive: cpu-die-passive {
+					temperature = <113000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				cpu-die-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * The speaker amps' shared shutdown line (SDZ, AP pin 54, low =
+	 * shutdown). One fixed regulator, the SDZ supply of all six, not
+	 * per-amp shutdown-gpios: with GPIO_SHARED six references become a
+	 * vote, and one amp driving the line low would not shut the other
+	 * five down.
+	 */
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl 54 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	/*
+	 * The AOP firmware runs the stream (MCA cluster 0, one serializer for
+	 * all six amps); the J616 variant of macaudio links the AOP audio
+	 * component's speaker back-end (DAI 3) to the amps. The codecs are
+	 * listed in the ADT provider order, so each gets its native playback
+	 * slot (LW1 0, RW1 1, LW2 2, RW2 3, LT 4, RT 5). The idle masks are the
+	 * ADT amp-tx-zd-config rows 0 and 1: LW1 drives zeros in the right
+	 * amps' sense slots, RW1 in the left amps'.
+	 */
+	sound: sound {
+		compatible = "apple,j616-macaudio", "apple,macaudio";
+		model = "MacBook Pro J616";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0x0f0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof1>, <&speaker_right_woof1>,
+					    <&speaker_left_woof2>, <&speaker_right_woof2>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>;
+			};
+		};
+	};
+
+	/*
+	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
+	 * to the CS42L84. A card of its own, so a codec that does not answer
+	 * costs the jack only, never the speakers.
+	 */
+	sound_jack: sound-jack {
+		compatible = "apple,j616-macaudio-jack", "apple,macaudio";
+		model = "MacBook Pro J616 Jack";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};
+
+&cpuidle {
+	status = "okay";
+};
+
+&smc {
+	status = "okay";
+};
+
+&smc_mbox {
+	status = "okay";
+};
+
+&nub_spmi0 {
+	status = "okay";
+};
+
+&pinctrl {
+	status = "okay";
+
+	wifi_clkreq_pins: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(0, 1)>;
+	};
+};
+
+/*
+ * The AP takes none of the always-on bank's interrupts: the AOP firmware
+ * owns some of its pins and interrupt registers, and a chained handler here
+ * would see their pending bits without a handler of ours.
+ */
+&pinctrl_nub {
+	status = "okay";
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts;
+};
+
+&fpwm0 {
+	status = "okay";
+};
+
+/* The Type-C retimers (ADT atcrt at 0x18/0x19/0x1a) sit on this bus; no driver yet. */
+&i2c6 {
+	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	/* SMC key gp1c powers the trackpad analog front end. */
+	apple,afe-smc = <&smc>;
+
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j616s.bin";
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <2>;
+	};
+
+	stm {
+	};
+
+	actuator {
+	};
+
+	tp-accel {
+	};
+
+	mtp {
+	};
+};
+
+&smc_hwmon {
+	/*
+	 * TCMz must stay the first temperature child: the thermal zone names
+	 * the sensor by its index, so the shared hwmon includes below only
+	 * append after it.
+	 */
+	temperature-TCMz {
+		apple,key-id = "TCMz";
+		label = "CPU Die Max";
+	};
+};
+
+/* Read-only fan speeds and more SMC sensors; every key exists on this machine's SMC. */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
+&pcie_dart {
+	status = "okay";
+};
+
+/*
+ * Wi-Fi and Bluetooth (BCM4388). The boot loader finds these nodes by
+ * the paths in the wifi0 and bluetooth0 aliases and adds the per-unit
+ * calibration, the antenna SKU and the addresses to them.
+ */
+/ {
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t6041-pcie", "apple,t6020-pcie";
+		reg = <0x1c 0xb0000000 0x0 0x1000000>,	/* config */
+		      <0x4 0x14000000 0x0 0x4000>,	/* rc */
+		      <0x4 0x10028000 0x0 0x4000>,	/* port0 */
+		      <0x4 0x11028000 0x0 0x4000>,	/* port1 */
+		      <0x4 0x12028000 0x0 0x4000>,	/* port2 */
+		      <0x4 0x13028000 0x0 0x4000>,	/* port3 */
+		      <0x4 0x17020000 0x0 0x4000>,	/* phy0 */
+		      <0x4 0x17024000 0x0 0x4000>,	/* phy1 */
+		      <0x4 0x17028000 0x0 0x4000>,	/* phy2 */
+		      <0x4 0x1702c000 0x0 0x4000>;	/* phy3 */
+		reg-names = "config", "rc",
+			    "port0", "port1", "port2", "port3",
+			    "phy0", "phy1", "phy2", "phy3";
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000 0x2000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_clkreq_pins>;
+		#size-cells = <2>;
+		#address-cells = <3>;
+		bus-range = <0 1>;
+		iommu-map-mask = <0xffff>;
+		iommu-map = <0x100 &pcie_dart 1 2>;
+		msi-ranges = <&aic AIC_IRQ 2071 IRQ_TYPE_EDGE_RISING 32>;
+		msi-parent = <&pcie0>;
+		msi-controller;
+		interrupts = <0 0x6bb 4>;
+		interrupt-parent = <&aic>;
+		device_type = "pci";
+
+		port00: pci@0,0 {
+			compatible = "pciclass,0604";
+			reg = <0 0 0 0 0>;
+			ranges;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
+			interrupt-map-mask = <0 0 0 7>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			#size-cells = <2>;
+			#address-cells = <3>;
+			pwren-gpios = <&smc_gpio 0x13 0>;
+			reset-gpios = <&pinctrl 4 1>;
+			device_type = "pci";
+
+			bluetooth@0,1 {
+				compatible = "pci14e4,5f72";
+				reg = <0x100 0 0 0 0>;
+				/* To be filled by the loader */
+				local-bd-address = [00 00 00 00 00 00];
+				brcm,board-type = "apple,hostomel";
+				status = "okay";
+			};
+
+			wifi@0,0 {
+				compatible = "brcm,bcm4329-fmac";
+				reg = <0 0 0 0 0>;
+				brcm,ccode-map-trivial;
+				brcm,board-type = "apple,hostomel";
+			};
+		};
+	};
+};
+
+&ans_mbox {
+	status = "okay";
+};
+
+&ans_sart {
+	status = "okay";
+};
+
+&nvme {
+	status = "okay";
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&dcp {
+	panel {
+		compatible = "apple,panel-j616", "apple,panel-mini-led", "apple,panel";
+		width-mm = <345>;
+		height-mm = <223>;
+		status = "disabled";
+	};
+};
+
+&pmc {
+	status = "okay";
+};
+
+&mcc {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&admac0 {
+	status = "okay";
+};
+
+&admac1 {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J616";
+	apple,machine-kind = "MacBook Pro";
+};
+
+/*
+ * The six SN012776 speaker amps, held in hardware shutdown until a sound
+ * card enables them (ADT /arm-io/i2c1/audio-speaker@38): one interrupt line
+ * on AP pin 55, level low; sense slots from speaker-config (speaker i at RX
+ * bytes 4i and 4i + 2, order LW1 RW1 LW2 RW2 LT RT). Names as on the J314
+ * and J316, which speakersafetyd's profile uses. Every amp joins the SDZ
+ * fail-closed group: an over-temperature or over-current fault on any one
+ * forces the shared shutdown line low.
+ */
+&i2c1 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
+	};
+};
+
+/*
+ * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output@4B). Its
+ * reset line is nub GPIO pin 58, driven high to run the codec (the driver's
+ * "reset" is an enable, as on the J514/J516); its interrupt is AP pin 106,
+ * level low. The AOP firmware runs the jack's stream on MCA cluster 2.
+ */
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 58 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl 106 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&isp {
+	memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
+	memory-region-names = "text", "data", "heap";
+	apple,platform-id = <5>;
+	/* ADT isp0 cam-connections-scheme */
+	apple,cam-connections-scheme = <0x10>;
+	status = "okay";
+
+	/*
+	 * The front camera, an IMX958: firmware configuration 5 as the
+	 * firmware reports it.
+	 */
+	sensor-presets {
+		/* 1920x1080 */
+		preset0 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <0 0 1920 1080>;
+		};
+		/* 1280x720 */
+		preset1 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 0 1280 720>;
+		};
+	};
+};
+
+&isp_dart0 {
+	status = "okay";
+};
+
+&isp_dart1 {
+	status = "okay";
+};
+
+&isp_dart2 {
+	status = "okay";
+};
+
+/*
+ * The GPU stays disabled until a boot loader fills in this unit's operating
+ * points, leakage and regions from the ADT; the values here are one unit's.
+ * Enabling it also takes gfx_mbox, keeps ps_afr and ps_gfx always on and
+ * claims pmp_gfx always-on, so that the PMP sees the GPU on exactly while it
+ * is powered.
+ */
+&gpu {
+	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+			<&gpu_fw_data>, <&uat_l2_pagetables>;
+	memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+			      "l2-pagetables";
+	operating-points-v2 = <&gpu_opp>;
+	apple,cs-opp = <&gpu_cs_opp>;
+	apple,afr-opp = <&gpu_afr_opp>;
+	status = "disabled";
+};
+
+/*
+ * The Type-C ports (ADT nub-spmi-a0 hpm0/hpm1, nub-spmi-a1 hpm2) and the
+ * MagSafe controller (nub-spmi-a0 hpm5). The ADT lists the event, sleep and
+ * wake interrupts; select is event + 2.
+ */
+&nub_spmi_a0 {
+	status = "okay";
+
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Back";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec0_con_hs: endpoint {
+						remote-endpoint = <&usb_drd0_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec0_con_ss: endpoint {
+						remote-endpoint = <&atcphy0_ss>;
+					};
+				};
+			};
+		};
+	};
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+			     <39 IRQ_TYPE_EDGE_RISING>,
+			     <43 IRQ_TYPE_EDGE_RISING>,
+			     <45 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_con_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_con_ss: endpoint {
+						remote-endpoint = <&atcphy1_ss>;
+					};
+				};
+			};
+		};
+	};
+
+	/* MagSafe port */
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			     <65 IRQ_TYPE_EDGE_RISING>,
+			     <69 IRQ_TYPE_EDGE_RISING>,
+			     <71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+	};
+};
+
+&nub_spmi_a1 {
+	status = "okay";
+
+	hpm2: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec2: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec2_con_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec2_con_ss: endpoint {
+						remote-endpoint = <&atcphy2_ss>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atcphy0 {
+	status = "okay";
+
+	port {
+		atcphy0_ss: endpoint {
+			remote-endpoint = <&typec0_con_ss>;
+		};
+	};
+};
+
+&atcphy0_mbox {
+	status = "okay";
+};
+
+&usb_drd0_dart_0 {
+	status = "okay";
+};
+
+&usb_drd0_dart_1 {
+	status = "okay";
+};
+
+&usb_drd0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd0_hs: endpoint {
+				remote-endpoint = <&typec0_con_hs>;
+			};
+		};
+	};
+};
+
+&atcphy1 {
+	status = "okay";
+
+	port {
+		atcphy1_ss: endpoint {
+			remote-endpoint = <&typec1_con_ss>;
+		};
+	};
+};
+
+&atcphy1_mbox {
+	status = "okay";
+};
+
+&usb_drd1_dart_0 {
+	status = "okay";
+};
+
+&usb_drd1_dart_1 {
+	status = "okay";
+};
+
+&usb_drd1 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd1_hs: endpoint {
+				remote-endpoint = <&typec1_con_hs>;
+			};
+		};
+	};
+};
+
+&atcphy2 {
+	status = "okay";
+
+	port {
+		atcphy2_ss: endpoint {
+			remote-endpoint = <&typec2_con_ss>;
+		};
+	};
+};
+
+&atcphy2_mbox {
+	status = "okay";
+};
+
+&usb_drd2_dart_0 {
+	status = "okay";
+};
+
+&usb_drd2_dart_1 {
+	status = "okay";
+};
+
+&usb_drd2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd2_hs: endpoint {
+				remote-endpoint = <&typec2_con_hs>;
+			};
+		};
+	};
+};
+
+#include "t6040-j616s-usb3.dtsi"

@@ -622,8 +622,7 @@ is_empty:
 	ntfs_debug("Done.");
 	return true;
 err_out:
-	if (rstr1_ph)
-		kvfree(rstr1_ph);
+	kvfree(rstr1_ph);
 	return false;
 }
 
@@ -692,7 +691,7 @@ map_vcn:
 
 	memset(empty_buf, 0xff, vol->cluster_size);
 
-	ra = kzalloc(sizeof(*ra), GFP_NOFS);
+	ra = kzalloc_obj(*ra, GFP_NOFS);
 	if (!ra)
 		goto err;
 

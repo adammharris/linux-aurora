@@ -171,6 +171,104 @@ static void mt7932_event_reply_eid_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0x50, false), -1);
 }
 
+static struct mt7932_rx_frame rx_qos_frame(void)
+{
+	return (struct mt7932_rx_frame) {
+		.translated = true,
+		.group4 = true,
+		.unicast = true,
+		.frame_control = IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA,
+		.sequence_control = 0x1230,
+		.qos_control = 3,
+		.sec_mode = 4,
+	};
+}
+
+static void mt7932_rx_reject_preserves_sequence_test(struct kunit *test)
+{
+	struct mt7932_duplicate cache[17] = {}, before[17];
+	struct mt7932_rx_frame frame = rx_qos_frame();
+
+	KUNIT_ASSERT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+	memcpy(before, cache, sizeof(cache));
+	frame.sequence_control += 0x10;
+	frame.sec_mode = 0;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_UNPROTECTED);
+	KUNIT_EXPECT_MEMEQ(test, cache, before, sizeof(cache));
+	frame.sec_mode = 4;
+	frame.cipher_mismatch = true;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_UNPROTECTED);
+	KUNIT_EXPECT_MEMEQ(test, cache, before, sizeof(cache));
+}
+
+static void mt7932_rx_decrypted_retry_test(struct kunit *test)
+{
+	struct mt7932_duplicate cache[17] = {};
+	struct mt7932_rx_frame frame = rx_qos_frame();
+
+	frame.sec_mode = 0;
+	KUNIT_ASSERT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_UNPROTECTED);
+	frame.sec_mode = 4;
+	frame.frame_control |= IEEE80211_FCTL_RETRY;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_DUPLICATE);
+}
+
+static void mt7932_rx_retry_amsdu_test(struct kunit *test)
+{
+	struct mt7932_duplicate cache[17] = {};
+	struct mt7932_rx_frame frame = rx_qos_frame();
+
+	/* The rejected first copy must not suppress the decrypted aggregate. */
+	frame.amsdu = 3;
+	frame.sec_mode = 0;
+	KUNIT_ASSERT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_UNPROTECTED);
+	frame.sec_mode = 4;
+	frame.frame_control |= IEEE80211_FCTL_RETRY;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+	frame.amsdu = 2;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+	frame.amsdu = 1;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+	/* A second retry of the completed aggregate is still suppressed. */
+	frame.amsdu = 3;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_DUPLICATE);
+	frame.amsdu = 2;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_DUPLICATE);
+	frame.amsdu = 1;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_DUPLICATE);
+}
+
+static void mt7932_rx_sequence_domains_test(struct kunit *test)
+{
+	struct mt7932_duplicate cache[17] = {};
+	struct mt7932_rx_frame frame = rx_qos_frame();
+
+	KUNIT_ASSERT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+	/* Same sequence without Retry is a new frame, including after wrap. */
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+	frame.frame_control |= IEEE80211_FCTL_RETRY;
+	frame.qos_control = 4;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+	frame.qos_control = 3;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_DUPLICATE);
+	frame.sequence_control = 0xfff0;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+	frame.sequence_control = 0;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, false), MT7932_RX_ACCEPT);
+}
+
+static void mt7932_rx_open_duplicate_test(struct kunit *test)
+{
+	struct mt7932_duplicate cache[17] = {};
+	struct mt7932_rx_frame frame = rx_qos_frame();
+
+	frame.sec_mode = 0;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, true), MT7932_RX_ACCEPT);
+	frame.frame_control |= IEEE80211_FCTL_RETRY;
+	KUNIT_EXPECT_EQ(test, mt7932_rx_filter(cache, &frame, true), MT7932_RX_DUPLICATE);
+}
+
 static struct kunit_case mt7932_input_test_cases[] = {
 	KUNIT_CASE(mt7932_rx_decrypted_test),
 	KUNIT_CASE(mt7932_rx_plaintext_test),
@@ -179,6 +277,11 @@ static struct kunit_case mt7932_input_test_cases[] = {
 	KUNIT_CASE(mt7932_rx_short_test),
 	KUNIT_CASE(mt7932_event_reply_test),
 	KUNIT_CASE(mt7932_event_reply_eid_test),
+	KUNIT_CASE(mt7932_rx_reject_preserves_sequence_test),
+	KUNIT_CASE(mt7932_rx_decrypted_retry_test),
+	KUNIT_CASE(mt7932_rx_retry_amsdu_test),
+	KUNIT_CASE(mt7932_rx_sequence_domains_test),
+	KUNIT_CASE(mt7932_rx_open_duplicate_test),
 	{}
 };
 

@@ -31,6 +31,7 @@
 #include "iomfb.h"
 #include "iomfb_internal.h"
 #include "parser.h"
+#include "dcp-property.h"
 #include "trace.h"
 #include "version_utils.h"
 
@@ -469,7 +470,15 @@ static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, v
 static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *prop)
 {
 	switch (prop->id) {
-	case IOMFB_PROPERTY_NITS:
+	case IOMFB_PROPERTY_NITS_V13_3:
+	/*
+	 * 13.x firmware publishes another property under the 14.7 ID, with
+	 * value 1, right before the panel level. Read as nits it is 0, and a
+	 * backlight registered from it starts at the lowest level.
+	 */
+#if DCP_FW_VERSION(14, 7, 0) <= DCP_FW_VER
+	case IOMFB_PROPERTY_NITS_V14_7:
+#endif
 	{
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 		/* The H17P takeover level comes from the powerlog hint interface. */
@@ -851,6 +860,34 @@ static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 	return clk_get_rate(dcp->clk);
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+/* The DVA that map_reg hands out for display register range @index. */
+static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
+				    struct resource *rsrc)
+{
+#if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
+	/*
+	 * T8122 dcpext: with the PMGR bandwidth page mapped, the DART faults
+	 * at display power-off and the DCP crashes. Give it a RAM page
+	 * instead. Generic M1/M2 DCPs on 14.7.0 also use this template
+	 * instance and keep the MMIO page.
+	 */
+	if (of_device_is_compatible(dcp->dev->of_node, "apple,t8122-dcpext") &&
+	    dcp->disp_bw_scratch_index && !dcp->disp_bw_doorbell_index &&
+	    index == dcp->disp_bw_scratch_index) {
+		dma_addr_t dva;
+
+		if (!dmam_alloc_coherent(dcp->dev, resource_size(rsrc), &dva,
+					 GFP_KERNEL))
+			return DMA_MAPPING_ERROR;
+		return dva;
+	}
+#endif
+	return dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
+				DMA_BIDIRECTIONAL, 0);
+}
+#endif
+
 static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *dcp,
 						struct DCP_FW_NAME(dcp_map_reg_req) *req)
 {
@@ -870,8 +907,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		 */
 		dma_addr_t dva = rsrc->start;
 #elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
-						  DMA_BIDIRECTIONAL, 0);
+		dma_addr_t dva = dcpep_map_reg_dva(dcp, req->index, rsrc);
 		WARN_ON(dva == DMA_MAPPING_ERROR);
 #endif
 
@@ -914,9 +950,8 @@ static void iomfbep_cb_enable_backlight_message_ap_gated(struct apple_dcp *dcp,
 	}
 #endif
 	/*
-	 * update backlight brightness on next swap, on non mini-LED displays
-	 * DCP seems to set an invalid iDAC value after coming out of DPMS.
-	 * syslog: "[BrightnessLCD.cpp:743][AFK]nitsToDBV: iDAC out of range"
+	 * Reapply brightness on the next swap after DPMS wake on panels
+	 * without mini-LED backlights.
 	 */
 	dcp->brightness.update = true;
 	/* Backlight handling is only set up for panels described in the DT. */
@@ -945,6 +980,10 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 	}
 #endif
 
+	if (!dcp_property_size_valid(*length))
+		return false;
+
+	dcp->chunks.modes_generation = dcp_modes_transfer_begin(dcp);
 	dcp->chunks.length = *length;
 	dcp->chunks.av_service_epoch = 0;
 	dcp->chunks.automatic_service_pending = false;
@@ -1020,9 +1059,6 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 			dcp_property_complete(dcp->chunks.data, dcp->chunks.received,
 					      dcp->chunks.length);
 
-	/* used just as opaque pointer for tracing */
-	ctx.dcp = dcp;
-
 	ret = parse(dcp->chunks.data, dcp->chunks.length, &ctx);
 
 	if (ret) {
@@ -1041,76 +1077,39 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		return false;
 	}
 
+	/* parse() resets the context: set the tracing pointer afterwards. */
+	ctx.dcp = dcp;
+
 	if (!strcmp(req->key, "TimingElements")) {
-		struct dcp_display_mode *modes;
-		struct dcp_metadata_ticket rate_ticket = {};
-		u64 rate_service_epoch = 0;
-		unsigned int nr_modes = 0, i;
-		unsigned long flags;
-
-		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-		    dcp->chunks.payload_complete && dcp->chunks.mode_ticket.associated) {
-			ctx.automatic_1080p180_rgb8 = true;
-			rate_ticket = dcp->chunks.mode_ticket;
-			rate_service_epoch = dcp->chunks.av_service_epoch;
-		}
-		modes = enumerate_modes(&ctx, &nr_modes,
-					     dcp->width_mm, dcp->height_mm,
-					     dcp->notch_height,
-					     dcp->fixed_connector_type ==
-						     DRM_MODE_CONNECTOR_eDP,
-					     dcp->hw.iomfb_method_profile ==
-						     DCP_IOMFB_METHODS_H17P_EXTERNAL);
-
-		if (IS_ERR(modes)) {
+		ret = dcp_modes_replace(dcp, &ctx, dcp->chunks.modes_generation);
+		if (ret) {
+			if (ret == -ESTALE) {
+				kfree(dcp->chunks.data);
+				dcp->chunks.data = NULL;
+				dcp->chunks.length = 0;
+			}
 			dev_warn(dcp->dev, "failed to parse modes\n");
-			modes = NULL;
-			nr_modes = 0;
-		} else {
-			for (i = 0; i < nr_modes; i++)
-				if (modes[i].automatic_rgb8_quirk) {
-					modes[i].unsafe_rgb8_ticket = rate_ticket;
-					modes[i].unsafe_rgb8_service_epoch = rate_service_epoch;
-					modes[i].automatic_connection_sequence = dcp->chunks.automatic_connection_sequence;
-					modes[i].automatic_service_pending = dcp->chunks.automatic_service_pending;
-				}
-		}
-		/* Publish one catalog revision with its immutable receipt tickets. */
-		spin_lock_irqsave(&dcp->metadata.lock, flags);
-		dcp->rate_proof.catalog_sequence++;
-		for (i = 0; i < nr_modes; i++)
-			if (modes[i].automatic_rgb8_quirk)
-				modes[i].automatic_catalog_sequence = dcp->rate_proof.catalog_sequence;
-		dcp->modes = modes;
-		dcp->nr_modes = nr_modes;
-		/* Only a complete receipt for a current cable is that cable's catalogue. */
-		dcp->metadata.catalog_ticket = rate_ticket;
-		dcp->metadata.catalog_ticket.associated &= nr_modes > 0;
-		dcp->metadata.catalog_connection_sequence =
-			dcp->chunks.automatic_connection_sequence;
-		spin_unlock_irqrestore(&dcp->metadata.lock, flags);
-		/* Notify removals as well as newly eligible modes, outside the lock. */
-		dcp_180hz_catalog_changed(dcp);
-		if (!modes) {
 			dcp_firmware_metadata_timing(dcp);
 			return false;
 		}
-		if (nr_modes == 0)
+		if (!READ_ONCE(dcp->nr_modes))
 			dev_warn(dcp->dev, "TimingElements without valid modes!\n");
 		dcp_180hz_notify(dcp);
 		dcp_firmware_metadata_timing(dcp);
 	} else if (!strcmp(req->key, "DisplayAttributes")) {
 		struct dcp_parse_ctx metadata_ctx = ctx;
 
-		ret = parse_display_attributes(&ctx, &dcp->width_mm,
-					&dcp->height_mm);
-
+		ret = dcp_attributes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
+			if (ret == -ESTALE) {
+				kfree(dcp->chunks.data);
+				dcp->chunks.data = NULL;
+				dcp->chunks.length = 0;
+			}
 			dev_warn(dcp->dev, "failed to parse display attribs\n");
 			return false;
 		}
 
-		dcp_set_dimensions(dcp);
 		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 			struct dcp_display_metadata metadata;
 
@@ -1125,7 +1124,17 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 			    struct dcp_set_dcpav_prop_end_req *req)
 {
-	u8 resp = dcpep_process_chunks(dcp, req);
+	u8 resp;
+
+	if (!dcp_property_key_valid(req->key, sizeof(req->key))) {
+		kfree(dcp->chunks.data);
+		dcp->chunks.data = NULL;
+		dcp->chunks.length = 0;
+		return false;
+	}
+	resp = dcpep_process_chunks(dcp, req);
+	if (!dcp->chunks.data)
+		return resp;
 
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
 		dev_dbg(dcp->dev,
@@ -1559,7 +1568,11 @@ static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
 	 * brightness.
 	 */
 	if (dcp_has_panel(dcp)) {
+#if !DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 		swap->swap.bl_unk = 1;
+#else
+		swap->swap.bl_update = 1;
+#endif
 		swap->swap.bl_value = 0;
 		swap->swap.bl_power = 0;
 	}
@@ -1782,9 +1795,14 @@ static void last_client_closed_poff(struct apple_dcp *dcp, void *out, void *cook
 
 static void aborted_swaps_dcp_poff(struct apple_dcp *dcp, void *out, void *cookie)
 {
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	/* iomfb_last_client_close times out on 14.7 */
+	last_client_closed_poff(dcp, NULL, cookie);
+#else
 	struct iomfb_last_client_close_req last_client_req = {};
 	iomfb_last_client_close(dcp, false, &last_client_req,
 				last_client_closed_poff, cookie);
+#endif
 }
 
 void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
@@ -1939,6 +1957,8 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 {
 	struct apple_connector *connector = dcp->connector;
+	/* sampled before complete_all() lets dcp_poweron() clear it */
+	bool poweron_hpd = READ_ONCE(dcp->typec_poweron_hpd);
 	unsigned int action;
 
 	/* DCP issues hotplug_gated callbacks after SetPowerState() calls on
@@ -1969,21 +1989,40 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+	/* DCP lost a sink which is still attached, see dcp_typec_relink() */
+	if (!(*connected) && dcp_typec_relink(dcp)) {
+		dcp_mode_invalidate(&dcp->mode_state);
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 	if (dcp_is_typec_output(dcp) && *connected && dcp->nr_modes)
 		complete_all(&dcp->typec_iomfb_hpd_ready);
+
+	/* A firmware HPD loss can bypass disconnected_hpd_event(), for
+	 * example on the fixed output. Do not lend its capability to the next
+	 * sink while that sink's DisplayAttributes are still arriving.
+	 */
+	if (!*connected)
+		WRITE_ONCE(dcp->ext_backlight, false);
 
 	if (dcp_external_hotplug(dcp, !!(*connected)))
 		return;
 
 	dcp_firmware_metadata_hotplug(dcp, !!(*connected));
+	apple_connector_edid_set_live(connector, !!(*connected));
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
 	/*
 	 * A Type-C sink can assert HPD only after a modeset has already failed,
 	 * as a TV behind a DP-to-HDMI converter does when it wakes from standby.
 	 * The connector state does not change then; re-apply the mode anyway.
+	 *
+	 * Not for the HPD dcp_poweron() waits for: the modeset of that commit
+	 * has not started yet, rather than failed. Reporting the link as bad
+	 * then makes wlroots replace the output, which powers the CRTC off and
+	 * on again, and the next wake does the same, forever.
 	 */
-	if (*connected && dcp_is_typec_output(dcp) &&
+	if (*connected && dcp_is_typec_output(dcp) && !poweron_hpd &&
 	    !READ_ONCE(dcp->mode_state.valid) &&
 	    !READ_ONCE(dcp->mode_state.changing)) {
 		dcp->swap_watchdog_retrains = 0;
@@ -2187,12 +2226,31 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_start_req) start_req = { 0 };
+	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
 
 	if (READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
-	    READ_ONCE(dcp->connector->connected))
+	    READ_ONCE(dcp->connector->connected)) {
+		/* The CTM reply may arrive after a link loss. Consume the
+		 * external level only here, once the swap can be submitted.
+		 */
+		if (!dcp_has_panel(dcp) &&
+		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+		    xchg(&dcp->brightness.update, false)) {
+			s32 bl = dcp_ext_backlight_value(dcp);
+
+			if (bl >= 0) {
+				req->swap.bl_unk = 1;
+				req->swap.bl_value = bl;
+				req->swap.bl_power = 0x40;
+			} else {
+				/* DisplayAttributes may still be on their way. */
+				smp_store_release(&dcp->brightness.update, true);
+			}
+		}
 		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
-	else
+	} else {
 		dcp_drm_crtc_vblank(dcp->crtc);
+	}
 }
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
@@ -2267,13 +2325,12 @@ static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state)
 {
-	struct dcp_display_mode *mode;
+	struct dcp_display_mode selected, *mode = &selected;
 	struct dcp_wait_cookie *cookie;
 	struct dcp_color_mode *cmode = NULL;
 	int ret;
 
-	mode = lookup_mode(dcp, &crtc_state->mode);
-	if (!mode) {
+	if (!lookup_mode(dcp, &crtc_state->mode, mode)) {
 		dev_err(dcp->dev, "no match for " DRM_MODE_FMT "\n",
 			DRM_MODE_ARG(&crtc_state->mode));
 		return -EIO;
@@ -2381,7 +2438,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	return 0;
 }
 
-void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_state *state)
+void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 {
 	struct drm_plane *plane;
 	struct drm_plane_state *new_state, *old_state;
@@ -2391,7 +2448,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	int has_surface = 0;
 	bool update_brightness;
 
-	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 
 	/* Reset all surfaces to defaults */
 	memset(req, 0, sizeof(*req));
@@ -2416,7 +2473,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		dcp->surfaces_cleared = true;
 	}
 
-	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, plane_idx) {
+	for_each_oldnew_plane_in_state(commit, plane, old_state, new_state, plane_idx) {
 		struct apple_plane_state *apple_state = to_apple_plane_state(new_state);
 		struct apple_plane *apl_plane = to_apple_plane(plane);
 
@@ -2436,11 +2493,18 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.src_rect[l] = apple_state->src_rect;
 		req->swap.dst_rect[l] = apple_state->dst_rect;
 
+#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+		req->swap.surf_ids[apl_plane->iomfb_surf] = plane->base.id;
+#endif
+
 		if (dcp->notch_height > 0)
 			req->swap.dst_rect[l].y += dcp->notch_height;
 
 		req->surf_iova[l] = apple_state->iova;
 		req->surf[l].base = apple_state->surf;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+		req->surf[l].base.surface_id = 0;
+#endif
 
 		/* Use sRGB colorspace only for internal panels. External
 		 * displays are expected to have EDID and user space can use
@@ -2509,7 +2573,11 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
 #endif
 	if (update_brightness) {
+#if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
+		req->swap.bl_update = 1;
+#else
 		req->swap.bl_unk = 1;
+#endif
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
 		dcp->brightness.update = false;
@@ -2560,7 +2628,7 @@ static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 	connector = dcp->connector;
 	if (connector) {
 		connector->connected = dcp->nr_modes > 0;
-		schedule_work(&connector->hotplug_wq);
+		dcp_queue_hotplug(connector);
 	}
 
 	dcp->active = true;

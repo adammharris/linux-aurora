@@ -136,7 +136,7 @@ static struct sn201202x_test *sn201202x_test_port(struct kunit *test)
 
 	tps = &t->sn.cd.tps;
 	tps->dev = t->dev;
-	tps->data = &tipd_sn201202x_data;
+	tps->data = tipd_hw_variants[TIPD_VARIANT_SN201202X];
 	tps->regmap = devm_regmap_init(t->dev, &sn201202x_test_bus, t,
 				       &tps6598x_regmap_config);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, tps->regmap);

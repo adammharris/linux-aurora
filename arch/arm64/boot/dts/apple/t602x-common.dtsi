@@ -257,7 +257,7 @@
 			cache-unified;
 			cache-size = <0x1000000>;
 		};
-	 };
+	};
 
 	blizzard_opp: opp-table-0 {
 		compatible = "operating-points-v2";
@@ -557,7 +557,7 @@
 	clk_disp0: clock-disp0 {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
-		clock-frequency = <257142848>;
+		clock-frequency = <257142848>; /* TODO: check */
 		clock-output-names = "clk_disp0";
 	};
 
@@ -568,7 +568,7 @@
 		clock-output-names = "clk_dispext0";
 	};
 
-	clk_dispext0_die1: clock-dispext0-die1 {
+	clk_dispext0_die1: clock-dispext0_die1 {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
 		clock-frequency = <0>;
@@ -582,7 +582,7 @@
 		clock-output-names = "clk_dispext1";
 	};
 
-	clk_dispext1_die1: clock-dispext1-die1 {
+	clk_dispext1_die1: clock-dispext1_die1 {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
 		clock-frequency = <0>;
@@ -616,16 +616,16 @@
 			status = "disabled";
 		};
 
-		uat_handoff: uat-handoff {
-			reg = <0 0 0 0>;
+		uat_handoff: uat-handoff@10 {
+			reg = <0 0x10 0 0>;
 		};
 
-		uat_pagetables: uat-pagetables {
-			reg = <0 0 0 0>;
+		uat_pagetables: uat-pagetables@20 {
+			reg = <0 0x20 0 0>;
 		};
 
-		uat_ttbs: uat-ttbs {
-			reg = <0 0 0 0>;
+		uat_ttbs: uat-ttbs@30 {
+			reg = <0 0x30 0 0>;
 		};
 
 		/* IOVA-only: the ANE firmware entry alias, 16 MiB at 0x10000000000 */

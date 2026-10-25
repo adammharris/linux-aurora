@@ -600,7 +600,7 @@ fn command_frame(cmd: &[u8; CMD_LEN], total: usize, at: usize, out: &mut [u8]) -
 /// A read the sensor did not take leaves the frame on offer at the same
 /// length: only then is it read again.
 fn read_frame(total: usize, at: usize, out: &mut [u8]) -> Result<()> {
-    if total < CRC_LEN || total > MAX_REPLY || at + out.len() > total - CRC_LEN {
+    if !(CRC_LEN..=MAX_REPLY).contains(&total) || at + out.len() > total - CRC_LEN {
         return Err(EINVAL);
     }
     poll_until_ready(total)?;

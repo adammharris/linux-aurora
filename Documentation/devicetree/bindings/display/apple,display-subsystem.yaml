@@ -15,11 +15,29 @@ description:
 
 properties:
   compatible:
-    const: apple,display-subsystem
+    oneOf:
+      - enum:
+          - apple,display-subsystem
+          - apple,t8132-display-subsystem
+      - const: apple,t8132-display-diagnostics
+        deprecated: true
+      - items:
+          - const: apple,t8132-display-subsystem
+          - const: apple,t8132-display-diagnostics
+        description: Compatibility with kernels predating the common M4 display backend.
 
   iommus:
     minItems: 1
     maxItems: 8
+
+  memory-region:
+    minItems: 1
+    maxItems: 64
+    description: Reserved memory retaining the inherited display mappings.
+
+  apple,j713-inherited-mappings:
+    type: boolean
+    description: The loader validated the inherited J713 SID0 scanout mapping.
 
 required:
   - compatible

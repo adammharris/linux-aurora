@@ -466,16 +466,16 @@
 			status = "disabled";
 		};
 
-		uat_handoff: uat-handoff {
-			reg = <0 0 0 0>;
+		uat_handoff: uat-handoff@10 {
+			reg = <0 0x10 0 0>;
 		};
 
-		uat_pagetables: uat-pagetables {
-			reg = <0 0 0 0>;
+		uat_pagetables: uat-pagetables@20 {
+			reg = <0 0x20 0 0>;
 		};
 
-		uat_ttbs: uat-ttbs {
-			reg = <0 0 0 0>;
+		uat_ttbs: uat-ttbs@30 {
+			reg = <0 0x30 0 0>;
 		};
 	};
 
@@ -625,21 +625,19 @@
 		disp0_dart: iommu@231304000 {
 			compatible = "apple,t8103-dart";
 			reg = <0x2 0x31304000 0x0 0x4000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 445 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_disp0_cpu0>;
-			apple,dma-range = <0x0 0x0 0x0 0xfc000000>;
 			status = "disabled";
 		};
 
 		dcp_dart: iommu@23130c000 {
 			compatible = "apple,t8103-dart";
 			reg = <0x2 0x3130c000 0x0 0x4000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 445 IRQ_TYPE_LEVEL_HIGH>;
-			apple,dma-range = <0xf 0x00000000 0x0 0xfc000000>;
 			power-domains = <&ps_disp0_cpu0>;
 		};
 
@@ -662,7 +660,7 @@
 			compatible = "apple,t8103-dcp", "apple,dcp";
 			mboxes = <&dcp_mbox>;
 			mbox-names = "mbox";
-			iommus = <&dcp_dart 0>;
+			iommus = <&dcp_dart 0 0x0 0x0 0x0 0xfc000000>;
 
 			reg-names = "coproc", "disp-0", "disp-1", "disp-2",
 				"disp-3", "disp-4";
@@ -684,7 +682,7 @@
 			#size-cells = <2>;
 
 			disp0_piodma: piodma {
-				iommus = <&disp0_dart 4>;
+				iommus = <&disp0_dart 4 0x0 0x0 0x0 0xfc000000>;
 				phandle = <&disp0_piodma>;
 			};
 
@@ -703,7 +701,7 @@
 		display: display-subsystem {
 			compatible = "apple,display-subsystem";
 			/* disp_dart0 must be 1st since it is locked */
-			iommus = <&disp0_dart 0>;
+			iommus = <&disp0_dart 0 0x0 0x0 0x0 0xfc000000>;
 			/* generate phandle explicitly for use in loader */
 			phandle = <&display>;
 		};
@@ -1313,16 +1311,16 @@
 				#gpio-cells = <2>;
 			};
 
-			smc_hwmon: hwmon {
-				compatible = "apple,smc-hwmon";
-			};
-
 			smc_reboot: reboot {
 				compatible = "apple,smc-reboot";
 				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
 					<&boot_error_count>, <&panic_count>, <&pm_setting>;
 				nvmem-cell-names = "shutdown_flag", "boot_stage",
 					"boot_error_count", "panic_count", "pm_setting";
+			};
+
+			smc_hwmon: hwmon {
+				compatible = "apple,smc-hwmon";
 			};
 
 			rtc {
@@ -1487,7 +1485,7 @@
 			};
 		};
 
-		avd: avd@268000000 {
+		avd: avd@269080000 {
 			compatible = "apple,t8103-avd";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 540 IRQ_TYPE_LEVEL_HIGH>,
@@ -1560,22 +1558,20 @@
 		dispext0_dart: iommu@271304000 {
 			compatible = "apple,t8103-dart";
 			reg = <0x2 0x71304000 0x0 0x4000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_dispext_cpu0>;
-			apple,dma-range = <0x0 0x0 0x0 0xfc000000>;
 			status = "disabled";
 		};
 
 		dcpext_dart: iommu@27130c000 {
 			compatible = "apple,t8103-dart";
 			reg = <0x2 0x7130c000 0x0 0x4000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_dispext_cpu0>;
-			apple,dma-range = <0xf 0x00000000 0x0 0xfc000000>;
 			status = "disabled";
 		};
 
@@ -1599,7 +1595,7 @@
 			compatible = "apple,t8103-dcpext", "apple,dcpext";
 			mboxes = <&dcpext_mbox>;
 			mbox-names = "mbox";
-			iommus = <&dcpext_dart 0>;
+			iommus = <&dcpext_dart 0 0x0 0x0 0x0 0xfc000000>;
 			phandle = <&dcpext>;
 
 			reg-names = "coproc", "disp-0", "disp-1", "disp-2",
@@ -1622,7 +1618,7 @@
 			#size-cells = <2>;
 
 			piodma {
-				iommus = <&dispext0_dart 4>;
+				iommus = <&dispext0_dart 4 0x0 0x0 0xf 0xffff0000>;
 			};
 
 			ports {
@@ -2253,6 +2249,7 @@
 };
 
 #include "t8103-pmgr.dtsi"
+#include "hwmon-common.dtsi"
 
 /*
  * The ANE has run on the M1, so enable it here with its DARTs and the

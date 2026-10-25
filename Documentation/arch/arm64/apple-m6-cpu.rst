@@ -1,5 +1,5 @@
 M6 CPU bring-up
-==============
+===============
 
 J873g has six E CPUs and a shared performance domain containing two P CPUs
 and four M CPUs. The T8152 ACC request uses a five-bit hardware state, with
@@ -7,7 +7,7 @@ state 2 as the first ADT operating point. Do not use the older voltage or PLL
 initialization sequences.
 
 Failure cases and qualification
-------------------------------
+-------------------------------
 
 Before testing, account for incorrect MPIDRs, incomplete spin-table release,
 broken cross-CPU interrupts, a stalled architectural timer, mismatched OPP

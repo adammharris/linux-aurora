@@ -220,6 +220,44 @@ int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 	return 0;
 }
 
+/*
+ * The firmware frees a SHAREDMALLOC surface by sending its iova. It does not
+ * free every surface it allocated, and may still access a surface after
+ * freeing it, so the surface is only moved to the released list here; it is
+ * freed once the stream has stopped, see isp_free_released_surfaces(), and
+ * what the firmware never frees is freed when the firmware stops.
+ */
+static void ipc_sm_release(struct apple_isp *isp, dma_addr_t iova)
+{
+	struct isp_surf *surf, *found = NULL;
+
+	mutex_lock(&isp->gc_lock);
+	list_for_each_entry(surf, &isp->gc, head) {
+		if (surf->iova == iova) {
+			found = surf;
+			list_move_tail(&surf->head, &isp->gc_released);
+			break;
+		}
+	}
+	mutex_unlock(&isp->gc_lock);
+
+	if (!found) {
+		dev_warn_ratelimited(isp->dev,
+				     "firmware freed unknown shared surface %pad\n",
+				     &iova);
+		return;
+	}
+
+	/* The terminal and buffer return handlers run in this thread. */
+	if (found == isp->log_surf)
+		isp->log_surf = NULL;
+	if (found == isp->bt_surf)
+		isp->bt_surf = NULL;
+
+	isp_dbg(isp, "shared surface released: iova %pad size 0x%llx\n",
+		&found->iova, found->size);
+}
+
 int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
 	struct isp_message *req = &chan->req, *rsp = &chan->rsp;
@@ -261,11 +299,8 @@ int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan)
 				surf->iova, surf->size);
 		}
 	} else {
-		/* This should be the shared surface free request, but
-		 * 1) The fw doesn't request to free all of what it requested
-		 * 2) The fw continues to access the surface after
-		 * So we link it to the gc, which runs after fw shutdown
-		 */
+		ipc_sm_release(isp, isp_fw_iova(isp, req->arg0));
+
 		rsp->arg0 = req->arg0 | ISP_IPC_FLAG_ACK;
 		rsp->arg1 = 0x0;
 		rsp->arg2 = 0x0;
@@ -273,3 +308,7 @@ int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan)
 
 	return 0;
 }
+
+#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
+#include "isp-ipc-test.c"
+#endif

@@ -3,7 +3,7 @@
 #include <asm/assembler.h>
 
 /*
- * T8140 secondaries can resume from WFI with cleared general registers.
+ * Affected Apple cores can resume from WFI with cleared general registers.
  * SP and stack memory survive. Preserve the AAPCS64 callee-saved registers
  * and x18 (which may hold the shadow call stack), including the return PC.
  * This follows the stateless-wait approach used during m1n1 M5 Windows

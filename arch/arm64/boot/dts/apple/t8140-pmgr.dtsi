@@ -400,7 +400,6 @@
 		apple,firmware-owned;
 	};
 
-
 	ps_venc0_dma: power-controller@8000 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x8000 4>;

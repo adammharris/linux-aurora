@@ -10,6 +10,7 @@
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/usb/of.h>
+#include <linux/usb/hcd.h>
 
 /**
  * usb_of_get_device_node() - get a USB device node
@@ -90,6 +91,20 @@ static bool usb_of_has_devices_or_graph(const struct usb_device *hub)
 	return false;
 }
 
+/* Prefer raw controller numbering, retaining older logical root-port graphs. */
+static struct device_node *usb_of_get_port_endpoint(struct usb_device *hub, int port1)
+{
+	struct device_node *ep;
+	int raw_port = port1;
+
+	if (!hub->parent)
+		raw_port = usb_hcd_find_raw_port_number(bus_to_hcd(hub->bus), port1);
+	ep = of_graph_get_endpoint_by_regs(hub->dev.of_node, raw_port, -1);
+	if (!ep && raw_port != port1)
+		ep = of_graph_get_endpoint_by_regs(hub->dev.of_node, port1, -1);
+	return ep;
+}
+
 /**
  * usb_of_get_connect_type() - get a USB hub's port connect_type
  * @hub: hub to which port is for @port1
@@ -108,6 +123,7 @@ enum usb_port_connect_type usb_of_get_connect_type(struct usb_device *hub, int p
 {
 	struct device_node *np, *child, *ep, *remote_np;
 	enum usb_port_connect_type connect_type;
+	int raw_port = port1;
 
 	/* Only set connect_type if binding has ports/hardwired devices. */
 	if (!usb_of_has_devices_or_graph(hub))
@@ -117,12 +133,14 @@ enum usb_port_connect_type usb_of_get_connect_type(struct usb_device *hub, int p
 	connect_type = USB_PORT_NOT_USED;
 
 	np = hub->dev.of_node;
+	if (!hub->parent)
+		raw_port = usb_hcd_find_raw_port_number(bus_to_hcd(hub->bus), port1);
 	/*
 	 * Hotplug ports are connected to an available remote node, e.g.
 	 * usb-a-connector compatible node, in the OF graph.
 	 */
 	if (of_graph_is_present(np)) {
-		ep = of_graph_get_endpoint_by_regs(np, port1, -1);
+		ep = usb_of_get_port_endpoint(hub, port1);
 		if (ep) {
 			remote_np = of_graph_get_remote_port_parent(ep);
 			of_node_put(ep);
@@ -136,7 +154,7 @@ enum usb_port_connect_type usb_of_get_connect_type(struct usb_device *hub, int p
 	 * Hard-wired ports are child nodes with a reg property corresponding
 	 * to the port number, i.e. a usb device.
 	 */
-	child = usb_of_get_device_node(hub, port1);
+	child = usb_of_get_device_node(hub, raw_port);
 	if (of_device_is_available(child))
 		connect_type = USB_PORT_CONNECT_TYPE_HARD_WIRED;
 	of_node_put(child);
@@ -144,6 +162,62 @@ enum usb_port_connect_type usb_of_get_connect_type(struct usb_device *hub, int p
 	return connect_type;
 }
 EXPORT_SYMBOL_GPL(usb_of_get_connect_type);
+
+/* Return a connector directly attached to an endpoint, or through one mux. */
+static struct device_node *usb_of_endpoint_connector(struct device_node *endpoint)
+{
+	struct device_node *remote __free(device_node) = of_graph_get_remote_endpoint(endpoint);
+	struct device_node *node __free(device_node) = of_graph_get_port_parent(remote);
+	struct device_node *other __free(device_node) = NULL;
+	struct device_node *ep;
+
+	if (of_device_is_compatible(node, "usb-c-connector") ||
+	    of_device_is_compatible(node, "usb-a-connector"))
+		return of_node_get(node);
+
+	/* A two-sided mode switch carries the same USB port to its connector. */
+	if (!of_property_present(node, "mode-switch"))
+		return NULL;
+	for_each_endpoint_of_node(node, ep) {
+		if (ep == remote)
+			continue;
+		if (other) {
+			of_node_put(ep);
+			return NULL;
+		}
+		other = of_node_get(ep);
+	}
+
+	struct device_node *connector __free(device_node) =
+		of_graph_get_remote_port_parent(other);
+
+	if (of_device_is_compatible(connector, "usb-c-connector") ||
+	    of_device_is_compatible(connector, "usb-a-connector"))
+		return of_node_get(connector);
+	return NULL;
+}
+
+/**
+ * usb_of_get_port_connector() - get a port's physical connector
+ * @hub: hub to which the port belongs
+ * @port1: one-based port number
+ *
+ * The USB2 and USB3 paths can pass through different hubs. Match their
+ * connector identity instead of assuming the same upstream port numbers.
+ * Hard-wired devices belong to the board, not the connector in its graph.
+ *
+ * Return: Connector node with a reference, or NULL if it is not described.
+ */
+struct device_node *usb_of_get_port_connector(struct usb_device *hub, int port1)
+{
+	struct device_node *ep __free(device_node) = NULL;
+
+	if (usb_of_get_connect_type(hub, port1) != USB_PORT_CONNECT_TYPE_HOT_PLUG)
+		return NULL;
+	ep = usb_of_get_port_endpoint(hub, port1);
+	return usb_of_endpoint_connector(ep);
+}
+EXPORT_SYMBOL_GPL(usb_of_get_port_connector);
 
 /**
  * usb_of_get_interface_node() - get a USB interface node

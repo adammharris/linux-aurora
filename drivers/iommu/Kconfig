@@ -316,8 +316,20 @@ config APPLE_DART
 
 	  Say Y here if you are using an Apple SoC.
 
+config APPLE_DART_J713_DCP
+	bool "Retained J713 display DART support"
+	depends on APPLE_DART=y && ARM64_16K_PAGES
+	help
+	  Adopt the qualified running J713 internal display DARTs. Their
+	  firmware-visible allocations, page tables and noncoherent CPU
+	  mappings remain pinned until platform reset. This limited bringup
+	  profile requires the built-in ARM64 DMA implementation; its private
+	  mapping/cache interfaces are not a modular DMA API.
+
+	  Leave this disabled for ordinary DART use, including APPLE_DART=m.
+
 config APPLE_DART_KUNIT_TEST
-	bool "KUnit tests for Apple DART locked domains" if !KUNIT_ALL_TESTS
+	bool "KUnit tests for Apple DART domains and commands" if !KUNIT_ALL_TESTS
 	depends on APPLE_DART=y && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
@@ -325,6 +337,8 @@ config APPLE_DART_KUNIT_TEST
 	  handoff without accessing physical DART hardware. Verify that
 	  legacy display roots can be replaced while newer firmware-owned
 	  roots retain their mappings and reject conflicting host entries.
+	  Verify that unmapping an IOVA maintains independent remap targets.
+	  That case requires kernel pages of at least 16 KiB.
 
 config S390_IOMMU
 	def_bool y if S390 && PCI
@@ -362,15 +376,6 @@ config MTK_IOMMU_V1
 
 	  if unsure, say N here.
 
-config HYPERV_IOMMU
-	bool "Hyper-V IRQ Handling"
-	depends on HYPERV && X86
-	select IOMMU_API
-	default HYPERV
-	help
-	  Stub IOMMU driver to handle IRQs to support Hyper-V Linux
-	  guest and root partitions.
-
 config VIRTIO_IOMMU
 	tristate "Virtio IOMMU driver"
 	depends on VIRTIO
@@ -394,6 +399,17 @@ config SPRD_IOMMU
 	  ISP(image), and CPP(camera pixel processor), etc.
 
 	  Say Y here if you want to use the multimedia devices listed above.
+
+config VSI_IOMMU
+	tristate "Verisilicon IOMMU Support"
+	depends on (ARCH_ROCKCHIP && ARM64) || COMPILE_TEST
+	select IOMMU_API
+	help
+	  Support for IOMMUs used by Verisilicon sub-systems like video
+	  decoders or encoder hardware blocks.
+
+	  Say Y here if you want to use this IOMMU in front of these
+	  hardware blocks.
 
 config IOMMU_DEBUG_PAGEALLOC
 	bool "Debug IOMMU mappings against page allocations"

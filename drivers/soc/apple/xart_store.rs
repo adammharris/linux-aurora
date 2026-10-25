@@ -434,6 +434,14 @@ impl Store {
         Ok(())
     }
 
+    /// The guard's effective level and whether its list was loaded, or
+    /// `None` when no guard runs.
+    pub(crate) fn guard_state(&self) -> Option<(u8, bool)> {
+        self.guard
+            .as_ref()
+            .map(|guard| (guard.effective_level(), guard.list_loaded()))
+    }
+
     /// Byte offset of the APFS-resolved gigalocker extent in the container.
     pub(crate) fn base(&self) -> u64 {
         self.base

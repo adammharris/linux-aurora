@@ -16,25 +16,32 @@ static inline u8 mt7932_domain_5g_bw(void)
  * Extension 1 places the secondary above the primary, 3 below it. Keep 2 GHz
  * at 20 MHz, and 165, which has no 40 MHz pair, at 20 MHz too.
  */
-static inline bool mt7932_channel_layout(u8 primary, u8 width, u8 extension,
-					u8 maximum, u8 *center, u8 *bw)
+static inline bool mt7932_channel_layout(enum nl80211_band band, u8 primary,
+					 u8 width, u8 extension, u8 maximum, u8 *center, u8 *bw)
 {
-	u8 band = mt7932_channel_band(primary);
-	u8 pair = mt7932_channel_ht40_centre(primary);
+	u8 pair = band == NL80211_BAND_6GHZ ? mt7932_channel_6g_center(primary, false) :
+		mt7932_channel_ht40_centre(primary);
 
-	if (!band || maximum > 2 || width > 1)
+	if (!mt7932_channel_band(band, primary) ||
+	    maximum > 2 || width > 1)
 		return false;
 	if (!width && !extension) {
 		*center = primary;
 		*bw = 0;
 		return true;
 	}
-	if (band != 2 || !pair || extension != (pair > primary ? 1 : 3))
+	if ((band != NL80211_BAND_5GHZ && band != NL80211_BAND_6GHZ) ||
+	    !pair || extension != (pair > primary ? 1 : 3))
 		return false;
 	*bw = width ? 2 : 1;
 	if (*bw > maximum)
 		return false;
-	*center = width ? mt7932_channel_vht80_centre(primary) : pair;
+	*center = pair;
+	if (width)
+		*center = band == NL80211_BAND_6GHZ ? mt7932_channel_6g_center(primary, true) :
+			mt7932_channel_vht80_centre(primary);
+	if (!*center)
+		return false;
 	return true;
 }
 

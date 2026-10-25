@@ -13,7 +13,7 @@
  * channels require mt7932_scan_passive() before submission. The body uses
  * a 20 ms dwell and fills the MT7932-specific tail.
  */
-static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq,
+static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq, enum nl80211_band band,
 				   const u8 *channels, unsigned int count)
 {
 	static const u8 ies[] = {0x7f,0x0a,1,0,8,0x8c,1,0x40,0,0,0,0,
@@ -23,8 +23,7 @@ static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq,
 	if (capacity < 0x4d4 || !seq || seq > 127 || !count || count > MT7932_SCAN_CHANNELS)
 		return -EINVAL;
 	for (i = 0; i < count; i++) {
-		if (!mt7932_channel_band(channels[i]) ||
-		    mt7932_channel_band(channels[i]) != mt7932_channel_band(channels[0]))
+		if (!mt7932_channel_band(band, channels[i]))
 			return -EINVAL;
 		for (j = 0; j < i; j++)
 			if (channels[i] == channels[j])
@@ -40,7 +39,7 @@ static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq,
 	body[0x9e] = 4;
 	body[0x9f] = count;
 	for (i = 0; i < count; i++) {
-		body[0xa0 + 2 * i] = mt7932_channel_band(channels[i]);
+		body[0xa0 + 2 * i] = mt7932_channel_band(band, channels[i]);
 		body[0xa1 + 2 * i] = channels[i];
 	}
 	put_unaligned_le16(sizeof(ies), body + 0xe0);
@@ -86,6 +85,33 @@ static inline void mt7932_scan_disconnected_passive(u8 body[0x4d4])
 	put_unaligned_le16(233, body + 0x4ca);
 }
 
+/* CID03 carries up to four directed SSIDs in 36-byte slots (le32 length,
+ * 32 bytes) at offset 8; selector 8 marks a directed request and byte 4
+ * counts the populated slots. Wildcard entries occupy no slot. A directed
+ * request carries no probe IEs.
+ */
+#define MT7932_SCAN_SSIDS 4
+
+static inline int mt7932_scan_ssid_slot(u8 body[0x4d4], const u8 *ssid,
+					size_t ssid_length)
+{
+	u8 slot = body[4];
+
+	if (!ssid_length)
+		return 0;
+	if (ssid_length > 32 || !body[2])
+		return -EINVAL;
+	if (slot >= MT7932_SCAN_SSIDS)
+		return -ENOSPC;
+	body[3] = 8;
+	put_unaligned_le32(ssid_length, body + 8 + 36 * slot);
+	memcpy(body + 12 + 36 * slot, ssid, ssid_length);
+	body[4] = slot + 1;
+	memset(body + 0xe2, 0, 600);
+	put_unaligned_le16(0, body + 0xe0);
+	return 0;
+}
+
 /* This firmware requires its native wildcard template. Directed scans use
  * no probe IEs. Forwarding the normal supplicant extras stalled the scan
  * on J700; arbitrary caller probe-IE carriage remains unsupported here.
@@ -102,31 +128,21 @@ static inline int mt7932_scan_options(u8 body[0x4d4], const u8 *ssid,
 			return -EINVAL;
 		offset += 2 + ies[offset + 1];
 	}
-	if (ssid_length) {
-		body[3] = 8;
-		body[4] = 1;
-		put_unaligned_le32(ssid_length, body + 8);
-		memcpy(body + 12, ssid, ssid_length);
-	}
-	if (ssid_length) {
-		memset(body + 0xe2, 0, 600);
-		put_unaligned_le16(0, body + 0xe0);
-	}
-	return 0;
+	return mt7932_scan_ssid_slot(body, ssid, ssid_length);
 }
 
 /* Original online-scan state retains the BSS/keys and supplies its home
  * channel at the end of CID03. This never narrows the requested scan list.
  * Keep the batch's active/passive dwell settings and native home timing tail.
  */
-static inline int mt7932_scan_home(u8 body[0x4d4], u8 channel)
+static inline int mt7932_scan_home(u8 body[0x4d4], enum nl80211_band band, u8 channel)
 {
-	u8 band = mt7932_channel_band(channel);
+	u8 firmware_band = channel ? mt7932_channel_band(band, channel) : 0;
 
-	if (channel && !band)
+	if (channel && !firmware_band)
 		return -EINVAL;
 	body[0x4cc] = channel;
-	body[0x4cd] = band;
+	body[0x4cd] = firmware_band;
 	return 0;
 }
 

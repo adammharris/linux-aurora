@@ -218,11 +218,11 @@ impl DeviceControlChannel::ver {
 
     /// Allocate a new Device Control channel.
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
     ) -> Result<DeviceControlChannel::ver> {
         Ok(DeviceControlChannel::ver {
-            dev: dev.into(),
+            dev: dev.clone(),
             ch: TxChannel::<ChannelState, DeviceControlMsg::ver>::new(alloc, 0x100)?,
         })
     }
@@ -255,11 +255,11 @@ pub(crate) struct PipeChannel {
 impl PipeChannel::ver {
     /// Allocate a new Pipe submission channel.
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
     ) -> Result<PipeChannel::ver> {
         Ok(PipeChannel::ver {
-            dev: dev.into(),
+            dev: dev.clone(),
             ch: TxChannel::<ChannelState, PipeMsg::ver>::new(alloc, 0x100)?,
         })
     }
@@ -286,12 +286,9 @@ impl FwCtlChannel {
     const COMMAND_TIMEOUT_MS: i64 = 1000;
 
     /// Allocate a new Firmware Control channel.
-    pub(crate) fn new(
-        dev: &AsahiDevice,
-        alloc: &mut gpu::KernelAllocators,
-    ) -> Result<FwCtlChannel> {
+    pub(crate) fn new(dev: AsahiDevice, alloc: &mut gpu::KernelAllocators) -> Result<FwCtlChannel> {
         Ok(FwCtlChannel {
-            dev: dev.into(),
+            dev: dev.clone(),
             ch: TxChannel::<FwCtlChannelState, FwCtlMsg>::new_uncached(alloc, 0x100)?,
         })
     }
@@ -328,13 +325,13 @@ pub(crate) struct EventChannel {
 impl EventChannel::ver {
     /// Allocate a new Event channel.
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
         ev_mgr: Arc<event::EventManager>,
         buf_mgr: buffer::BufferManager::ver,
     ) -> Result<EventChannel::ver> {
         Ok(EventChannel::ver {
-            dev: dev.into(),
+            dev: dev.clone(),
             ch: RxChannel::<ChannelState, RawEventMsg>::new(alloc, 0x100)?,
             ev_mgr,
             buf_mgr,
@@ -470,12 +467,9 @@ impl FwLogChannel {
     const BUF_SIZE: usize = 0x100;
 
     /// Allocate a new Firmware Log channel.
-    pub(crate) fn new(
-        dev: &AsahiDevice,
-        alloc: &mut gpu::KernelAllocators,
-    ) -> Result<FwLogChannel> {
+    pub(crate) fn new(dev: AsahiDevice, alloc: &mut gpu::KernelAllocators) -> Result<FwLogChannel> {
         Ok(FwLogChannel {
-            dev: dev.into(),
+            dev: dev.clone(),
             ch: RxChannel::<FwLogChannelState, RawFwLogMsg>::new(alloc, Self::RING_SIZE)?,
             payload_buf: alloc
                 .shared
@@ -563,11 +557,11 @@ pub(crate) struct KTraceChannel {
 impl KTraceChannel {
     /// Allocate a new KTrace channel.
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
     ) -> Result<KTraceChannel> {
         Ok(KTraceChannel {
-            dev: dev.into(),
+            dev: dev.clone(),
             ch: RxChannel::<ChannelState, RawKTraceMsg>::new(alloc, 0x200)?,
         })
     }
@@ -607,13 +601,13 @@ pub(crate) struct StatsChannel {
 impl StatsChannel::ver {
     /// Allocate a new Statistics channel.
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
         snap: Arc<crate::stats::StatsSnapshot>,
         ts_hz: u64,
     ) -> Result<StatsChannel::ver> {
         Ok(StatsChannel::ver {
-            dev: dev.into(),
+            dev: dev.clone(),
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
             snap,
             ts_hz,
@@ -637,7 +631,7 @@ impl StatsChannel::ver {
                     // accessing the enum view is valid.
                     let msg = unsafe { msg.msg };
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
-                    if *module_parameters::stats_export.value() != 0 {
+                    if module_parameters::stats_export.value() != 0 {
                         // Retain the latest values for /sys/class/drm/card*/
                         // device/agx_stats. Read-only with respect to
                         // scheduling or power behaviour: the firmware already

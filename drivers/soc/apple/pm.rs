@@ -46,7 +46,7 @@ trait SleepHolds {
     /// Holds entropy requests, once any in flight is answered.
     fn hold_entropy(&self);
     /// Ends any Touch ID capture and holds new ones.
-    fn hold_captures(&self) -> Result<()>;
+    fn hold_captures(&self);
     fn release_captures(&self);
     fn release_entropy(&self);
 }
@@ -55,7 +55,7 @@ impl SleepHolds for SepData {
     fn hold_entropy(&self) {
         self.rng_sleep_prepare();
     }
-    fn hold_captures(&self) -> Result<()> {
+    fn hold_captures(&self) {
         self.sleep_prepare()
     }
     fn release_captures(&self) {
@@ -68,20 +68,14 @@ impl SleepHolds for SepData {
 
 /// `entering`: the system is about to sleep; otherwise it has resumed, or
 /// the suspend was aborted.
-fn sleep_event(sep: &impl SleepHolds, entering: bool) -> Result<()> {
+fn sleep_event(sep: &impl SleepHolds, entering: bool) {
     if entering {
         sep.hold_entropy();
-        if let Err(error) = sep.hold_captures() {
-            // A failing notifier is not included in the PM chain's rollback.
-            sep.release_captures();
-            sep.release_entropy();
-            return Err(error);
-        }
+        sep.hold_captures();
     } else {
         sep.release_captures();
         sep.release_entropy();
     }
-    Ok(())
 }
 
 /// # Safety
@@ -95,10 +89,7 @@ unsafe extern "C" fn pm_event(entering: bool) -> c_int {
     // `unregister` only after `sep_pm_unregister` has waited out any running
     // notifier call, so it is live for this borrow.
     let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
-    match sleep_event(&*sep, entering) {
-        Ok(()) => 0,
-        Err(error) => error.to_errno(),
-    }
+    sleep_event(&*sep, entering);
 }
 
 pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
@@ -162,15 +153,13 @@ mod tests {
     struct Calls {
         made: RefCell<[u8; 8]>,
         count: Cell<usize>,
-        refuse: Option<Error>,
     }
 
     impl Calls {
-        fn new(refuse: Option<Error>) -> Self {
+        fn new() -> Self {
             Calls {
                 made: RefCell::new([0; 8]),
                 count: Cell::new(0),
-                refuse,
             }
         }
         fn call(&self, which: u8) {
@@ -187,9 +176,8 @@ mod tests {
         fn hold_entropy(&self) {
             self.call(HOLD_ENTROPY);
         }
-        fn hold_captures(&self) -> Result<()> {
+        fn hold_captures(&self) {
             self.call(HOLD_CAPTURES);
-            self.refuse.map_or(Ok(()), Err)
         }
         fn release_captures(&self) {
             self.call(RELEASE_CAPTURES);
@@ -201,8 +189,8 @@ mod tests {
 
     #[test]
     fn going_to_sleep_holds_entropy_then_captures() {
-        let calls = Calls::new(None);
-        assert_eq!(sleep_event(&calls, true), Ok(()));
+        let calls = Calls::new();
+        sleep_event(&calls, true);
         assert_eq!(
             calls.made(),
             [HOLD_ENTROPY, HOLD_CAPTURES, 0, 0, 0, 0, 0, 0]
@@ -210,29 +198,21 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_sleep_releases_what_it_held() {
-        // The chain sends no POST event to the notifier that failed.
-        let calls = Calls::new(Some(EBUSY));
-        assert_eq!(sleep_event(&calls, true), Err(EBUSY));
+    fn sleep_holds_stay_until_the_post_event() {
+        let calls = Calls::new();
+        sleep_event(&calls, true);
+        assert_eq!(calls.count.get(), 2);
+        sleep_event(&calls, false);
         assert_eq!(
             calls.made(),
-            [
-                HOLD_ENTROPY,
-                HOLD_CAPTURES,
-                RELEASE_CAPTURES,
-                RELEASE_ENTROPY,
-                0,
-                0,
-                0,
-                0
-            ]
+            [HOLD_ENTROPY, HOLD_CAPTURES, RELEASE_CAPTURES, RELEASE_ENTROPY, 0, 0, 0, 0]
         );
     }
 
     #[test]
     fn waking_releases_captures_then_entropy() {
-        let calls = Calls::new(None);
-        assert_eq!(sleep_event(&calls, false), Ok(()));
+        let calls = Calls::new();
+        sleep_event(&calls, false);
         assert_eq!(
             calls.made(),
             [RELEASE_CAPTURES, RELEASE_ENTROPY, 0, 0, 0, 0, 0, 0]

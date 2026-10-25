@@ -242,6 +242,18 @@ static ssize_t process_vm_rw_core(pid_t pid, struct iov_iter *iter,
 	if (nr_pages == 0)
 		return 0;
 
+	/* Subpage kernels allocate only after choosing the page-array path. */
+	if (!IS_ENABLED(CONFIG_MM_SUBPAGE) && nr_pages > PVM_MAX_PP_ARRAY_COUNT) {
+		/* For reliability don't try to kmalloc more than
+		   2 pages worth */
+		process_pages = kmalloc(min_t(size_t, PVM_MAX_KMALLOC_PAGES * PAGE_SIZE,
+					      sizeof(struct page *)*nr_pages),
+					GFP_KERNEL);
+
+		if (!process_pages)
+			return -ENOMEM;
+	}
+
 	/* Get process information */
 	task = find_get_task_by_vpid(pid);
 	if (!task) {
@@ -269,7 +281,7 @@ static ssize_t process_vm_rw_core(pid_t pid, struct iov_iter *iter,
 		goto copied;
 	}
 #endif
-	if (nr_pages > PVM_MAX_PP_ARRAY_COUNT) {
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE) && nr_pages > PVM_MAX_PP_ARRAY_COUNT) {
 		/* For reliability don't try to kmalloc more than
 		   2 pages worth */
 		process_pages = kmalloc(min_t(size_t, PVM_MAX_KMALLOC_PAGES * PAGE_SIZE,

@@ -14,6 +14,7 @@
 #include <linux/pm_qos.h>
 #include <linux/component.h>
 #include <linux/usb/of.h>
+#include <linux/of.h>
 
 #include "hub.h"
 
@@ -379,6 +380,9 @@ static void usb_port_device_release(struct device *dev)
 {
 	struct usb_port *port_dev = to_usb_port(dev);
 
+	of_node_put(port_dev->connector_node);
+	usb_put_dev(port_dev->reconnect_hs);
+	usb_put_dev(port_dev->reconnect_ss);
 	kfree(port_dev->req);
 	kfree(port_dev);
 }
@@ -681,6 +685,28 @@ static int match_location(struct usb_device *peer_hdev, void *p)
 	return 0;
 }
 
+/* usb_port_peer_mutex serializes this with port removal and other peering. */
+static int match_connector(struct usb_device *hdev, void *data)
+{
+	struct usb_port *port = data;
+	struct usb_device *parent = to_usb_device(port->dev.parent->parent);
+	struct usb_hub *hub = usb_hub_to_struct_hub(hdev);
+
+	if (!hub || bus_to_hcd(hdev->bus) != bus_to_hcd(parent->bus)->shared_hcd)
+		return 0;
+
+	for (int i = 0; i < hdev->maxchild; i++) {
+		struct usb_port *peer = hub->ports[i];
+
+		if (peer && peer->is_superspeed != port->is_superspeed &&
+		    peer->connector_node == port->connector_node) {
+			link_peers_report(port, peer);
+			return 1;
+		}
+	}
+	return 0;
+}
+
 /*
  * Find the peer port either via explicit platform firmware "location"
  * data, the peer hcd for root hubs, or the upstream peer relationship
@@ -699,6 +725,10 @@ static void find_and_link_peer(struct usb_hub *hub, int port1)
 	 * situation where we need to go back and undo a default peering
 	 * when the port is later peered by location data)
 	 */
+	if (port_dev->connector_node) {
+		usb_for_each_dev(port_dev, match_connector);
+		return;
+	}
 	if (port_dev->location) {
 		/* we link the peer in match_location() if found */
 		usb_for_each_dev(port_dev, match_location);
@@ -735,7 +765,7 @@ static void find_and_link_peer(struct usb_hub *hub, int port1)
 	 * does not have location data
 	 */
 	peer = peer_hub->ports[port1 - 1];
-	if (peer && peer->location == 0)
+	if (peer && !peer->connector_node && peer->location == 0)
 		link_peers_report(port_dev, peer);
 }
 
@@ -799,6 +829,7 @@ int usb_hub_create_port_device(struct usb_hub *hub, int port1)
 	}
 
 	port_dev->connect_type = usb_of_get_connect_type(hdev, port1);
+	port_dev->connector_node = usb_of_get_port_connector(hdev, port1);
 	hub->ports[port1 - 1] = port_dev;
 	port_dev->portnum = port1;
 	set_bit(port1, hub->power_bits);

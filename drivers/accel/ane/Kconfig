@@ -21,3 +21,15 @@ config DRM_ACCEL_ANE
 	  To compile this driver as modules, choose M here: the module for
 	  the M1 family will be called ane, and the module for the M2 family
 	  will be called ane_t6021.
+
+config DRM_ACCEL_ANE_KUNIT_TEST
+	tristate "KUnit tests for the Apple Neural Engine driver" if !KUNIT_ALL_TESTS
+	depends on DRM_ACCEL_ANE && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Build KUnit tests for the Apple Neural Engine driver. They check
+	  the buffer sizes that DRM_IOCTL_ANE_SUBMIT accepts against the
+	  task descriptor layout that userspace builds, at the limits, one
+	  past them and with a size product that overflows.
+
+	  If unsure, say N.

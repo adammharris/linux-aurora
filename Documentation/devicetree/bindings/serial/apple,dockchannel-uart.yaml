@@ -36,11 +36,36 @@ properties:
   interrupts:
     maxItems: 1
 
+  apple,channel:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 15
+    default: 0
+    description:
+      Index of this channel within its DockChannel block. Channel n owns
+      bits 2n (TX) and 2n + 1 (RX) of the shared interrupt mask and flag
+      registers.
+
+  apple,sw-drain:
+    type: boolean
+    description:
+      The channel does not raise an interrupt when data arrives, and its RX
+      FIFO is drained in software instead. This mirrors the enable-sw-drain
+      property of the channel's Apple device tree node. The interrupt, if
+      described, is not used.
+
 required:
   - compatible
   - reg
   - reg-names
-  - interrupts
+
+if:
+  not:
+    required:
+      - apple,sw-drain
+then:
+  required:
+    - interrupts
 
 unevaluatedProperties: false
 

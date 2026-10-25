@@ -25,8 +25,10 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmc.h>
 #include <linux/workqueue.h>
@@ -50,18 +52,23 @@ enum apple_clpc_rail {
 /**
  * struct apple_clpc_hw - per-SoC CLPC parameters
  * @rail: PMC rail of the DCS and of the fabric
+ * @sustain: consecutive busy samples before a cluster requests a state;
+ *	0 or 1 for the first
  * @map: state of each rail for a busy cluster below 25, 50, 75 and 100
  *	percent of its maximum frequency
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
+	unsigned int sustain;
 	u8 map[APPLE_CLPC_RAILS][APPLE_CLPC_LEVELS];
+	bool gpu_demand;
 };
 
 struct apple_clpc_cluster {
 	unsigned int policy_cpu;
 	cpumask_var_t cpus;
 	unsigned int busy;
+	unsigned int streak;
 	unsigned int level;
 	unsigned int request[APPLE_CLPC_RAILS];
 };
@@ -92,6 +99,8 @@ struct apple_clpc {
 	unsigned long samples;
 	unsigned long update_errors;
 	struct dentry *debugfs;
+	struct regmap *gpu_pmgr;
+	u32 gpu_offset;
 };
 
 /* cpufreq policies can appear after probe; pick up new ones as they do. */
@@ -167,8 +176,13 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 
 	q = min_t(unsigned int, cl->level / (100 / APPLE_CLPC_LEVELS),
 		  APPLE_CLPC_LEVELS - 1);
+	if (busy < APPLE_CLPC_BUSY_PCT)
+		cl->streak = 0;
+	else if (cl->streak < clpc->hw->sustain)
+		cl->streak++;
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		cl->request[rail] = busy >= APPLE_CLPC_BUSY_PCT ?
+		cl->request[rail] = busy >= APPLE_CLPC_BUSY_PCT &&
+				    cl->streak >= clpc->hw->sustain ?
 				   clpc->hw->map[rail][q] : 0;
 }
 
@@ -233,6 +247,17 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 		apple_clpc_sample_cluster(clpc, cl);
 		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 			demand[rail] = max(demand[rail], cl->request[rail]);
+	}
+	if (clpc->gpu_pmgr) {
+		u32 status;
+
+		/* Keep the qualified floor while graphics is powered. A failed
+		 * read must not silently starve a running graphics consumer.
+		 */
+		if (regmap_read(clpc->gpu_pmgr, clpc->gpu_offset, &status) ||
+		    (status & GENMASK(7, 4)) == GENMASK(7, 4))
+			for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+				demand[rail] = clpc->hw->map[rail][APPLE_CLPC_LEVELS - 1];
 	}
 
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
@@ -340,6 +365,20 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->dev = dev;
 	clpc->pmc = dev->parent;
 	clpc->hw = of_device_get_match_data(dev);
+	if (clpc->hw->gpu_demand) {
+		struct device_node *gpu = of_parse_phandle(dev->of_node,
+							 "apple,gpu-power-state", 0);
+
+		if (!gpu)
+			return dev_err_probe(dev, -EINVAL, "missing graphics power state\n");
+		ret = of_property_read_u32(gpu, "reg", &clpc->gpu_offset);
+		clpc->gpu_pmgr = syscon_node_to_regmap(gpu->parent);
+		of_node_put(gpu);
+		if (ret)
+			return ret;
+		if (IS_ERR(clpc->gpu_pmgr))
+			return PTR_ERR(clpc->gpu_pmgr);
+	}
 	if (!apple_pmc_rail_count(clpc->pmc))
 		return dev_err_probe(dev, -ENODEV, "parent is not a PMC\n");
 
@@ -423,21 +462,66 @@ static int apple_clpc_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(apple_clpc_pm_ops, apple_clpc_suspend,
 				apple_clpc_resume);
 
+/* Only the stock M5/F3 busy floor is qualified on T8132. Do not invent
+ * intermediate frequency-to-memory tables; idle can still release the vote.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 5, 5, 5, 5 },
+		[APPLE_CLPC_SOC] = { 3, 3, 3, 3 },
+	},
+	.gpu_demand = true,
+};
+
 /*
  * T8140: DCS states 0-4 on rail 0, fabric states 0-3 on rail 1. A busy
- * cluster raises the DCS one state per frequency quartile and leaves the
- * fabric alone.
+ * cluster raises the DCS one state per frequency quartile; only a cluster
+ * at its top quartile also raises the fabric.
+ *
+ * GPU work needs both rails at their top states: the GPU firmware takes up
+ * and completes every command over the fabric. With the fabric left at
+ * state 0, light GPU submissions take 30-50% longer than at state 3, and
+ * macOS holds the fabric at its top states while such work streams. The
+ * graphics power state is on only while the GPU has work (the firmware
+ * powers it off when idle), so the floor follows GPU activity and is
+ * released HOLD_MS after it stops.
  */
 static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
 	.map = {
 		[APPLE_CLPC_DCS] = { 1, 2, 3, 4 },
-		[APPLE_CLPC_SOC] = { 0, 0, 0, 0 },
+		[APPLE_CLPC_SOC] = { 0, 0, 0, 3 },
 	},
+	.gpu_demand = true,
+};
+
+/*
+ * T6040: DCS states 0-5 on rail 0, fabric states 0-2 on rail 1. No cluster
+ * runs below a quarter of its maximum (P 1260 of 4512 MHz, E 1020 of
+ * 2592 MHz), so the first column only completes the table. A busy cluster
+ * in the upper half asks for the top states. With the floor held at DCS 5
+ * and fabric 2 the CPUs read 237-242 GB/s at 135 ns DRAM latency, against
+ * 41 GB/s and 314 ns at 0 and 0. The second column is provisional until the
+ * power of each DCS state is measured.
+ *
+ * A cluster requests only after three busy samples in a row (12 ms). At idle
+ * a single busy sample raised the floor about 60 % of the time, from short
+ * bursts of background work; three in a row bring that to about 11 %.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 1, 2, 5, 5 },
+		[APPLE_CLPC_SOC] = { 0, 1, 2, 2 },
+	},
+	.sustain = 3,
 };
 
 static const struct of_device_id apple_clpc_of_match[] = {
+	{ .compatible = "apple,t8132-clpc", .data = &apple_clpc_hw_t8132 },
 	{ .compatible = "apple,t8140-clpc", .data = &apple_clpc_hw_t8140 },
+	{ .compatible = "apple,t6041-clpc", .data = &apple_clpc_hw_t6040 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_clpc_of_match);

@@ -482,16 +482,16 @@
 			status = "disabled";
 		};
 
-		uat_handoff: uat-handoff {
-			reg = <0 0 0 0>;
+		uat_handoff: uat-handoff@10 {
+			reg = <0 0x10 0 0>;
 		};
 
-		uat_pagetables: uat-pagetables {
-			reg = <0 0 0 0>;
+		uat_pagetables: uat-pagetables@20 {
+			reg = <0 0x20 0 0>;
 		};
 
-		uat_ttbs: uat-ttbs {
-			reg = <0 0 0 0>;
+		uat_ttbs: uat-ttbs@30 {
+			reg = <0 0x30 0 0>;
 		};
 	};
 
@@ -701,22 +701,20 @@
 		disp0_dart: iommu@231304000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
 			reg = <0x2 0x31304000 0x0 0x4000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 553 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_disp0_cpu0>;
-			apple,dma-range = <0x0 0x0 0xf 0xffff0000>;
 			status = "disabled";
 		};
 
 		dcp_dart: iommu@23130c000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
 			reg = <0x2 0x3130c000 0x0 0x4000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 553 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_disp0_cpu0>;
-			apple,dma-range = <0x8 0x00000000 0x7 0xffff0000>;
 		};
 
 		dcp_mbox: mbox@231c08000 {
@@ -738,7 +736,7 @@
 			compatible = "apple,t8112-dcp", "apple,dcp";
 			mboxes = <&dcp_mbox>;
 			mbox-names = "mbox";
-			iommus = <&dcp_dart 5>;
+			iommus = <&dcp_dart 5 0x8 0x00000000 0x7 0xffff0000>;
 
 			/* the ADT has 2 additional regs which seems to be unused */
 			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
@@ -762,7 +760,7 @@
 			#size-cells = <2>;
 
 			disp0_piodma: piodma {
-				iommus = <&disp0_dart 4>;
+				iommus = <&disp0_dart 4 0x0 0x0 0xf 0xffff0000>;
 				phandle = <&disp0_piodma>;
 			};
 
@@ -781,7 +779,7 @@
 		display: display-subsystem {
 			compatible = "apple,display-subsystem";
 			/* disp_dart0 must be 1st since it is locked */
-			iommus = <&disp0_dart 0>;
+			iommus = <&disp0_dart 0 0x0 0x0 0xf 0xffff0000>;
 			/* generate phandle explicitly for use in loader */
 			phandle = <&display>;
 		};
@@ -1246,6 +1244,12 @@
 			/* child nodes are added in t8103-pmgr.dtsi */
 		};
 
+		cio_reset: reset-controller@23b790000 {
+			compatible = "apple,t8112-cio-reset", "apple,t8103-cio-reset";
+			reg = <0x2 0x3b790000 0x0 0x8000>;
+			#reset-cells = <1>;
+		};
+
 		pmp_mbox: mbox@23bc08000 {
 			compatible = "apple,t8112-asc-mailbox", "apple,asc-mailbox-v4";
 			reg = <0x2 0x3bc08000 0x0 0x4000>;
@@ -1258,12 +1262,6 @@
 				"recv-empty", "recv-not-empty";
 			#mbox-cells = <0>;
 			power-domains = <&ps_pmp>, <&ps_pms_sram>;
-		};
-
-		cio_reset: reset-controller@23b790000 {
-			compatible = "apple,t8112-cio-reset", "apple,t8103-cio-reset";
-			reg = <0x2 0x3b790000 0x0 0x8000>;
-			#reset-cells = <1>;
 		};
 
 		pinctrl_ap: pinctrl@23c100000 {
@@ -1460,16 +1458,16 @@
 				#gpio-cells = <2>;
 			};
 
-			smc_hwmon: hwmon {
-				compatible = "apple,smc-hwmon";
-			};
-
 			smc_reboot: reboot {
 				compatible = "apple,smc-reboot";
 				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
 					<&boot_error_count>, <&panic_count>, <&pm_setting>;
 				nvmem-cell-names = "shutdown_flag", "boot_stage",
 					"boot_error_count", "panic_count", "pm_setting";
+			};
+
+			smc_hwmon: hwmon {
+				compatible = "apple,smc-hwmon";
 			};
 
 			rtc {
@@ -1716,7 +1714,7 @@
 			#mbox-cells = <0>;
 		};
 
-		avd: avd@268000000 {
+		avd: avd@269080000 {
 			compatible = "apple,t8112-avd";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 667 IRQ_TYPE_LEVEL_HIGH>,
@@ -1805,8 +1803,7 @@
 		dispext0_dart: iommu@271304000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
 			reg = <0x2 0x71304000 0x0 0x4000>;
-			#iommu-cells = <1>;
-			apple,dma-range = <0x0 0x0 0xf 0xffff0000>;
+			#iommu-cells = <5>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 593 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_dispext_cpu0>;
@@ -1816,8 +1813,7 @@
 		dcpext_dart: iommu@27130c000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
 			reg = <0x2 0x7130c000 0x0 0x4000>;
-			#iommu-cells = <1>;
-			apple,dma-range = <0x8 0x0 0x7 0xffff0000>;
+			#iommu-cells = <5>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 593 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_dispext_cpu0>;
@@ -1844,7 +1840,7 @@
 			compatible = "apple,t8112-dcpext", "apple,dcpext";
 			mboxes = <&dcpext_mbox>;
 			mbox-names = "mbox";
-			iommus = <&dcpext_dart 5>;
+			iommus = <&dcpext_dart 5 0x8 0x00000000 0x7 0xffff0000>;
 			phandle = <&dcpext>;
 
 			/* the ADT has 2 additional regs which seems to be unused */
@@ -1870,7 +1866,7 @@
 			#size-cells = <2>;
 
 			piodma {
-				iommus = <&dispext0_dart 4>;
+				iommus = <&dispext0_dart 4 0x0 0x0 0xf 0xffff0000>;
 			};
 
 			ports {
@@ -2525,3 +2521,4 @@
 };
 
 #include "t8112-pmgr.dtsi"
+#include "hwmon-common.dtsi"

@@ -12,3 +12,5 @@ obj-$(CONFIG_TYPEC_STUSB160X) 	+= stusb160x.o
 obj-$(CONFIG_TYPEC_RT1719)	+= rt1719.o
 obj-$(CONFIG_TYPEC_WUSB3801)	+= wusb3801.o
 obj-$(CONFIG_TYPEC)		+= mux/
+obj-$(CONFIG_TYPEC_MUX_KUNIT_TEST)	+= typec-mux-test.o
+typec-mux-test-y		:= mux-test.o typec-mux-test.dtbo.o

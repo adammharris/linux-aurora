@@ -385,8 +385,13 @@ void brcmf_fweh_detach(struct brcmf_pub *drvr)
 	if (!fweh)
 		return;
 
-	/* cancel the worker if initialized */
+	/* Stop the worker if initialized. brcmf_detach() calls this with the
+	 * event producers stopped, before its interfaces go away, so first run
+	 * the events still queued: a worker that was queued but had not started
+	 * would otherwise be cancelled with its events left on the queue.
+	 */
 	if (fweh->event_work.func) {
+		flush_work(&fweh->event_work);
 		cancel_work_sync(&fweh->event_work);
 		WARN_ON(!list_empty(&fweh->event_q));
 	}

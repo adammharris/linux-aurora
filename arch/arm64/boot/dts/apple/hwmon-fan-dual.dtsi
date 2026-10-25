@@ -11,6 +11,7 @@
 	fan-F0Ac {
 		label = "Fan 1";
 	};
+
 	fan-F1Ac {
 		apple,key-id = "F1Ac";
 		label = "Fan 2";

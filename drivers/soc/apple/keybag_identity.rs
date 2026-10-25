@@ -45,47 +45,52 @@ impl SnapshotIdentity {
     }
 }
 
-#[cfg(test)]
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_keybag_identity)]
 mod tests {
     use super::*;
+    use kernel::prelude::*;
+
     const LOOKUP: [u8; 16] = [1; 16];
     const BAG: [u8; 16] = [2; 16];
     const OTHER: [u8; 16] = [3; 16];
 
     #[test]
-    fn sepos13_keeps_lookup_and_bag_identities_distinct() {
-        let proof = SnapshotIdentity::from_loaded(
-            LOOKUP, UuidProvenance::AsGenerated, BAG, true,
-        ).unwrap();
+    fn sepos13_keeps_lookup_and_bag_identities_distinct() -> Result {
+        let proof = SnapshotIdentity::from_loaded(LOOKUP, UuidProvenance::AsGenerated, BAG, true)
+            .ok_or(EINVAL)?;
         assert!(proof.accepts(&LOOKUP, UuidProvenance::AsGenerated, &BAG));
         assert!(!proof.accepts(&BAG, UuidProvenance::AsGenerated, &BAG));
         assert!(!proof.accepts(&LOOKUP, UuidProvenance::AsGenerated, &LOOKUP));
+        Ok(())
     }
 
     #[test]
-    fn changed_record_or_designated_bag_is_rejected() {
-        let proof = SnapshotIdentity::from_loaded(
-            LOOKUP, UuidProvenance::AsGenerated, BAG, true,
-        ).unwrap();
+    fn changed_record_or_designated_bag_is_rejected() -> Result {
+        let proof = SnapshotIdentity::from_loaded(LOOKUP, UuidProvenance::AsGenerated, BAG, true)
+            .ok_or(EINVAL)?;
         assert!(!proof.accepts(&OTHER, UuidProvenance::AsGenerated, &BAG));
         assert!(!proof.accepts(&LOOKUP, UuidProvenance::ReadBackFromBag, &BAG));
         assert!(!proof.accepts(&LOOKUP, UuidProvenance::AsGenerated, &OTHER));
+        Ok(())
     }
 
     #[test]
-    fn blob_recovery_keeps_strict_uuid_equality() {
+    fn blob_recovery_keeps_strict_uuid_equality() -> Result {
         for provenance in [UuidProvenance::AsGenerated, UuidProvenance::ReadBackFromBag] {
             assert!(SnapshotIdentity::from_loaded(LOOKUP, provenance, BAG, false).is_none());
-            let proof = SnapshotIdentity::from_loaded(BAG, provenance, BAG, false).unwrap();
+            let proof = SnapshotIdentity::from_loaded(BAG, provenance, BAG, false).ok_or(EINVAL)?;
             assert!(proof.accepts(&BAG, provenance, &BAG));
             assert!(!proof.accepts(&BAG, provenance, &OTHER));
         }
+        Ok(())
     }
 
     #[test]
     fn readback_record_cannot_claim_generated_lookup() {
-        assert!(SnapshotIdentity::from_loaded(
-            LOOKUP, UuidProvenance::ReadBackFromBag, BAG, true,
-        ).is_none());
+        assert!(
+            SnapshotIdentity::from_loaded(LOOKUP, UuidProvenance::ReadBackFromBag, BAG, true)
+                .is_none()
+        );
     }
 }

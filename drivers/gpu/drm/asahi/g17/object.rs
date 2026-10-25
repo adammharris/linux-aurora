@@ -21,7 +21,7 @@ use kernel::{
     prelude::*, //
 };
 
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice;
 use crate::{
     gem,
     mmu, //
@@ -68,7 +68,7 @@ unsafe impl Sync for KernelObject {}
 impl KernelObject {
     /// Allocates a zeroed object of `size` bytes and maps it into `vm`.
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         placement: Placement,
         size: usize,
@@ -78,22 +78,32 @@ impl KernelObject {
         let mut this = Self::backing(dev, size, cpu)?;
         let mapping = match placement {
             Placement::At(addr) => this.obj.map_at(vm, addr, prot, false)?,
-            Placement::In(range, align) => this.obj.map_into_range(vm, range, align, prot, true)?,
+            Placement::In(range, align) => {
+                let site = if range.start >= crate::hw::t8140::dynamic::LOWER.start
+                    && range.end <= crate::hw::t8140::dynamic::LOWER.end {
+                    super::capacity::Site::LowerVa
+                } else {
+                    super::capacity::Site::UpperVa
+                };
+                this.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
+                    if error == ENOSPC { super::capacity::refused(site) } else { error }
+                })?
+            }
         };
         this.mapping = Some(mapping);
         Ok(this)
     }
 
     /// Allocates CPU-accessible backing whose GPU mappings will be installed later.
-    pub(crate) fn backing(dev: &AsahiDevice, size: usize, cpu: CpuMap) -> Result<Self> {
+    pub(crate) fn backing(dev: &AsahiDrmDevice, size: usize, cpu: CpuMap) -> Result<Self> {
         let mut obj = match cpu {
             CpuMap::WriteBack => gem::new_kernel_object(dev, size)?,
             CpuMap::WriteCombined => gem::new_kernel_object_wc(dev, size)?,
         };
-        let mut vmap = obj.vmap()?;
-        vmap.memset(0);
-        let ptr = NonNull::new(vmap.as_mut_ptr()).ok_or(ENOMEM)?;
-        core::mem::drop(vmap);
+        let vmap = obj.vmap()?;
+        let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
+        // SAFETY: The mapping covers the whole object.
+        unsafe { ptr.as_ptr().write_bytes(0, kernel::drm::gem::BaseObject::size(vmap.owner())) };
 
         // INVARIANT: `vmap()` created the owned kernel mapping of `obj` that `ptr` points into,
         // and `obj` keeps it until it is dropped.
@@ -113,6 +123,9 @@ impl KernelObject {
         prot: mmu::Prot,
     ) -> Result<mmu::KernelMapping> {
         gem::ObjectRef::new(self.obj.gem.clone()).map_at(vm, addr, prot, false)
+            .map_err(|error| if error == ENOSPC {
+                super::capacity::refused(super::capacity::Site::AliasVa)
+            } else { error })
     }
 
     /// Reuses only a complete alias of this exact retained backing. Permanent
@@ -159,6 +172,20 @@ impl KernelObject {
         prot: mmu::Prot,
     ) -> Result<mmu::KernelMapping> {
         gem::ObjectRef::new(self.obj.gem.clone()).map_into_range(vm, range, align, prot, false)
+            .map_err(|error| if error == ENOSPC {
+                super::capacity::refused(super::capacity::Site::AliasVa)
+            } else { error })
+    }
+
+    fn alias_in_lowest(
+        &self,
+        vm: &mmu::Vm,
+        range: Range<u64>,
+        align: u64,
+        prot: mmu::Prot,
+        guard_size: usize,
+    ) -> Result<mmu::KernelMapping> {
+        vm.map_in_range_lowest(&self.obj.gem, 0..self.size, align, range, prot, guard_size)
     }
 
     /// Maps an exact backing subrange, retaining an explicit unmapped guard.
@@ -192,7 +219,7 @@ impl KernelObject {
     }
 
     /// Returns a reference-counted kernel mapping of the object.
-    pub(crate) fn kernel_map(&self) -> Result<shmem::VMap<gem::AsahiObject, u8>> {
+    pub(crate) fn kernel_map(&self) -> Result<shmem::VMapOwned<gem::AsahiObject>> {
         self.obj.gem.owned_vmap()
     }
 
@@ -298,7 +325,7 @@ impl KernelObject {
 /// Allocation domains shared by the G17 resource builders. Dynamic objects
 /// retain a guard page; aliases keep the existing backing and its exact VA.
 pub(crate) struct Allocator<'a> {
-    pub(crate) dev: &'a AsahiDevice,
+    pub(crate) dev: &'a AsahiDrmDevice,
     pub(crate) uat: &'a mmu::Uat,
 }
 
@@ -340,6 +367,76 @@ impl Allocator<'_> {
             prot,
             cpu,
         )
+    }
+
+    /// Place fresh backing at one address in the canonical and both alias VMs.
+    /// A client may retain mappings after their canonical reservation is freed.
+    /// Retry only address collisions, keeping the same backing throughout.
+    pub(crate) fn lower_with_aliases(
+        &self,
+        size: usize,
+        align: u64,
+        prot: mmu::Prot,
+        cpu: CpuMap,
+        aliases: [&mmu::Vm; 2],
+    ) -> Result<(KernelObject, [mmu::KernelMapping; 2])> {
+        if size == 0 || size % mmu::UAT_PGSZ != 0 {
+            return Err(EINVAL);
+        }
+        let mut object = KernelObject::backing(self.dev, size, cpu)?;
+        let mut range = crate::hw::t8140::dynamic::LOWER;
+        let mut searching = false;
+        loop {
+            // Keep ordinary best-fit placement on the uncontended path. A
+            // collision starts a lowest-address search over the whole arena.
+            let mapping = (if searching {
+                object.alias_in_lowest(
+                    self.uat.kernel_lower_vm(), range.clone(), align, prot, mmu::UAT_PGSZ,
+                )
+            } else {
+                object.obj.map_into_range(
+                    self.uat.kernel_lower_vm(), range.clone(), align, prot, true,
+                )
+            }).map_err(|error| if error == ENOSPC {
+                crate::g17::capacity::refused(crate::g17::capacity::Site::LowerVa)
+            } else { error })?;
+            let address = mapping.iova();
+            let end = address.checked_add(size as u64).ok_or(EOVERFLOW)?;
+            // Partial aliases are destroyed before releasing the canonical
+            // reservation, so a retry cannot expose its address prematurely.
+            let mapped: core::result::Result<_, (Error, usize)> = (|| {
+                let first = object.map_alias(aliases[0], address, prot)
+                    .map_err(|error| (error, 0))?;
+                let second = object.map_alias(aliases[1], address, prot)
+                    .map_err(|error| (error, 1))?;
+                Ok([first, second])
+            })();
+            match mapped {
+                Ok(mapped) => {
+                    object.mapping = Some(mapping);
+                    return Ok((object, mapped));
+                }
+                Err((error, index)) if error == ENOSPC && end < range.end => {
+                    drop(mapping);
+                    let start = if searching {
+                        address + mmu::UAT_PGSZ as u64
+                    } else {
+                        range.start
+                    };
+                    // Jump to an actual hole in the VM that refused the alias,
+                    // rather than remapping backing at every intervening page.
+                    let candidate = object.alias_in_lowest(
+                        aliases[index], start..range.end, align, prot, 0,
+                    ).map_err(|error| if error == ENOSPC {
+                        crate::g17::capacity::refused(crate::g17::capacity::Site::AliasVa)
+                    } else { error })?;
+                    range.start = candidate.iova();
+                    drop(candidate);
+                    searching = true;
+                }
+                Err((error, _)) => return Err(error),
+            }
+        }
     }
 }
 
@@ -575,5 +672,18 @@ impl Pool {
             // Mapping teardown must not run while the pool mutex is held.
             drop(entry);
         }
+    }
+}
+
+impl Pool {
+    pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let inner = self.inner.lock();
+        for family in 0..POOL_FAMILIES {
+            let entries = &inner.returned[family * POOL_SLOTS..(family + 1) * POOL_SLOTS];
+            writeln!(f, "cached_objects_{} used={} total={} returned={} poisoned={}", family,
+                     inner.reserved[family], POOL_SLOTS, entries.iter().flatten().count(),
+                     entries.iter().flatten().filter(|entry| entry.poisoned).count())?;
+        }
+        writeln!(f, "cached_object_bytes used={} total={}", inner.bytes, POOL_BYTES)
     }
 }

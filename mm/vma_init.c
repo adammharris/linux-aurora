@@ -5,6 +5,10 @@
  * between CONFIG_MMU and non-CONFIG_MMU kernel configurations.
  */
 
+/*
+ * To allow for userland testing we place internal dependencies in
+ * vma_internal.h and external VMA API declarations in vma.h.
+ */
 #include "vma_internal.h"
 #include "vma.h"
 
@@ -46,10 +50,9 @@ static void vm_area_init_from(const struct vm_area_struct *src,
 	dest->vm_start = src->vm_start;
 	dest->vm_end = src->vm_end;
 	dest->anon_vma = src->anon_vma;
-	vma_set_page_offset(dest, (struct vm_page_offset) {
-		.index = src->vm_pgoff,
-		.offset = vma_subpage_offset(src),
-	});
+	dest->vm_pgoff = vma_start_pgoff(src);
+	__vma_set_anon_pgoff(dest, vma_start_anon_pgoff(src));
+	vma_set_subpage_offset(dest, vma_subpage_offset(src));
 	dest->vm_file = src->vm_file;
 	dest->vm_private_data = src->vm_private_data;
 	vm_flags_init(dest, src->vm_flags);

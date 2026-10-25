@@ -193,8 +193,7 @@ impl Vm {
     }
 
     pub(crate) fn translate_iova(&self, address: u64) -> Result<u64> {
-        self.inner
-            .exec_lock(None, false)?
+        lock_vm(&self.gpuvm, None, false)?
             .page_table
             .translate_iova(address)
     }

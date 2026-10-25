@@ -64,7 +64,8 @@
 };
 
 &display {
-	iommus = <&dispext0_dart 0>, <&dispext1_dart 0>;
+	iommus = <&dispext0_dart 0 0x100 0x0 0x10 0x0>,
+		 <&dispext1_dart 0 0x100 0x0 0x10 0x0>;
 };
 
 &dispext1_dart {
@@ -257,7 +258,7 @@
 	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
 };
 
-&hpm3  {
+&hpm3 {
 	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
 };
 

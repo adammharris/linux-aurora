@@ -46,13 +46,11 @@
 
 #define DIE
 #define DIE_NO 0
+#define SOC_NODE {/soc}
 
-&{/soc} {
-	#include "t602x-die0.dtsi"
-	#include "t602x-dieX.dtsi"
-	#include "t602x-nvme.dtsi"
-};
-
+#include "t602x-die0.dtsi"
+#include "t602x-dieX.dtsi"
+#include "t602x-nvme.dtsi"
 #include "t602x-gpio-pins.dtsi"
 #include "t602x-pmgr.dtsi"
 
@@ -85,6 +83,8 @@
 	apple,ppm-filter-time-constant-ms = <34>;
 	apple,ppm-ki = <18.0>;
 };
+
+#include "hwmon-common.dtsi"
 
 /*
  * The ANE has run on the M2 Pro and the M2 Max, so enable it here with its

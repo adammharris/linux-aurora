@@ -747,8 +747,6 @@ static int posix_acl_fix_xattr_common(const void *value, size_t size)
 	count = posix_acl_xattr_count(size);
 	if (count < 0)
 		return -EINVAL;
-	if (count == 0)
-		return 0;
 
 	return count;
 }
@@ -1133,7 +1131,7 @@ retry_deleg:
 	if (error)
 		goto out_inode_unlock;
 
-	error = try_break_deleg(inode, &delegated_inode);
+	error = try_break_deleg(inode, 0, &delegated_inode);
 	if (error)
 		goto out_inode_unlock;
 
@@ -1241,7 +1239,7 @@ retry_deleg:
 	if (error)
 		goto out_inode_unlock;
 
-	error = try_break_deleg(inode, &delegated_inode);
+	error = try_break_deleg(inode, 0, &delegated_inode);
 	if (error)
 		goto out_inode_unlock;
 

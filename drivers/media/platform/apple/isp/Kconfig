@@ -24,8 +24,18 @@ config VIDEO_APPLE_ISP_KUNIT_TEST
 	depends on KUNIT=y || VIDEO_APPLE_ISP=m
 	default KUNIT_ALL_TESTS
 	help
-	  Builds unit tests for the videobuf2 queue set-up of the Apple ISP
-	  driver into the driver. They need no hardware. Only useful for
-	  kernel developers running KUnit.
+	  Builds unit tests for the videobuf2 queue set-up and for the
+	  shared memory the firmware frees into the Apple ISP driver. They
+	  need no hardware. Only useful for kernel developers running KUnit.
 
 	  If unsure, say N.
+
+config VIDEO_APPLE_ISP_IPC_LAYOUT_KUNIT_TEST
+	tristate "Apple ISP IPC layout tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test firmware-selected IPC ring extents, including 64-bit addresses,
+	  overflow, alignment and overlap with the channel table or other rings.
+	  These tests run without starting or accessing the ISP and do not
+	  require a supported Apple device or the ISP driver itself.

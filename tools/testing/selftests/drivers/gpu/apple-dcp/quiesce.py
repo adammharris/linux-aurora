@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright 2026 Ryan Murray
 """Actual mux prepare/set and TPS removal ordering; firmware/PHY leaves are mocks."""
-from common import block, atc_function
+from common import block, atc_function, fabric_core, fabric_rebalance
 
 def make_unit(source, parent=False, reference=None):
  reference=source if reference is None else reference
@@ -23,6 +23,7 @@ typedef unsigned u32;
 #define guard(k) (void)
 #define scoped_guard(k,l) for(int once=((void)(l),1);once;once=0)
 #define READ_ONCE(x) (x)
+#define schedule_work(w) ((void)(w))
 #define WARN_ON_ONCE(x) (x)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define to_platform_device(p) (p)
@@ -55,9 +56,9 @@ static int mutex_trylock(struct mutex *m) { return pthread_mutex_trylock(&m->val
 static void mutex_unlock(struct mutex *m) { assert(!pthread_mutex_unlock(&m->value)); }
 struct typec_mux { struct typec_mux_context *context; struct typec_mux_state transaction; struct task_struct *owner; int srcu_index; unsigned prepared; bool applied; unsigned num_mux_devs; struct typec_mux_dev *mux_devs[3]; bool timeout_transient; };
 struct connector { bool connected; };
-struct apple_dcp { int external_lock,external_error; bool external_cable,external_stopped; struct { bool connected; } dptxport[1]; void *hdmi_hpd; bool active; bool external,typec_cable_connected; void *dev; struct connector *typec_connector; };
+struct apple_dcp { int external_lock,external_error; bool external_cable,external_stopped; struct { bool connected; } dptxport[1]; void *hdmi_hpd; bool active; bool external,typec_cable_connected; void *dev; struct connector *typec_connector; bool ext_backlight; };
 struct apple_dcp_typec_route;
-struct apple_dcp_typec_port { int link; void *connector_np; struct apple_dcp_typec_route *owner,*target,*secondary_target,*preferred_route; void *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,safe_finish_ready,dp_wanted,dp_hpd,hpd; };
+struct apple_dcp_typec_port { int link; void *connector_np; struct apple_dcp_typec_route *owner,*target,*secondary_target,*preferred_route; void *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,safe_finish_ready,dp_wanted,dp_hpd,hpd,busy_noted; };
 struct apple_dcp_typec_route { struct apple_dcp_typec_port *port; struct apple_dcp *dcp; void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel; };
 static int dcp_typec_fabric_lock,dcp_typec_ports,deactivate_calls;
 struct drm_device { int unused; };
@@ -114,7 +115,7 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
  policy=block(mux,'bool typec_mux_safe_after_role(')+'\n' if 'bool typec_mux_safe_after_role(' in mux else ''
  functions=policy+'\n'.join(block(mux, marker) for marker in ('static void typec_mux_unlock(', 'void typec_mux_abort(', 'int typec_mux_begin(', 'int typec_mux_apply(', 'int typec_mux_end(', 'int typec_mux_prepare(')) if not parent else block((reference/'drivers/usb/typec/mux.c').read_text(),'int typec_mux_prepare(')+'\n'
  functions+=block(mux,'int typec_mux_set(')+'\n'+block(dcp,'static int dcp_typec_route_prepare(')+'\n'+block(dcp,'static int dcp_typec_route_finish(')+'\n'+block(dcp,'static void dcp_typec_route_commit(')+'\n'
- functions+=block(dcp,'static struct apple_dcp_typec_route *\ndcp_typec_rebalance_locked(')+'\n'
+ functions+=fabric_rebalance(dcp)
  if 'static bool tps6598x_safe_after_role(' in core:
   functions+=block(core,'static bool tps6598x_safe_after_role(')+'\n'
  if not parent:functions+=block(core,'static void tps6598x_drop_partner(')+'\n'+block(core,'static int tps6598x_set_data_role(')+'\n'
@@ -122,7 +123,7 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
  # atcphy_mux_set_locked() also reports whether a SuperSpeed port may come back up.
  split=[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park','atcphy_mux_switch')]
  functions+=block(core,'static '+('void' if parent else 'int')+' tps6598x_disconnect(')+'\n'+block(core,'static '+('void' if parent else 'int')+' cd321x_remove(')+'\n'+block(core,'void tipd_remove(')+'\n'
- ordinary_phy=r'''
+ ordinary_phy=block(atc, 'enum atcphy_generation {') + ';\n' + r'''
 /* Actual ordinary-port ATC power-off, mux recheck and USB2 init; MMIO leaves. */
 #undef WARN_ON_ONCE
 #define WARN_ON_ONCE(x) ({ bool hit=(x);phy_warns+=hit;hit; })
@@ -133,11 +134,12 @@ enum atcphy_mode { APPLE_ATCPHY_MODE_OFF, APPLE_ATCPHY_MODE_USB2,
  APPLE_ATCPHY_MODE_TBT, APPLE_ATCPHY_MODE_USB4 };
 enum atcphy_pipehandler_state { ATCPHY_PIPEHANDLER_STATE_DUMMY, ATCPHY_PIPEHANDLER_STATE_USB3 };
 struct apple_atcphy {
+ struct { void *usb3_dp; } tunables;
  void *dev; int lock;
- const struct { bool has_usb4,has_t8140_dp; } *hw;
+ const struct { unsigned int gen; bool has_usb4,has_t8140_dp,dp_t8122; u32 usb2phy_sig_host; } *hw;
  struct { void *usb2phy; } regs;
  bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables;
- bool usb3_port_off,park_owed;
+ bool usb3_port_off,park_owed,dp_only,pd_was_off;
  enum atcphy_mode mode,typec_mode;
  enum atcphy_pipehandler_state pipe_state;
 };
@@ -149,7 +151,8 @@ static struct { enum atcphy_pipehandler_state pipehandler_state; bool enable_dp_
 static struct apple_atcphy ordinary_phy;
 static struct phy usb_phy={.data=&ordinary_phy};
 static unsigned phy_warns,configure_calls,lane_requests;
-static int atcphy_park_pipehandler(struct apple_atcphy *p) { p->pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY;return 0; }
+static void atcphy_restore_after_pd_off(struct apple_atcphy *p) { assert(!p->pd_was_off); }
+static int atcphy_park_pipehandler(struct apple_atcphy *p, bool keep_dp) { (void)keep_dp;p->pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY;return 0; }
 static int atcphy_configure_pipehandler(struct apple_atcphy *p,bool on) { (void)p;(void)on;assert(false);return -EINVAL; }
 static int atcphy_configure(struct apple_atcphy *p,enum atcphy_mode mode) { configure_calls++;lane_requests+=mode!=APPLE_ATCPHY_MODE_OFF;p->mode=mode;p->mode_dirty=false;return 0; }
 static void set32(void *p,unsigned v) { (void)p;(void)v;assert(false); }
@@ -278,4 +281,19 @@ int main(int argc,char **argv) {
   prefix=prefix.replace('struct tipd_data {','struct tipd_data { bool role_switch_controls_phy;')
   controls=controls.replace('data=(struct tipd_data){','data=(struct tipd_data){.role_switch_controls_phy=true,')
   controls=controls.replace('c.tps.role_sw=&c;\n  assert(tps6598x_disconnect', 'c.tps.role_sw=&c;data.role_switch_controls_phy=false;\n  assert(tps6598x_disconnect')
+ fabric=fabric_core(reference)
+ if fabric:
+  # The fabric core split: rebalancing runs the real dcp_fabric_run_rebalance()
+  # and dcp_fabric_run_deactivate() over the real decisions, and the adapter
+  # hands the core each route's struct dcp_fabric_route.
+  prefix=prefix.replace('typedef unsigned u32;\n','typedef unsigned u32;\ntypedef unsigned long long u64;\ntypedef unsigned char u8;\n'+fabric,1)
+  prefix=prefix.replace('struct apple_dcp_typec_route { ','struct apple_dcp_typec_route { struct dcp_fabric_route core; ',1)
+  prefix=prefix.replace('#define lockdep_assert_held(p) ((void)(p))\n','''#define lockdep_assert_held(p) ((void)(p))
+#define list_first_entry_or_null(h,t,m) ((void)(h),sole_port())
+#define list_is_last(p,h) ((void)(p),(void)(h),true)
+#define list_next_entry(p,m) ((void)(p),(struct apple_dcp_typec_port *)NULL)
+''',1)
+  # The real plan snapshots each route into its core before deciding.
+  prefix=prefix.replace('static void dcp_typec_plan(struct drm_device *d,struct apple_dcp_typec_port *p,unsigned n) { (void)d;(void)p;(void)n; }',
+   'static void dcp_typec_plan(struct drm_device *d,struct apple_dcp_typec_port *p,unsigned n) { (void)d;(void)p;(void)n;route.core.tunnel=route.tunnel; }',1)
  return prefix+functions+ordinary_phy+controls

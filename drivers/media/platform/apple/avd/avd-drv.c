@@ -23,6 +23,8 @@
 #include "avd-inst.h"
 #include "avd-regs.h"
 
+#define AVD_CODEC_INFO_MAX_SIZE	0x40
+
 static void calc_tile_meta(u32 w, u32 h, u32 bpb, u32 tile_dim,
 			   u32 meta_hdr_bytes, u32 *tile, u32 *meta)
 {
@@ -128,7 +130,7 @@ static int avd_wait_submission_queue(struct avd_ctx *ctx, int vp)
 	}
 
 	if (cur >= max / 2) {
-		if (avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER)
+		if (avd->variant->quirks & AVD_QUIRK_V5_QUEUE_PACING)
 			usleep_range(100, 150);
 		else
 			usleep_range(500, 650);
@@ -199,7 +201,7 @@ int avd_submit_job(struct avd_ctx *ctx)
 		seg = &segments[idx];
 		for (i = 0; i < seg->num; i++)
 			writel(seg->instructions[i], reg);
-		if ((!(avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER) ||
+		if ((!(avd->variant->quirks & AVD_QUIRK_V5_QUEUE_PACING) ||
 		     sub->codec == AVD_CODEC_HEVC) &&
 		    avd_wait_submission_queue(ctx, vp))
 			break;
@@ -318,7 +320,14 @@ static irqreturn_t avd_irq_handler(int irq, void *data)
 		goto done;
 	} else {
 		dev_err(avd->dev, "H%d error", status);
-		/* let watchdog handle */
+		/*
+		 * avd-fw err(n): VP n raised its error interrupt and stopped,
+		 * and the PP only starts on a VP done, so the job cannot
+		 * complete any more. Run the watchdog now instead of after its
+		 * timeout: it resets the AVD and fails only this frame, and it
+		 * ignores a job the hardware does not own yet.
+		 */
+		mod_delayed_work(system_wq, &ctx->watchdog_work, 0);
 		goto done;
 	}
 
@@ -429,6 +438,17 @@ static void avd_device_run(void *priv)
 		avd_job_finish(ctx, result);
 }
 
+/*
+ * Capture buffers are found by timestamp and handed to the hardware by DMA
+ * address, so nothing limits them to VB2_MAX_FRAME. A larger pool lets
+ * userspace decode ahead to ride out bitrate spikes the hardware can't
+ * decode in real time (e.g. 150+ Mbit/s 4K60 H.264).
+ */
+static unsigned int max_capture_buffers = 128;
+module_param(max_capture_buffers, uint, 0444);
+MODULE_PARM_DESC(max_capture_buffers,
+		 "Maximum number of capture buffers per context (default 128)");
+
 static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 			  struct vb2_queue *dst_vq)
 {
@@ -466,6 +486,7 @@ static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 	dst_vq->lock = &ctx->dev->vdev_lock;
 	dst_vq->dev = ctx->dev->v4l2_dev.dev;
 	dst_vq->allow_cache_hints = true;
+	dst_vq->max_num_buffers = max(max_capture_buffers, VB2_MAX_FRAME);
 
 	return vb2_queue_init(dst_vq);
 }
@@ -758,7 +779,7 @@ static const struct avd_variant avd_t8140_variant = {
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
-	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER | AVD_QUIRK_V5_QUEUE_PACING,
 };
 
 static const struct avd_variant avd_t8132_variant = {
@@ -780,6 +801,34 @@ static const struct avd_variant avd_t8132_variant = {
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
+};
+
+/*
+ * T6040 (M4 Pro): the T8132 decoder. Its first HEVC job stalled the VP when
+ * it was sent the pre-v5 header (no DMA configuration words, no reserved
+ * scratch slot); T6040 runs the same v5 firmware generation as T8140, so it
+ * gets the v5 header. HEVC stays hidden from V4L2 clients until that is
+ * verified on the hardware.
+ */
+static const struct avd_variant avd_t6040_variant = {
+	.vp_slots = {
+		[AVD_CODEC_HEVC] = 4,
+		[AVD_CODEC_H264] = 4,
+		[AVD_CODEC_VP9] = 1,
+		[AVD_CODEC_AV1] = 3,
+	},
+	.fifo_slots = 15,
+	.configure_stream = t8122_configure_stream,
+	.capabilities = AVD_CAPABILITY_H264 |
+			AVD_CAPABILITY_VP9 |
+			AVD_CAPABILITY_AV1,
+	.fw_name = "apple/avd-fw-v5-t1.bin",
+	.revision = 4,
+	.vp_slot_offset = 0xc,
+	.submit_offset = 0x40,
+	.submit_queue_max_offset = 0x44,
+	.submit_queue_status_offset = 0x7c,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
 };
 
 /* can also be derived from a version register */
@@ -805,6 +854,10 @@ static const struct of_device_id avd_of_match[] = {
 		.data = &avd_t8122_variant
 	},
 	{
+		.compatible = "apple,t6041-avd",
+		.data = &avd_t6040_variant
+	},
+	{
 		.compatible = "apple,t8132-avd",
 		.data = &avd_t8132_variant
 	},
@@ -821,6 +874,7 @@ static int avd_probe(struct platform_device *pdev)
 {
 	struct avd_dev *avd;
 	const struct of_device_id *match;
+	const char *codec_info = NULL;
 	int ret, irq;
 
 	avd = devm_kzalloc(&pdev->dev, sizeof(*avd), GFP_KERNEL);
@@ -863,6 +917,29 @@ static int avd_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(avd->dev, "failed to load firmware: %d", ret);
 		return ret;
+	}
+
+	/* Determine firmware and HW variant capabilities */
+	codec_info = avd->fw->data + avd->fw->size - AVD_CODEC_INFO_MAX_SIZE;
+	if (strncmp(codec_info, "CODECS:", 7) == 0) {
+		unsigned int caps = 0;
+		unsigned int variant_caps = avd->variant->capabilities;
+
+		if (strnstr(codec_info, "av1", AVD_CODEC_INFO_MAX_SIZE))
+			caps |= variant_caps & AVD_CAPABILITY_AV1;
+		if (strnstr(codec_info, "h264", AVD_CODEC_INFO_MAX_SIZE))
+			caps |= variant_caps & AVD_CAPABILITY_H264;
+		if (strnstr(codec_info, "h265", AVD_CODEC_INFO_MAX_SIZE))
+			caps |= variant_caps & AVD_CAPABILITY_HEVC;
+		if (strnstr(codec_info, "vp9", AVD_CODEC_INFO_MAX_SIZE))
+			caps |= variant_caps & AVD_CAPABILITY_VP9;
+
+		dev_info(avd->dev, "Firmware codecs: %.27s\n", codec_info + 7);
+
+		avd->capabilities = caps;
+	} else {
+		/* Backward compatibility to old firmware, do not upstream. */
+		avd->capabilities = avd->variant->capabilities;
 	}
 
 	ret = dma_set_mask_and_coherent(avd->dev,

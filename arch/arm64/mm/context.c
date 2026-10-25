@@ -39,6 +39,21 @@ static unsigned long *pinned_asid_map;
 #define ctxid2asid(asid)	((asid) & ~ASID_MASK)
 #define asid2ctxid(asid, genid)	((asid) | (genid))
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+/*
+ * Experimental mixed-granule userspace is off unless booted with user4k=on.
+ * Early parameters are parsed in setup_arch(), before page_ext sizing and
+ * CPU capability detection read this.
+ */
+bool arm64_user4k_on __ro_after_init;
+
+static int __init user4k_setup(char *str)
+{
+	return kstrtobool(str, &arm64_user4k_on);
+}
+early_param("user4k", user4k_setup);
+#endif
+
 #ifdef CONFIG_ARM64_USER4K_KUNIT_TEST
 /* Test-only capacity reduction; hardware ASID width and normal boots are unchanged. */
 static bool user4k_test_small_asids;

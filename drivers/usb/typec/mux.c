@@ -59,6 +59,8 @@ static void *typec_switch_match(const struct fwnode_handle *fwnode,
 	 */
 	dev = class_find_device(&typec_mux_class, NULL, fwnode,
 				switch_fwnode_match);
+	if (!dev)
+		return ERR_PTR(-EPROBE_DEFER);
 
 	/* Skip duplicates */
 	for (i = 0; i < TYPEC_MUX_MAX_DEVS; i++)
@@ -67,7 +69,7 @@ static void *typec_switch_match(const struct fwnode_handle *fwnode,
 			return NULL;
 		}
 
-	return dev ? to_typec_switch_dev(dev) : ERR_PTR(-EPROBE_DEFER);
+	return to_typec_switch_dev(dev);
 }
 
 /**
@@ -366,10 +368,32 @@ static int mux_fwnode_match(struct device *dev, const void *fwnode)
 	return device_match_fwnode(dev, fwnode);
 }
 
+/*
+ * The connection lookup checks that a mux's own node is available, but the
+ * device that registers a mux can sit further up: a display processor
+ * registers its Type-C routes, which are child nodes of its own. Under a
+ * node that is not available, such as one the boot loader left disabled,
+ * nothing ever registers the mux.
+ */
+static bool typec_mux_ancestors_available(const struct fwnode_handle *fwnode)
+{
+	struct fwnode_handle *parent;
+
+	fwnode_for_each_parent_node(fwnode, parent) {
+		if (!fwnode_device_is_available(parent)) {
+			fwnode_handle_put(parent);
+			return false;
+		}
+	}
+	return true;
+}
+
 static void *typec_mux_match(const struct fwnode_handle *fwnode,
 			     const char *id, void *data)
 {
+	struct typec_mux_dev **mux_devs = data;
 	struct device *dev;
+	int i;
 
 	/*
 	 * Device graph (OF graph) does not give any means to identify the
@@ -384,8 +408,18 @@ static void *typec_mux_match(const struct fwnode_handle *fwnode,
 
 	dev = class_find_device(&typec_mux_class, NULL, fwnode,
 				mux_fwnode_match);
+	if (!dev)
+		return typec_mux_ancestors_available(fwnode) ? ERR_PTR(-EPROBE_DEFER) : NULL;
 
-	return dev ? to_typec_mux_dev(dev) : ERR_PTR(-EPROBE_DEFER);
+	/* Skip duplicates */
+	for (i = 0; i < TYPEC_MUX_MAX_DEVS; i++)
+		if (to_typec_mux_dev(dev) == mux_devs[i]) {
+			put_device(dev);
+			return NULL;
+		}
+
+
+	return to_typec_mux_dev(dev);
 }
 
 /**
@@ -413,7 +447,8 @@ struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnode)
 	/* Unregister must drain lookup and module-reference conversion too. */
 	index = srcu_read_lock(&typec_mux_srcu);
 	count = fwnode_connection_find_matches(fwnode, "mode-switch",
-					       NULL, typec_mux_match,
+					       (void **)mux_devs,
+					       typec_mux_match,
 					       (void **)mux_devs,
 					       ARRAY_SIZE(mux_devs));
 	if (count <= 0) {
@@ -783,6 +818,7 @@ fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode)
 	struct typec_thunderbolt_switch_dev *sw_dev;
 	struct typec_thunderbolt_switch *sw;
 	void *match;
+	int ret = 0;
 
 	match = fwnode_connection_find_match(fwnode, "thunderbolt-switch", NULL,
 					     typec_thunderbolt_switch_match);
@@ -799,7 +835,15 @@ fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode)
 	}
 
 	sw->sw_dev = sw_dev;
-	WARN_ON(!try_module_get(sw_dev->dev.parent->driver->owner));
+	scoped_guard(rwsem_read, &sw_dev->set_lock) {
+		if (!sw_dev->set || !try_module_get(sw_dev->owner))
+			ret = -ENODEV;
+	}
+	if (ret) {
+		put_device(&sw_dev->dev);
+		kfree(sw);
+		return ERR_PTR(ret);
+	}
 
 	return sw;
 }
@@ -816,7 +860,7 @@ void typec_thunderbolt_switch_put(struct typec_thunderbolt_switch *sw)
 	if (IS_ERR_OR_NULL(sw))
 		return;
 
-	module_put(sw->sw_dev->dev.parent->driver->owner);
+	module_put(sw->sw_dev->owner);
 	put_device(&sw->sw_dev->dev);
 	kfree(sw);
 }
@@ -837,6 +881,9 @@ int typec_thunderbolt_switch_set(struct typec_thunderbolt_switch *sw,
 	if (IS_ERR_OR_NULL(sw))
 		return 0;
 
+	guard(rwsem_read)(&sw->sw_dev->set_lock);
+	if (!sw->sw_dev->set)
+		return -ENODEV;
 	return sw->sw_dev->set(sw->sw_dev, data);
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_set);
@@ -890,6 +937,34 @@ void typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw)
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify);
 
+/**
+ * typec_thunderbolt_switch_notify_ready - Report completed activation
+ * @sw: Registered provider switch
+ *
+ * Wake consumers waiting on a busy provider without requesting fault recovery.
+ * As with revalidation notifications, drain producers before unregistering.
+ */
+void typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *sw)
+{
+	atomic_notifier_call_chain(&sw->notifiers,
+				   TYPEC_THUNDERBOLT_SWITCH_READY, NULL);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify_ready);
+
+/**
+ * typec_thunderbolt_switch_notify_restore - Request a cable read after sleep
+ * @sw: Registered provider switch
+ *
+ * The provider powered itself down for system sleep and needs the current
+ * cable state reapplied. Unlike a revalidation this reports no link fault.
+ */
+void typec_thunderbolt_switch_notify_restore(struct typec_thunderbolt_switch_dev *sw)
+{
+	atomic_notifier_call_chain(&sw->notifiers,
+				   TYPEC_THUNDERBOLT_SWITCH_RESTORE, NULL);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify_restore);
+
 static void typec_thunderbolt_switch_release(struct device *dev)
 {
 	kfree(to_typec_thunderbolt_switch_dev(dev));
@@ -923,6 +998,8 @@ typec_thunderbolt_switch_register(struct device *parent,
 	if (!sw_dev)
 		return ERR_PTR(-ENOMEM);
 
+	init_rwsem(&sw_dev->set_lock);
+	sw_dev->owner = parent->driver ? parent->driver->owner : NULL;
 	sw_dev->set = desc->set;
 
 	device_initialize(&sw_dev->dev);
@@ -959,8 +1036,13 @@ EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_register);
  */
 void typec_thunderbolt_switch_unregister(struct typec_thunderbolt_switch_dev *sw_dev)
 {
-	if (!IS_ERR_OR_NULL(sw_dev))
-		device_unregister(&sw_dev->dev);
+	if (IS_ERR_OR_NULL(sw_dev))
+		return;
+
+	/* Drain callbacks before the parent releases its private data. */
+	scoped_guard(rwsem_write, &sw_dev->set_lock)
+		sw_dev->set = NULL;
+	device_unregister(&sw_dev->dev);
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_unregister);
 

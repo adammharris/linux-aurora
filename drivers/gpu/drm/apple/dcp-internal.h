@@ -16,6 +16,9 @@
 #include <linux/scatterlist.h>
 #include <linux/usb/typec_mux.h>
 
+#include "dcp-fabric.h"
+#include "dcp-fabric-session.h"
+#include "dcp-relink.h"
 #include "dptxep.h"
 #include "dcp_backlight.h"
 #include "dcp-announce.h"
@@ -27,12 +30,16 @@
 #include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
+#include "iomfb_v14_7.h"
+#include "iomfb_v14_7_tpl.h"
+#include "iomfb_v26_6.h"
 #include "epic/dpavservep.h"
+#include "version_utils.h"
 
 #define DCP_MAX_PLANES 4
-#define DCP_MAX_TYPEC_ROUTES 4
 
 struct apple_dcp;
+struct iomfb_m4;
 struct apple_dcp_afkep;
 struct dcp_method_entry;
 
@@ -58,42 +65,14 @@ struct iomfb_transaction {
 };
 struct apple_dcp_typec_port;
 
-struct apple_dcp_typec_route {
-	struct apple_dcp *dcp;
-	struct apple_dcp_typec_port *port;
-	struct list_head port_link;
-	struct phy *phy;
-	struct mux_control *xbar;
-	struct typec_mux_dev *typec_mux;
-	u32 dptx_phy;
-	u32 mux_index;
-	bool selected;
-	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
-	unsigned int tunnel_dpin;
-	struct mux_control *active_xbar;
-	bool tunnel;
-	/* tunnel: crossbar brought up (at DidChangeLinkConfiguration) */
-	bool xbar_up;
-	/* Lower mux release is consumed even when idle programming fails. */
-	bool deactivate_xbar_done;
-	int deactivate_error;
-};
-
-bool dcp_is_typec_output(struct apple_dcp *dcp);
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
-bool dcp_is_usb4_output(struct apple_dcp *dcp);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
+bool dcp_typec_relink(struct apple_dcp *dcp);
+bool dcp_typec_sink_relink(struct apple_dcp *dcp);
 
 struct dcpav_service_epic;
-
-enum dcp_firmware_version {
-	DCP_FIRMWARE_UNKNOWN,
-	DCP_FIRMWARE_V_12_3,
-	DCP_FIRMWARE_V_13_5,
-	DCP_FIRMWARE_H17P,
-};
 
 enum {
 	SYSTEM_ENDPOINT = 0x20,
@@ -101,6 +80,11 @@ enum {
 	DCP_EXPERT_ENDPOINT = 0x22,
 	DISP0_ENDPOINT = 0x23,
 	DPTX_CONTROLLER_ENDPOINT = 0x24,
+	/*
+	 * The same endpoint on T6030 14.7 firmware: the DPAV controller that
+	 * publishes the port service used by DPTX 0x2a.
+	 */
+	DPAV_CTRL_ENDPOINT = 0x24,
 	DPAVSERV_ENDPOINT = 0x28,
 	DPAVSERV_ENDPOINT_V2 = 0x2a,
 	AV_ENDPOINT = 0x29,
@@ -113,6 +97,7 @@ enum {
 
 /* Temporary backing for a chunked transfer via setDCPAVPropStart/Chunk/End */
 struct dcp_chunks {
+	u64 modes_generation;
 	size_t length;
 	void *data;
 	size_t received;
@@ -213,6 +198,14 @@ struct apple_dcp_hw_data {
 	u32 firmware_display_windows;
 	u32 firmware_scratch;
 	u32 firmware_request;
+	/* M2 Pro/Max laptop T6020 Thunderbolt flow, from the match data */
+	bool t6020_tunnel_flow;
+	/*
+	 * A processor Linux starts itself on 14.7 firmware through the IOMFB
+	 * template whose AFK, DPTX and DPAV endpoints speak the 14.7 protocol
+	 * (the T8122 dcpext), see dcp_fw_is_14_7().
+	 */
+	bool fw_14_7_endpoints;
 };
 
 enum dcp_test_point {
@@ -222,11 +215,19 @@ enum dcp_test_point {
 };
 
 /* TODO: move IOMFB members to its own struct */
+struct dcpext_scanout;
+struct dcp_hdmi;
+
 struct apple_dcp {
+	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
+	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
 	bool quiescing;
 	bool drm_retained;
+	/* vblank_wq and swap_watchdog_wq disabled by the last unbind */
+	bool vblank_works_disabled;
+	struct dcp_fabric_pipeline fabric;
 	struct device *dev;
 	struct platform_device *piodma;
 	bool piodma_created;
@@ -265,6 +266,51 @@ struct apple_dcp {
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
+	bool external;
+	/*
+	 * T8122 dcpext: the panel's DRM device never waits on this processor.
+	 * A probe or bind failure leaves it in the device as an unusable pipe
+	 * (ext_dead): no CRTC, Type-C routes disabled or ignored, RTKit
+	 * messages dropped. See dcp_platform_probe().
+	 */
+	bool ext_failsafe;
+	bool ext_dead;
+	/*
+	 * A T6030 external processor in the main DRM device: the kernel starts
+	 * its firmware on first use, its modes come from the attached display.
+	 * Clear for the manual diagnostic path (separate scanout, explicit start).
+	 */
+	bool external_native;
+	struct dcpext_scanout *dcpext_scanout;
+	bool external_link_ready; /* Full connect/HPD handshake completed. */
+	bool external_suspended; /* hpd_mutex serializes PM against explicit start */
+	struct work_struct external_work;
+	/* Native: retries pending connects once DPTX ports are announced. */
+	struct work_struct external_ready_work;
+	/* Native: the firmware's start state, see iomfb_v14_7.c. */
+	unsigned int external_phase;
+	/* Native: bounded recovery of a display link or mode, see dcp.c. */
+	struct delayed_work external_retry_wq;
+	atomic_t external_retries;
+	/* typec_generation when the pending retry was queued */
+	u64 external_retry_generation;
+	/*
+	 * Native: the connector is kept connected while the display is
+	 * described again, until the pending retry, once per connection
+	 * (typec_generation + 1 of the last hold); see iomfb_v14_7.c.
+	 */
+	atomic_t external_held;
+	u64 external_held_connection;
+	/*
+	 * Native: DRM unbound this pipe; firmware callbacks leave its
+	 * connector and CRTC alone. Set under the session lock.
+	 */
+	bool external_detached;
+	atomic_t external_requested;
+
+	/* DCP_FIRMWARE_V_14_7 state; outlives this device once RTKit runs. */
+	struct apple_dcp_v14 *v14;
+	struct apple_dcp_v26 *v26;
 
 	/* Coprocessor control register */
 	void __iomem *coproc_reg;
@@ -333,6 +379,7 @@ struct apple_dcp {
 	union {
 		struct dcp_swap_submit_req_v12_3 v12_3;
 		struct dcp_swap_submit_req_v13_3 v13_3;
+		struct dcp_swap_submit_req_v14_7_0 v14_7_0;
 		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
 
@@ -348,8 +395,18 @@ struct apple_dcp {
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
+	/* hpd_mutex: Type-C display sessions released; see dcp_poweroff() */
+	u64 typec_unplugs;
+	/* typec_unplugs when the CRTC last claimed its display session */
+	u64 crtc_unplugs;
 	u64 placeholder_generation;
 	struct delayed_work placeholder_edid_wq;
+	/* replugs replayed for a Type-C sink that lost its link */
+	spinlock_t relink_lock;
+	struct dcp_relink_state relink;
+	struct delayed_work typec_relink_wq;
+	/* The driver holds the sink HPD low itself; hpd_mutex. */
+	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
 	struct dcp_set_digital_out_mode_req mode;
@@ -374,8 +431,15 @@ struct apple_dcp {
 	bool crc_enabled;
 
 	/* Modes valid for the connected display */
+	/* Readers copy a mode before dropping this lock. */
+	struct mutex modes_lock;
 	struct dcp_display_mode *modes;
 	unsigned int nr_modes;
+	u64 modes_generation;
+	u64 dimensions_generation;
+	struct work_struct dimensions_wq;
+	bool modes_admitted;
+	bool modes_provisional;
 
 	/* Attributes of the connector */
 	int connector_type;
@@ -383,6 +447,8 @@ struct apple_dcp {
 
 	/* Attributes of the connected display */
 	int width_mm, height_mm;
+	/* an external display whose backlight DCP can drive */
+	bool ext_backlight;
 
 	unsigned notch_height;
 
@@ -428,6 +494,11 @@ struct apple_dcp {
 	struct apple_dcp_afkep *dptx_controller_ep;
 	struct completion dptx_controller_ready;
 
+	struct apple_dcp_afkep *dpavctrlep;
+	struct apple_epic_service *dpav_ctrl;
+	struct completion dpav_ctrl_ready;
+	bool dpav_ctrl_open;
+
 	struct dptx_port dptxport[2];
 
 	/* debugfs entries */
@@ -450,6 +521,7 @@ struct apple_dcp {
 	/* wakes/sleeps the Thunderbolt DP IN adapter from DCP Activate/Deactivate */
 	int (*tb_dpin_set_active)(void *ctx, bool active);
 	void *tb_dpin_ctx;
+	u64 tb_generation; /* tb_lock: admitted callback cookie, including attach */
 	/*
 	 * Serializes the Thunderbolt DP IN callback and tunnel crossbar state
 	 * between DCP apcalls and tunnel teardown; never held while waiting
@@ -457,15 +529,40 @@ struct apple_dcp {
 	 */
 	struct mutex tb_lock;
 	bool tb_clock_ok;
+	/* tb_lock: the direct DP PHY crossbar output whose clocks run (T6030). */
+	struct mux_control *direct_xbar_up;
+	/*
+	 * Tiled display (LG UltraFine 5K): the second Thunderbolt DP IN of the
+	 * same port drives DPTX port 1 of this pipeline, so DCP sees both tiles
+	 * and presents one display. Under tb_lock like the fields above.
+	 */
+	struct {
+		bool active;
+		bool ready; /* admitted second-stream setup */
+		struct mux_control *xbar;	/* the port's dpin1 crossbar control */
+		int mux_state;			/* dispextN, DPTX port 1 */
+		bool xbar_up;
+		bool clock_ok;
+		u64 generation;			/* the Thunderbolt binding's */
+		int (*set_active)(void *binding, bool active);
+		void *binding;
+	} split;
 	/* CRTC powered off while the Type-C cable stays attached */
 	bool typec_crtc_off;
+	bool typec_follow_start;
+	bool typec_follow_retiring;
+	u64 typec_follow_gen;
+	/* dcp_poweron() reconnects DPTX; its own modeset follows the HPD */
+	bool typec_poweron_hpd;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
 	u32 typec_reconnect_tries;
+	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */
 	/* hpd_mutex: what DRM reports for the external display, and when */
 	struct dcp_announce announce;
 	struct delayed_work announce_wq;
+	bool typec_work_enabled; /* hpd_mutex; IRQ recovery admission */
 #if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
 	/* Lets a test stop work where it races, see dcp_test_point(). */
 	void (*test_point)(struct apple_dcp *dcp, enum dcp_test_point point);
@@ -532,7 +629,38 @@ struct apple_dcp {
 		 */
 		struct list_head dropped;
 	} iomfb;
+	/* Hardirq, resume and expiry share one generation under this lock. */
+	spinlock_t hdmi_presence_lock;
+	struct dcp_fabric_presence hdmi_presence;
+	unsigned long hdmi_edge_jiffies;
+	bool hdmi_edge_seen;
+	struct delayed_work hdmi_settle_wq;
+	struct delayed_work hdmi_recheck_wq;
+	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
+	struct dcp_hdmi *hdmi;
 };
+
+/* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
+static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
+{
+	return IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132) &&
+	       dcp->fw_compat == DCP_FIRMWARE_M4;
+}
+
+/* Presents carry nits; one serialized IOMFB owner. */
+static inline bool dcp_presents_nits(const struct apple_dcp *dcp)
+{
+	return (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
+	       iomfb_is_m4(dcp);
+}
+
+/* An adopted firmware session that fails stop and is never torn down. */
+static inline bool dcp_fail_stop(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_H17P ||
+	       iomfb_is_m4(dcp);
+}
 
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected);
@@ -602,7 +730,37 @@ void dcp_backlight_stop(struct apple_dcp *dcp);
 void dcp_backlight_finish_fade(struct apple_dcp *dcp);
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+
+/*
+ * Does @dcp's firmware speak the 14.7 AFK, DPTX and DPAV endpoint protocol,
+ * whichever IOMFB path drives it? DCP_FIRMWARE_V_14_7 is the native DCPLink
+ * session; on DCP_FIRMWARE_V_14_7_TEMPLATE only the processors marked by
+ * their match data (the T8122 dcpext): generic M1/M2 DCPs on 14.7.0 keep the
+ * endpoint handling they had.
+ */
+static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 ||
+	       (dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
+		dcp->hw.fw_14_7_endpoints);
+}
+
+/*
+ * The T8122 dcpext connects its DPTX port as AsahiLinux/linux#607 does,
+ * the kernel this firmware was first driven with: no validation of the
+ * target, a connect without the supports-HPD attribute, GET_SUPPORTS_HPD
+ * answered with 0, HPD asserted only after the link-configuration wait,
+ * and tiled display hints acknowledged with 0. Every other DCP keeps the
+ * Type-C model of dcp_dptx_connect_session().
+ */
+static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
+{
+	/* Not the generic M1/M2 DCPs this tree also runs on the template. */
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
+	       dcp->hw.fw_14_7_endpoints;
+}
 
 #define DCP_AUDIO_MAX_CHANS 15
 

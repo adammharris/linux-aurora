@@ -4,9 +4,28 @@
 from pathlib import Path
 import hashlib, json, os, re, shlex, subprocess
 
+# The Type-C display fabric moved from dcp.c to dcp-fabric.c; extract from
+# them as one unit so a function is found whichever file holds it.
+_read_text = Path.read_text
+
+
+def _read_dcp_unit(self, *args, **kwargs):
+    text = _read_text(self, *args, **kwargs)
+    fabric = self.with_name('dcp-fabric.c')
+    if self.name == 'dcp.c' and self.parent.name == 'apple' and fabric.exists():
+        text += '\n' + _read_text(fabric, *args, **kwargs)
+    return text
+
+
+Path.read_text = _read_dcp_unit
+
 def block(source, marker):
     start = source.index(marker) if isinstance(marker, str) else marker
     opening = source.index('{', start)
+    if isinstance(marker, str) and marker.startswith('static ') and '(' in marker:
+        while 0 <= source.find(';', start) < opening:
+            start = source.index(marker, source.index(';', start) + 1)
+            opening = source.index('{', start)
     end, depth = opening + 1, 1
     while depth:
         depth += (source[end] == '{') - (source[end] == '}')
@@ -28,7 +47,15 @@ def source_defines(source):
 def tipd_pm_header(root):
     """CD321x PM state machine for host units, with a host clamp() for minmax.h."""
     header = (root / 'drivers/usb/typec/tipd/cd321x-pm.h').read_text()
-    header = header.replace('#include <linux/types.h>', '')
+    # Host integer types; a repeated identical typedef is valid C11.
+    header = header.replace('#include <linux/types.h>',
+        '#include <stdint.h>\ntypedef uint32_t u32;')
+    # Units that model probe, not DP status updates, leave cd321x_dp_send() unused.
+    header = header.replace('static inline enum cd321x_dp_send cd321x_dp_send(',
+        'static inline __attribute__((unused)) enum cd321x_dp_send cd321x_dp_send(')
+    # The host units need the status bit, not kernel USB declarations.
+    header = header.replace('#include <linux/usb/typec_dp.h>',
+        '#ifndef DP_STATUS_IRQ_HPD\n#define DP_STATUS_IRQ_HPD (1U << 8)\n#endif')
     # Single line: probe-mux-pm-dispatch filters duplicate definitions per line.
     return header.replace('#include <linux/minmax.h>',
         '#define clamp(val, lo, hi) ({ __auto_type _v = (val); '
@@ -54,6 +81,14 @@ def run_unit(name, unit, output, cases=((),), includes=(), extra=()):
     return hashlib.sha256(unit.encode()).hexdigest()
 
 
+# Asahi 7.2 moved the generation-specific setup after the tunables into
+# per-SoC atcphy_hw callbacks; atcphy_configure() calls them and compares
+# against the all-modes one for the RCAL wait.
+ATC_POST_TUNABLE = ('atcphy_configure_post_tunable_t8103', 'atcphy_wake_common_t8122',
+                    'atcphy_configure_post_tunable_t8122',
+                    'atcphy_configure_post_tunable_all_modes')
+
+
 # Helpers that the fixed-hub SuperSpeed handover split out of extracted functions
 ATC_SPLIT = ('atcphy_pipe_live', 'atcphy_usb3_route')
 
@@ -64,7 +99,7 @@ def atc_function(source, name):
     The fixed-hub SuperSpeed handover splits helpers out of the functions that the
     fixtures extract; older sources keep that code inline.
     """
-    marker = re.search(r'^static [^\n]+\b' + name + r'\(', source, re.M)
+    marker = re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
     return block(source, marker.start()) + '\n' if marker else ''
 
 
@@ -99,3 +134,73 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
     return ret;
 }
 '''
+
+
+def fabric_core(root):
+    """The real Type-C fabric decisions and effect runners as host C.
+
+    dcp-fabric-core.c and dcp-fabric-effects.h are host-compilable by design
+    (KUnit runs them against fake hardware); only the kernel includes and
+    module boilerplate are dropped.  The unit supplies u32/u64.  Unused
+    static inline helpers are marked so, as they would be in a header.
+    """
+    apple = root / 'drivers/gpu/drm/apple'
+    core = apple / 'dcp-fabric-core.c'
+    if not core.exists():
+        return ''
+
+    def strip(text):
+        return '\n'.join(line for line in text.splitlines()
+                         if not line.startswith(('#include', 'EXPORT_SYMBOL', 'MODULE_'))) + '\n'
+    tunnel = (root / 'include/linux/soc/apple/dp-tunnel.h').read_text()
+    return ('\n#include <limits.h>\n#include <errno.h>\n#include <stdbool.h>\n'
+            '#ifndef BIT\n#define BIT(n) (1UL << (n))\n#endif\n'
+            '#ifndef time_before\n#define time_before(a, b) ((long)((a) - (b)) < 0)\n#endif\n'
+            + block(tunnel, 'static inline bool apple_dp_tunnel_wiring_dual(') + '\n'
+            + strip((apple / 'dcp-fabric-core.h').read_text())
+            + strip(core.read_text())
+            + strip((apple / 'dcp-fabric-effects.h').read_text())).replace(
+                'static inline ', 'static inline __attribute__((unused)) ')
+
+
+def fabric_rebalance(dcp):
+    """dcp_typec_rebalance_locked() with the adapter callbacks it runs through.
+
+    The fabric core split turned the loop into dcp_fabric_run_rebalance() over
+    struct dcp_rebalance_context and dcp_rebalance_ops; older sources keep the
+    loop inline.
+    """
+    marker = 'static struct apple_dcp_typec_route *\ndcp_typec_rebalance_locked('
+    end = dcp.index(marker)
+    end += len(block(dcp, end))
+    start = dcp.find('struct dcp_rebalance_context {')
+    return dcp[start if 0 <= start < end else dcp.index(marker):end] + '\n'
+
+
+def apple_function(root, name):
+    """The definition of @name in whichever drivers/gpu/drm/apple source has it.
+
+    Robust to functions moving between files; '' when no source defines it.
+    """
+    pattern = re.compile(r'^(?:[A-Za-z_][\w \t*]*\n)?(?:[A-Za-z_][\w \t*]*?\b)?' + re.escape(name) +
+                         r'\([^;{]*?\)\s*\{', re.M)
+    for path in sorted((root / 'drivers/gpu/drm/apple').glob('*.c')):
+        if 'test' in path.name:
+            continue
+        text = _read_text(path)
+        match = pattern.search(text)
+        if match:
+            return block(text, match.start()) + '\n'
+    return ''
+
+
+def internal_inline(root, name):
+    """A static inline helper from dcp-internal.h, marked unused; '' if absent.
+
+    dcp_fw_is_14_7() reads fw_compat and hw.fw_14_7_endpoints.
+    """
+    text = (root / 'drivers/gpu/drm/apple/dcp-internal.h').read_text()
+    match = re.search(r'^static inline [^\n;]*\b' + re.escape(name) + r'\(', text, re.M)
+    if not match:
+        return ''
+    return block(text, match.start()).replace('static inline ', 'static inline __attribute__((unused)) ', 1) + '\n'

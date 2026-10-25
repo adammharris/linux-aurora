@@ -12,6 +12,7 @@
 
 #include <asm/cacheflush.h>
 #include <asm/cpufeature.h>
+#include <asm/cputype.h>
 #include <asm/setup.h>
 
 #include "pi.h"
@@ -93,6 +94,7 @@ static const struct ftr_set_desc mmfr1 __prel64_initconst = {
 	.override	= &id_aa64mmfr1_override,
 	.fields		= {
 		FIELD("vh", ID_AA64MMFR1_EL1_VH_SHIFT, mmfr1_vh_filter),
+		FIELD("hafdbs", ID_AA64MMFR1_EL1_HAFDBS_SHIFT, NULL),
 #if defined(CONFIG_ARM64_USER4K_KUNIT_TEST) && defined(CONFIG_ARM64_SW_TTBR0_PAN)
 		FIELD("pan", ID_AA64MMFR1_EL1_PAN_SHIFT, user4k_pan_test_filter),
 #endif
@@ -134,6 +136,15 @@ static const struct ftr_set_desc mmfr2 __prel64_initconst = {
 	.override	= &id_aa64mmfr2_override,
 	.fields		= {
 		FIELD("varange", ID_AA64MMFR2_EL1_VARange_SHIFT, mmfr2_varange_filter),
+		{}
+	},
+};
+
+static const struct ftr_set_desc mmfr4 __prel64_initconst = {
+	.name		= "id_aa64mmfr4",
+	.override	= &id_aa64mmfr4_override,
+	.fields		= {
+		FIELD("nv_frac", ID_AA64MMFR4_EL1_NV_frac_SHIFT, NULL),
 		{}
 	},
 };
@@ -253,6 +264,7 @@ PREL64(const struct ftr_set_desc, reg) regs[] __prel64_initconst = {
 	{ &mmfr0	},
 	{ &mmfr1	},
 	{ &mmfr2	},
+	{ &mmfr4	},
 	{ &pfr0 	},
 	{ &pfr1 	},
 	{ &isar1	},
@@ -276,10 +288,11 @@ static const struct {
 	  "id_aa64isar1.api=0 id_aa64isar1.apa=0 "
 	  "id_aa64isar2.gpa3=0 id_aa64isar2.apa3=0"	   },
 	{ "arm64.nomops",		"id_aa64isar2.mops=0" },
-	{ "arm64.nomte",		"id_aa64pfr1.mte=0" },
 	{ "arm64.nowfxt",		"id_aa64isar2.wfxt=0" },
+	{ "arm64.nomte",		"id_aa64pfr1.mte=0" },
 	{ "nokaslr",			"arm64_sw.nokaslr=1" },
 	{ "rodata=off",			"arm64_sw.rodataoff=1" },
+	{ "arm64.nohaft",		"id_aa64mmfr1.hafdbs=2" },
 	{ "arm64.nolva",		"id_aa64mmfr2.varange=0" },
 	{ "arm64.no32bit_el0",		"id_aa64pfr0.el0=1" },
 	{ "arm64.nompam",		"id_aa64pfr0.mpam=0 id_aa64pfr1.mpam_frac=0" },
@@ -444,6 +457,13 @@ void __init init_feature_override(u64 boot_status, const void *fdt,
 	__boot_status = boot_status;
 
 	parse_cmdline(fdt, chosen);
+
+	/*
+	 * Timed waits bypass the register-saving idle path on Apple M4+ cores.
+	 * Apply this after boot arguments so they cannot re-enable WFxT.
+	 */
+	if (IS_ENABLED(CONFIG_ARCH_APPLE) && midr_is_apple_m4_or_later(read_cpuid_id()))
+		__parse_cmdline("id_aa64isar2.wfxt=0", false);
 
 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
 		reg = prel64_pointer(regs[i].reg);

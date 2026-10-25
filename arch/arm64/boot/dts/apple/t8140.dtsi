@@ -410,7 +410,7 @@
 	 * the simple-bus.
 	 */
 	display: display-subsystem {
-		compatible = "apple,display-subsystem";
+		compatible = "apple,t8140-display-subsystem", "apple,display-subsystem";
 		/* disp0_dart is locked by the bootloader and must come first */
 		iommus = <&disp0_dart 0>;
 		/* generate a phandle for the loader */
@@ -491,8 +491,7 @@
 
 			/* PMP soc-device 9, which the PMP acknowledges */
 			pmp_report_gfx: report@9 {
-				compatible = "apple,t8140-pmp-v2-report-entry",
-					     "apple,t6000-pmp-v2-report-entry";
+				compatible = "apple,t8140-pmp-v2-report-entry";
 				reg = <0x9>;
 				label = "pmp-gfx";
 				#power-domain-cells = <0>;

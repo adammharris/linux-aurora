@@ -36,10 +36,29 @@ properties:
       - items:
           - enum:
               - apple,t6020-dart
+              - apple,t6041-dart
               - apple,t8122-dart
+              - apple,t8132-dart
               - apple,t8140-dart
               - apple,t8142-dart
           - const: apple,t8110-dart
+
+  apple,managed-sids:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      - const: 1
+      - const: 2
+    description: >
+      J713 radio ordinary stream ownership profile. Only these inactive
+      normal streams and their exact-RID entries may be adopted by the OS.
+      Other streams and RID entries remain inherited. The documented static
+      SID16 bypass role may be initialized only from a disabled stream with
+      no valid root; an existing bypass remains unchanged. PIODMA and other
+      reserved roles are not modified. This does not authorize a controller
+      reset or takeover of active page tables. Both the radio DART and PCI
+      host describe the same two ordinary streams. Error reporting must
+      already be unmasked at admission; the OS preserves the inherited global
+      error-mask policy rather than changing it for these streams.
 
   reg:
     maxItems: 1
@@ -55,8 +74,8 @@ properties:
   '#iommu-cells':
     enum: [1, 5]
     description:
-      Usually one cell describing the stream id emitted by a master. The
-      T6020 NHI DART uses five cells to describe a stream range and its
+      One cell describes the stream ID emitted by a master. Five cells
+      describe the stream ID followed by the 64-bit base and length of its
       device-visible DMA window.
 
   power-domains:
@@ -78,6 +97,15 @@ properties:
       Offset added to device-visible DMA addresses when indexing the DART page
       tables. This models host bridges which alias a low PCI bus aperture into
       a high DART translation window.
+
+  apple,firmware-root-handoff:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 1
+    description: >
+      The bootloader has reserved the actual three-level locked root and leaf
+      table pages as normal RAM and completed the display coprocessor power
+      handoff. Linux retains occupied root slots and excludes their entire
+      IOVA spans from allocation. This does not assert immutable descendants.
 
   apple,tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
@@ -111,21 +139,6 @@ required:
   - reg
   - '#iommu-cells'
   - interrupts
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6020-dart
-    then:
-      properties:
-        '#iommu-cells':
-          enum: [1, 5]
-    else:
-      properties:
-        '#iommu-cells':
-          const: 1
 
 additionalProperties: false
 

@@ -889,27 +889,31 @@ unsigned long arch_align_stack(unsigned long sp)
 #ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
 int arm64_bprm_prepare_mm(struct linux_binprm *bprm, bool compat)
 {
-	unsigned int requested = current->exec_page_shift ?:
-				 current->default_exec_page_shift;
-	unsigned int shift = arm64_exec_page_shift(compat,
-			cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE), PAGE_SHIFT,
-			requested);
+	/* Without user4k=on every image, AArch32 included, stays native. */
+	bool enabled = user4k_enabled();
+	bool has_4k = enabled && cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE);
+	unsigned int requested = 0, shift;
 
+	if (enabled)
+		requested = current->exec_page_shift ?:
+			    current->default_exec_page_shift;
+	shift = arm64_exec_page_shift(compat, has_4k, PAGE_SHIFT, requested);
+
+	/* begin_new_exec() falls back to this if the exec gains privilege. */
+	bprm->secure_page_shift = arm64_exec_page_shift(compat, has_4k,
+							PAGE_SHIFT, 0);
 	return bprm_set_page_shift(bprm, shift);
 }
 
-/* Return zero for the native default, or a validated alternative shift. */
+/*
+ * Return zero for the native default, or a validated alternative shift.
+ * Every alternative is refused with -EINVAL unless booted with user4k=on.
+ */
 int arch_exec_page_size_shift(unsigned long size)
 {
-	if (!size || size == PAGE_SIZE)
-		return 0;
-	if (size == SZ_4K)
-		return cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE) ?
-			12 : -EOPNOTSUPP;
-	if (PAGE_SIZE > SZ_16K && size == SZ_16K)
-		return cpus_have_final_cap(ARM64_HAS_USER16K_GRANULE) ?
-			14 : -EOPNOTSUPP;
-	return -EINVAL;
+	return arm64_exec_page_size_request(size, user4k_enabled(),
+			cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE),
+			cpus_have_final_cap(ARM64_HAS_USER16K_GRANULE));
 }
 #endif
 

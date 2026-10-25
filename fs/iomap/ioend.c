@@ -29,6 +29,7 @@ struct iomap_ioend *iomap_init_ioend(struct inode *inode,
 	ioend->io_offset = file_offset;
 	ioend->io_size = bio->bi_iter.bi_size;
 	ioend->io_sector = bio->bi_iter.bi_sector;
+	ioend->io_vi = NULL;
 	ioend->io_private = NULL;
 	return ioend;
 }
@@ -238,8 +239,6 @@ ssize_t iomap_add_to_ioend(struct iomap_writepage_ctx *wpc, struct folio *folio,
 
 	if (wpc->iomap.flags & IOMAP_F_SHARED)
 		ioend_flags |= IOMAP_IOEND_SHARED;
-	if (folio_test_dropbehind(folio))
-		ioend_flags |= IOMAP_IOEND_DONTCACHE;
 	if (pos == wpc->iomap.offset && (wpc->iomap.flags & IOMAP_F_BOUNDARY))
 		ioend_flags |= IOMAP_IOEND_BOUNDARY;
 
@@ -255,6 +254,9 @@ new_ioend:
 
 	if (!bio_add_folio(&ioend->io_bio, folio, map_len, poff))
 		goto new_ioend;
+
+	if (folio_test_dropbehind(folio))
+		bio_set_flag(&ioend->io_bio, BIO_COMPLETE_IN_TASK);
 
 	/*
 	 * Clamp io_offset and io_size to the incore EOF so that ondisk
@@ -384,6 +386,8 @@ static bool iomap_ioend_can_merge(struct iomap_ioend *ioend,
 		return false;
 
 	if (ioend->io_bio.bi_status != next->io_bio.bi_status)
+		return false;
+	if (ioend->io_private != next->io_private)
 		return false;
 	if (next->io_flags & IOMAP_IOEND_BOUNDARY)
 		return false;

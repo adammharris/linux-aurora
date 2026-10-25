@@ -3,6 +3,7 @@
 #include <linux/module.h>
 
 #include "cd321x-pm.h"
+#include "cd321x-setup.h"
 
 static void cd321x_resume_requires_snapshot_test(struct kunit *test)
 {
@@ -397,7 +398,8 @@ static void cd321x_busy_provider_completion_reopens_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
 	KUNIT_EXPECT_FALSE(test, pm.force_reconnect);
 	/* The PCIe worker's completion notification permits a fresh check. */
-	KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, (unsigned int)CD321X_LINK_EVENTS);
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
 	cd321x_pm_complete(&pm);
@@ -703,15 +705,384 @@ static void cd321x_held_mux_other_failure_test(struct kunit *test)
 /* Only a pipeline owned by another port skips the retry. */
 static void cd321x_display_taken_test(struct kunit *test)
 {
-	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC));
-	/* A PHY mid-transition or a pending SAFE state must be retried. */
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EBUSY));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0));
+	/* T8140/T8142: a PHY mid-transition or a pending SAFE state is retried. */
+	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC, true));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EBUSY, true));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, true));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT, true));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, true));
+	/* Other SoCs keep -EBUSY as the taken display. */
+	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-EBUSY, false));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ENOSPC, false));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, false));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, false));
+}
+
+static void cd321x_completion_failure_sequence_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_new_connection(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	cd321x_pm_complete(&pm);
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, (unsigned int)CD321X_LINK_EVENTS);
+
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	cd321x_pm_complete(&pm);
+	/* Completion after a successful forced restart must spend no budget. */
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, CD321X_LINK_EVENTS - 1U);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, CD321X_LINK_EVENTS - 2U);
+}
+
+static void cd321x_ready_keeps_failed_recovery_bounded_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	unsigned int event, attempt;
+
+	cd321x_pm_new_connection(&pm);
+	for (event = 0; event < CD321X_LINK_EVENTS; event++) {
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+		for (attempt = 0; attempt < CD321X_RESUME_ATTEMPTS; attempt++) {
+			KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+			cd321x_pm_snapshot_ready(&pm);
+			cd321x_pm_retry(&pm, true);
+		}
+		KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	}
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_link_event(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, 0U);
+}
+
+static void cd321x_ready_preserves_failure_and_lifecycle_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_init(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
+	cd321x_pm_prepare(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	cd321x_pm_remove(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+}
+
+static void cd321x_ready_with_exhausted_fault_budget_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	unsigned int i;
+
+	cd321x_pm_new_connection(&pm);
+	for (i = 0; i < CD321X_LINK_EVENTS; i++) {
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+		cd321x_pm_snapshot_ready(&pm);
+		cd321x_pm_complete(&pm);
+	}
+	/* The provider stays busy activating a host until the reads run out. */
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	for (i = 0; i < CD321X_RESUME_ATTEMPTS; i++) {
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+		cd321x_pm_snapshot_ready(&pm);
+		KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm, false),
+				i + 1 < CD321X_RESUME_ATTEMPTS);
+	}
+	KUNIT_ASSERT_EQ(test, pm.phase, CD321X_PM_STALE);
+	/* The refused fault must not swallow the completion that came with it. */
+	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, true, true, false),
+			CD321X_PM_FAULT_REFUSED | CD321X_PM_READY_ACCEPTED);
+	KUNIT_EXPECT_FALSE(test, pm.provider_busy);
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, 0U);
+	KUNIT_EXPECT_TRUE(test, cd321x_pm_begin_read(&pm));
+}
+
+static void cd321x_fault_outranks_coalesced_ready_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_new_connection(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	/* An accepted fault already cleared provider_busy: READY adds nothing. */
+	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, true, true, false),
+			CD321X_PM_FAULT_ACCEPTED);
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, CD321X_LINK_EVENTS - 1U);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_REVALIDATE);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, false, false, false), 0U);
+}
+
+static void cd321x_ready_during_apply_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_new_connection(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, false));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_activation_ready(&pm));
+	/* The old queued APPLY cannot erase the requested fresh read. */
+	cd321x_pm_complete(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_activation_ready(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, (unsigned int)CD321X_LINK_EVENTS);
+}
+
+struct cd321x_setup_fixture {
+	u8 state;
+	u64 mask;
+	unsigned int reads, writes;
+	unsigned int fail_read, fail_s0, fail_mask;
+};
+
+static int cd321x_fake_read_state(void *ctx, u8 *state)
+{
+	struct cd321x_setup_fixture *f = ctx;
+
+	f->reads++;
+	if (f->fail_read) {
+		f->fail_read--;
+		return -EIO;
+	}
+	*state = f->state;
+	return 0;
+}
+
+static int cd321x_fake_read_mask(void *ctx, u64 *mask)
+{
+	struct cd321x_setup_fixture *f = ctx;
+
+	f->reads++;
+	*mask = f->mask;
+	return 0;
+}
+
+static int cd321x_fake_set_s0(void *ctx)
+{
+	struct cd321x_setup_fixture *f = ctx;
+
+	f->writes++;
+	if (f->fail_s0) {
+		f->fail_s0--;
+		return -EIO;
+	}
+	f->state = 0;
+	return 0;
+}
+
+static int cd321x_fake_set_mask(void *ctx, u64 mask)
+{
+	struct cd321x_setup_fixture *f = ctx;
+
+	f->writes++;
+	if (f->fail_mask) {
+		f->fail_mask--;
+		return -EIO;
+	}
+	f->mask = mask;
+	return 0;
+}
+
+static const struct cd321x_setup_ops cd321x_fake_setup_ops = {
+	.read_state = cd321x_fake_read_state,
+	.read_mask = cd321x_fake_read_mask,
+	.set_s0 = cd321x_fake_set_s0,
+	.set_mask = cd321x_fake_set_mask,
+};
+
+static void cd321x_reset_setup_retry_test(struct kunit *test)
+{
+	unsigned int failure;
+
+	for (failure = 0; failure < 3; failure++) {
+		struct cd321x_pm_state pm = {};
+		struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507 };
+
+		if (!failure)
+			f.fail_read = 1;
+		else if (failure == 1)
+			f.fail_s0 = 1;
+		else
+			f.fail_mask = 1;
+		KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), -EIO);
+		KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+		/* No further interrupt follows the cleared reset event. */
+		KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0, 0x602,
+						    &cd321x_fake_setup_ops, &f), 1);
+		KUNIT_EXPECT_EQ(test, f.state, (u8)0);
+		KUNIT_EXPECT_EQ(test, f.mask, (u64)0x602);
+		KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+	}
+}
+
+static void cd321x_reset_setup_bound_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507, .fail_s0 = 99 };
+	unsigned int i;
+
+	for (i = 0; i < 10; i++)
+		KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), -EIO);
+	KUNIT_EXPECT_EQ(test, f.writes, (unsigned int)CD321X_RESUME_ATTEMPTS);
+	KUNIT_EXPECT_EQ(test, pm.setup_attempts_left, 0U);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+}
+
+static void cd321x_reset_setup_pm_fence_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507, .fail_mask = 1 };
+
+	KUNIT_ASSERT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), -EIO);
+	cd321x_pm_prepare(&pm);
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.writes, 2U);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0, 0x602,
+						    &cd321x_fake_setup_ops, &f), 1);
+	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+	cd321x_pm_remove(&pm);
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.writes, 4U);
+	cd321x_pm_init(&pm);
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.writes, 4U);
+}
+
+static void cd321x_reset_setup_healthy_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .mask = 0x602 };
+
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0x602, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_EQ(test, f.reads, 2U);
+	KUNIT_EXPECT_EQ(test, f.writes, 0U);
+	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+}
+
+static void cd321x_reset_first_irq_during_prepare_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507 };
+
+	cd321x_pm_prepare(&pm);
+	/* The IRQ is cleared before suspend has disabled the controller IRQ. */
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_TRUE(test, pm.setup_pending);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, f.writes, 0U);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_PREPARED);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0, 0x602,
+						    &cd321x_fake_setup_ops, &f), 1);
+	KUNIT_EXPECT_EQ(test, f.state, (u8)0);
+	KUNIT_EXPECT_EQ(test, f.mask, (u64)0x602);
+	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+}
+
+static void cd321x_reset_first_irq_before_ready_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	struct cd321x_setup_fixture f = { .state = 7, .mask = 0x0507 };
+
+	cd321x_pm_init(&pm);
+	/* The IRQ is registered before port initialization publishes ready. */
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 1, 0x602,
+						    &cd321x_fake_setup_ops, &f), 0);
+	KUNIT_EXPECT_TRUE(test, pm.setup_pending);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, f.writes, 0U);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_INITIALIZING);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_ready(&pm));
+	KUNIT_EXPECT_EQ(test, cd321x_setup_run(&pm, 0, 0x602,
+						    &cd321x_fake_setup_ops, &f), 1);
+	KUNIT_EXPECT_EQ(test, f.state, (u8)0);
+	KUNIT_EXPECT_EQ(test, f.mask, (u64)0x602);
+	KUNIT_EXPECT_FALSE(test, pm.setup_pending);
+}
+
+static void cd321x_restore_ignores_fault_budget_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	unsigned int i;
+
+	cd321x_pm_new_connection(&pm);
+	for (i = 0; i < CD321X_LINK_EVENTS; i++)
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_link_event(&pm));
+	KUNIT_ASSERT_FALSE(test, cd321x_pm_link_event(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	cd321x_pm_complete(&pm);
+
+	/* A sleep restore still gets its bounded fresh read. */
+	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, false, false, true),
+			CD321X_PM_RESTORE_ACCEPTED);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_REVALIDATE);
+	KUNIT_EXPECT_EQ(test, pm.attempts_left, (unsigned int)CD321X_RESUME_ATTEMPTS);
+	KUNIT_EXPECT_EQ(test, pm.link_events_left, 0U);
+	KUNIT_EXPECT_TRUE(test, cd321x_pm_begin_read(&pm));
+
+	/* A prepared port revalidates on its own resume instead. */
+	cd321x_pm_prepare(&pm);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, false, false, true), 0U);
+}
+
+static void cd321x_dp_send_test(struct kunit *test)
+{
+	const u32 hpd = DP_STATUS_HPD_STATE | DP_STATUS_CON_UFP_D;
+	const u32 irq = hpd | DP_STATUS_IRQ_HPD;
+
+	/* An unchanged status is not sent, also one that carries IRQ_HPD. */
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, hpd, false), CD321X_DP_SEND_NONE);
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(irq, irq, false), CD321X_DP_SEND_NONE);
+	/* A new IRQ_HPD from the partner is a changed status. */
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, irq, false), CD321X_DP_SEND);
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(irq, hpd, false), CD321X_DP_SEND);
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, 0, false), CD321X_DP_SEND);
+	/* An HPD pulse is sent once, as an edge if the route holds IRQ_HPD. */
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, irq, true), CD321X_DP_SEND);
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(irq, irq, true), CD321X_DP_SEND_EDGE);
 }
 
 static struct kunit_case cd321x_pm_cases[] = {
+	KUNIT_CASE(cd321x_reset_first_irq_before_ready_test),
+	KUNIT_CASE(cd321x_reset_first_irq_during_prepare_test),
+	KUNIT_CASE(cd321x_reset_setup_retry_test),
+	KUNIT_CASE(cd321x_reset_setup_bound_test),
+	KUNIT_CASE(cd321x_reset_setup_pm_fence_test),
+	KUNIT_CASE(cd321x_reset_setup_healthy_test),
+	KUNIT_CASE(cd321x_completion_failure_sequence_test),
+	KUNIT_CASE(cd321x_ready_keeps_failed_recovery_bounded_test),
+	KUNIT_CASE(cd321x_ready_preserves_failure_and_lifecycle_test),
+	KUNIT_CASE(cd321x_ready_with_exhausted_fault_budget_test),
+	KUNIT_CASE(cd321x_fault_outranks_coalesced_ready_test),
+	KUNIT_CASE(cd321x_ready_during_apply_test),
 	KUNIT_CASE(cd321x_busy_provider_preserves_connection_test),
 	KUNIT_CASE(cd321x_busy_provider_completion_reopens_test),
 	KUNIT_CASE(cd321x_busy_provider_keeps_real_failure_test),
@@ -746,6 +1117,8 @@ static struct kunit_case cd321x_pm_cases[] = {
 	KUNIT_CASE(cd321x_held_mux_retries_bounded_test),
 	KUNIT_CASE(cd321x_held_mux_other_failure_test),
 	KUNIT_CASE(cd321x_display_taken_test),
+	KUNIT_CASE(cd321x_dp_send_test),
+	KUNIT_CASE(cd321x_restore_ignores_fault_budget_test),
 	{}
 };
 

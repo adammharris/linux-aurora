@@ -61,12 +61,10 @@ static const int TQ_PRTY_TABLE[ANE_TQ_COUNT] = { 0x1, 0x2, 0x3,	 0x4,
 
 /* The ane SET block (m1n1 ANE.ps_map) maps the pmgr power-state words
  * for this engine (set0, base, set1..4). pmgr reads are always safe and
- * give recovery its ACTUAL power evidence; the SET words themselves are
- * firmware-locked: a direct write external-aborts the SoC. Bisect
- * evidence, 2026-09-16: the T6001 kill is netconsole-named at
- * 0x28e08c000 (PS_SET0 down, all sets gated); T8103 hard-reset the same
- * way at 0x23b70c000 with the 95dbcf3-era gate armed. No code here ever
- * writes the SET block.
+ * give recovery its ACTUAL power state; the SET words themselves are
+ * firmware-locked: a direct write external-aborts the SoC (T6001 at
+ * 0x28e08c000 with PS_SET0 down and all sets gated; T8103 hard-resets
+ * the same way at 0x23b70c000). No code here ever writes the SET block.
  */
 #define ANE_PS_ACTUAL_MASK	  0xf0
 #define ANE_PS_WORDS		  6 /* set0, base, set1..4 */
@@ -91,7 +89,7 @@ u32 ane_ps_act(struct ane_device *ane)
 
 /* Bisect probe: per-word named reads of the SET window. Each word logs
  * before its readl, so a window whose address does not decode on this
- * SoC is named by the last off-box line (word index + byte offset)
+ * SoC is named by the last line logged (word index + byte offset)
  * instead of a silent hard reset between two other prints. The lines
  * are debug messages: dynamic debug turns them on.
  */
@@ -121,7 +119,7 @@ u32 ane_ps_act_probe(struct ane_device *ane)
 /* Recovery-path MMIO logging. Every write prints before and after, and
  * every engine read prints its value, each line carrying the pmgr
  * ACTUAL of the owning partitions. A write that external-aborts the
- * SoC is then named by the last line the off-box netconsole carried,
+ * SoC is then named by the last line that reached a remote console,
  * and the bisect starts from that register instead of a guess. The
  * lines are debug messages: dynamic debug turns them on.
  */
@@ -283,12 +281,12 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 
 	for (;;) {
 		/* Latch-first completion poll. Engine register reads hang
-		 * jwm1 once a DART fault has landed (lockups 1 and 3: the
-		 * journal ends inside the 1-microsecond completion poll,
-		 * before any fault handling ran), so the poll op consults
-		 * the DART error latch first and stops the poll before the
-		 * engine is touched. Residual hazard: a fault landing
-		 * between one iteration's latch read and engine read.
+		 * the SoC (T8103) once a DART fault has landed, inside the
+		 * 1-microsecond completion poll and before any fault
+		 * handling can run, so the poll op consults the DART error
+		 * latch first and stops the poll before the engine is
+		 * touched. Residual hazard: a fault landing between one
+		 * iteration's latch read and engine read.
 		 */
 		err = read_poll_timeout(ane_tm_poll_step, status,
 					status != 0, 1, 1000000, false,
@@ -327,7 +325,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 		}
 		status = tq_read32(ane, TQ_NID1(req->qid));
 		tq_write32(ane, TQ_NID1(req->qid), status & ~1U);
-		/* Kept from the qualified completion sequence (clear the
+		/* Kept from the established completion sequence (clear the
 		 * NID valid bit, then the queue status). writel() already
 		 * orders the two writes to the engine.
 		 */
@@ -393,7 +391,7 @@ wedge:
  * wedge clears, BO_FREE unmaps them through the normal path again.
  * Callers hold engine_lock.
  *
- * T6001 note, bisect evidence 2026-09-16: its set0/base islands are
+ * T6001 note: its set0/base islands are
  * firmware-locked (direct pmgr writes external-abort; see the SET block
  * comment above) and hold the tm/tq file in retention through any
  * genpd cycle - TQ_EN still reads 0x3000 after a 20 ms and a 2 s gate,
@@ -506,7 +504,7 @@ static void ane_tm_drain_retained(struct ane_device *ane)
 	int line, qid;
 
 	/* Stop the TM first: the cycle leaves the enable|halt latch set
-	 * (TQ_EN 0x3000, 2026-09-16 evidence). Clear both bits so the
+	 * (TQ_EN reads 0x3000). Clear both bits so the
 	 * re-arm below starts the TM from a defined stopped state.
 	 */
 	ane_rec_writel(ane, "TM_TQ_EN stop tm+0x0c",
@@ -564,8 +562,8 @@ static void ane_tm_drain_retained(struct ane_device *ane)
 			tq_write32(ane, TQ_NID1(qid), nid & ~1U);
 	}
 
-	/* Retention evidence for the off-box console: what the dead task
-	 * left in the committed counter and the error latches.
+	/* Log the retained state: what the dead task left in the
+	 * committed counter and the error latches.
 	 */
 	ane_rec_read32(ane, "TM_COMMITTED tm+0x44 (drain)",
 		       ane->engine + ANE_TM_BASE + TM_COMMITTED);

@@ -284,7 +284,7 @@ int main(void)
  assert(safe(&p)==-EIO&&writes==before&&p.dp_usb_context_valid==valid&&p.dp_usb_context_dirty==dirty&&p.dp_owned_pmas==owned);balanced(&p);
  resume_error=0;assert(safe(&p)==0);balanced(&p);
  /* PM resume is NOT proof of ACK. Real parking timeout stays fatal. */
- prepare(&p,true,true,false);fail_caller="atcphy_pipehandler_lock";before=writes;
+ prepare(&p,true,true,false);fail_caller="atcphy_pipehandler_lock_timeout";before=writes;
  assert(safe(&p)==-ETIMEDOUT&&writes==before&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3&&p.mode_dirty);balanced(&p);
  fail_caller=NULL;assert(safe(&p)==0);balanced(&p);
  for(unsigned int missing=0;missing<5;missing++){
@@ -354,7 +354,7 @@ int main(void)
  }
  prepare(&p,true,true,false);link_present=link_suspended=true;link_error=-EIO;
  assert(safe(&p)==-EIO);balanced(&p);link_error=0;assert(safe(&p)==0);balanced(&p);
- prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock";before=writes;
+ prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock_timeout";before=writes;
  assert(safe(&p)==-ETIMEDOUT&&writes==before&&p.mode_dirty&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);balanced(&p);
  fail_caller=NULL;assert(safe(&p)==0);balanced(&p);
 #else
@@ -384,7 +384,7 @@ int main(void)
  balanced(&p);port_on_error=0;before=writes;
  assert(select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==0&&port_ons==2&&!p.usb3_port_off&&writes==before);balanced(&p);
  /* PM resume is NOT proof of ACK; the port is down and stays down. */
- prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock";before=writes;
+ prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock_timeout";before=writes;
  assert(safe(&p)==-ETIMEDOUT&&writes==before&&p.mode_dirty&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
  assert(usb3_port_down&&p.usb3_port_off&&!port_ons);balanced(&p);
  fail_caller=NULL;assert(safe(&p)==0);balanced(&p);
@@ -485,7 +485,7 @@ struct notifier_block { int (*notifier_call)(struct notifier_block *,unsigned lo
 struct cd321x {
  struct tps6598x tps;
  struct work update_work,resume_work;
- int link_event;
+ int link_event,ready_event,restore_event;
  struct cd321x_pm_state pm;
  void *mux,*tbt_switch,*port_altmode_dp,*port_altmode_tbt;
  struct fwnode_handle *connector_fwnode;
@@ -545,10 +545,11 @@ static void balanced(void) {
  assert(!ports&&!altmodes&&!muxes&&!switches&&!notifiers&&!connector.refs);
 }
 int main(void) {
+ (void)cd321x_pm_notifications;
  struct cd321x c;
  struct cd321x_pm_state budget;
  cd321x_pm_init(&budget);assert(cd321x_pm_ready(&budget));
- assert(cd321x_display_taken(-ENOSPC)&&!cd321x_display_taken(-EBUSY)&&!cd321x_display_taken(0));
+ assert(cd321x_display_taken(-ENOSPC,true)&&!cd321x_display_taken(-EBUSY,true)&&!cd321x_display_taken(0,true)&&cd321x_display_taken(-EBUSY,false)&&!cd321x_display_taken(-ENOSPC,false)&&!cd321x_display_taken(0,false));
  for(unsigned int i=0;i<CD321X_RESUME_ATTEMPTS;i++){
   assert(cd321x_pm_begin_read(&budget));cd321x_pm_snapshot_ready(&budget);
   assert(cd321x_pm_retry(&budget,false)==(i+1<CD321X_RESUME_ATTEMPTS));

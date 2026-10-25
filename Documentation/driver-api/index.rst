@@ -79,6 +79,7 @@ Subsystem-specific APIs
 
    80211/index
    acpi/index
+   ../soc/apple/index
    backlight/lp855x-driver.rst
    clk
    coco/index
@@ -105,6 +106,7 @@ Subsystem-specific APIs
    interconnect
    ipmb
    ipmi
+   issei/index
    libata
    mailbox
    md/index

@@ -3,8 +3,15 @@ Date:		October 2026
 KernelVersion:	7.1
 Contact:	Chris Kearney <chris@kearneymail.com>
 Description:
-		(RO) Version of the diag interface: "1" for the attributes
-		and values described in this file.
+		(RO) Version of the diag interface: "2" for the attributes
+		and values described in this file. Version 2 added
+		sensor_attach and restore; version 1 had neither.
+
+		Within a version, attributes are only added, and an existing
+		attribute keeps its values and their meaning. A reader tests
+		for an attribute it needs rather than for a version: a
+		version 2 kernel may lack xart_guard, xart_guard_list,
+		xart_guard_refusals and matching, which came later.
 
 		The diag directory holds passive diagnostics of the Apple
 		SEP (Secure Enclave Processor) driver, apple_sep, for
@@ -174,7 +181,9 @@ Date:		October 2026
 KernelVersion:	7.1
 Contact:	Chris Kearney <chris@kearneymail.com>
 Description:
-		(RO) Whether Touch ID is ready to enrol and verify.
+		(RO) Whether the Touch ID sensor side is ready to enrol and
+		verify. Whether the enclave may save the state a match
+		writes, which the xART guard can refuse, is in matching.
 
 		=========	============================================
 		unknown		Still in progress: the boot-time bring-up has
@@ -210,3 +219,148 @@ Description:
 		tool waiting for "ready" has to open it, or let its client
 		do so, first. Enrol and verify also need xart to read
 		"enabled".
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/sensor_attach
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) How far the automatic attach of the fingerprint sensor
+		got. Touch ID activation brings the sensor up, with spaced
+		retries, and if that falls short one more round follows
+		about 10 s later, once the boot-time bring-up is over.
+
+		=========	============================================
+		unknown		Touch ID has not been activated, or its
+				attach has not decided yet.
+		attached	The sensor came online and the enclave's
+				identity view was proven; restore says what
+				became of the enrolled fingerprints.
+		retrying	The attach-time bring-up fell short and the
+				later round has still to run.
+		not-ready	Every automatic bring-up fell short. Capture
+				is unavailable until an enrol or verify
+				brings the sensor up.
+		=========	============================================
+
+		touchid follows every later bring-up, while this attribute
+		describes the attach alone.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/restore
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) What became of the enrolled fingerprints when the sensor
+		was first attached this boot. Decided once, by the first
+		bring-up that reaches the enclave's identity view.
+
+		========	============================================
+		unknown		No bring-up has reached the identity view.
+		restored	The enclave lists the enrolled fingerprints
+				and their restore was proven; the driver
+				logged "Touch ID: restored N".
+		empty		The enclave lists no enrolled fingerprint.
+				Touch ID can enrol, and has nothing to match.
+		unproven	The enclave lists fingerprints, but their
+				restore could not be proven. Matching is
+				refused this boot.
+		========	============================================
+
+		A tool deciding whether Touch ID is ready to match at boot
+		reads touchid "ready", sensor_attach "attached", restore
+		"restored" (or "empty", with nothing to match) and matching
+		(not "blocked").
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/xart_guard
+Date:		October 2026
+KernelVersion:	7.2
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) The level of the xART guard, which keeps the enclave's
+		writes to the shared gigalocker away from session records
+		this Linux install did not create, as an unsigned decimal.
+		It is the effective level, after the xart_guard parameter's
+		default (-1) has taken the platform's. Fixed at probe.
+
+		==	================================================
+		0	No guard runs: xart_guard=0, the platform's
+			default is 0, or xART writes are disabled (see
+			xart).
+		1	Writes and deletes of session records that
+			existed at probe and are not on Linux's list of
+			its own records are refused.
+		2	As 1, and writes to the shared root records are
+			refused too.
+		==	================================================
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/xart_guard_list
+Date:		October 2026
+KernelVersion:	7.2
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) Whether the guard loaded Linux's list of the session
+		records it created (/var/lib/aurora-sep-xart-owned.bin).
+		Fixed at probe.
+
+		===========	=========================================
+		none		No guard runs (xart_guard reads "0").
+		loaded		The list was read. An empty list is
+				"loaded" too, and does not show that Touch
+				ID was set up without the guard: a keybag
+				created under it may write no record, and a
+				rollback of the root file system can empty
+				the list.
+		unavailable	The list could not be opened or read. Every
+				session record that existed at probe is
+				protected and no new one can be adopted, so
+				every session write is refused.
+		===========	=========================================
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/xart_guard_refusals
+Date:		October 2026
+KernelVersion:	7.2
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) How many of the enclave's xART writes and deletes the
+		guard has refused since probe, as an unsigned decimal. A
+		new record that could not be added to Linux's list counts
+		too, since its write is refused. Only the first few
+		refusals are logged; this counts them all.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/matching
+Date:		October 2026
+KernelVersion:	7.2
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) Whether a fingerprint match can save the state it
+		writes to xART, as far as the driver can tell. A match
+		rewrites session records that existed before it, so the xART
+		guard can refuse it, and the verify then fails although
+		the fingerprints were restored.
+
+		==========	==========================================
+		usable		xART writes are enabled and no guard runs.
+		unverified	A guard runs with its list loaded on a
+				warm-attach Mac (boot "warm") and has refused
+				nothing yet. Whether every record a match
+				rewrites is on the list is not known until a
+				match is tried.
+		blocked		A match's write is refused or known to be:
+				xART writes are disabled (xart "disabled"),
+				the guard has refused a write
+				(xart_guard_refusals above 0), the guard
+				has no list (xart_guard_list
+				"unavailable"), or a guard runs on a
+				cold-boot Mac (boot "cold"). On a cold-boot
+				Mac, creating the keybag needs xart_guard=0,
+				so the records a match rewrites are not on
+				the list.
+		==========	==========================================
+
+		For the guard cases the documented opt-out is xart_guard=0,
+		which lets the enclave rewrite session records that another
+		OS on the Mac may have created; see
+		tools/aurora-sep/XART-SAFETY.md. During a boot the value
+		can only move from "unverified" to "blocked", once the guard
+		refuses a write.

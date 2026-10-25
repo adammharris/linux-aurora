@@ -504,13 +504,12 @@ pub(crate) fn reserved_region(dev: &kernel::device::Device, name: &CStr) -> Resu
     let ret = unsafe {
         bindings::of_reserved_mem_region_to_resource_byname(np, name.as_char_ptr(), &mut res)
     };
-    to_result(ret).map_err(|e| {
+    to_result(ret).inspect_err(|e| {
         pr_err!(
             "apple_sep: reserved-memory region '{}' is unavailable ({:?})\n",
             name,
             e
         );
-        e
     })?;
 
     let size = res.end.wrapping_sub(res.start).wrapping_add(1);

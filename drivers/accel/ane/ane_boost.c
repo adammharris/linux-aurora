@@ -3,17 +3,14 @@
  * Engine-busy CPU cluster boost.
  *
  * Bandwidth-bound programs run at a speed set by the CPU cluster
- * p-states. Measured on jwm1 (T8103, 2026-09-25, ane-linux-experiments
- * receipt jwm1-ane-dvfs-boost): with a mostly-sleeping submitter at
- * normal priority, 75 of 489 Qwen decode steps take 100-175 ms instead
- * of 70, every program in a slow step ~2x its normal wall, the
- * submitter's CPU time and run delay unchanged; both clusters pinned
- * at their top p-state (performance governor, or SCHED_FIFO for the
- * submitter, which schedutil boosts the same way) -> 0 of 489. The
- * whole-encoder Parakeet program (140 ms) moves too once the QoS lapses
- * mid-submit: timed from submit start, the hold dropped 100 ms into
- * every encoder run, median 171 ms (140-238); held to completion, 138.0
- * (137.7-138.7), jwm1 2026-09-25. The likely
+ * p-states. On T8103, with a mostly-sleeping submitter at normal
+ * priority, some submits run about twice as long as normal, while the
+ * submitter's CPU time and run delay stay unchanged; with both clusters
+ * pinned at their top p-state (performance governor, or SCHED_FIFO for
+ * the submitter, which schedutil boosts the same way) the slow submits
+ * disappear. A single long program slows down as well if the QoS
+ * lapses before it completes, so the hold must last from submit start
+ * to completion, and the idle delay counts from completion. The likely
  * mechanism is the second p-state field apple-soc-cpufreq writes with
  * the cluster p-state on T8103 only (DVFS_CMD PS2, has_ps2); the
  * memory-controller tuning its author named as unimplemented is still
@@ -113,7 +110,7 @@ void ane_boost_end(struct ane_device *ane)
 	b->busy = false;
 	b->last_end = jiffies;
 	if (b->on)
-		mod_delayed_work(system_wq, &b->off,
+		mod_delayed_work(system_dfl_wq, &b->off,
 				 msecs_to_jiffies(boost_idle_ms));
 	mutex_unlock(&b->lock);
 }

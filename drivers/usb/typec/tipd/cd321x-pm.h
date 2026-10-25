@@ -6,6 +6,7 @@
 
 #include <linux/minmax.h>
 #include <linux/types.h>
+#include <linux/usb/typec_dp.h>
 
 #define CD321X_RESUME_ATTEMPTS 3
 #define CD321X_LINK_EVENTS 3
@@ -47,11 +48,15 @@ struct cd321x_pm_state {
 	/* When the change was first held up, in milliseconds. */
 	unsigned int mux_since_ms;
 	bool force_reconnect;
+	bool provider_busy;
+	bool setup_pending;
+	unsigned int setup_attempts_left;
 };
 
 static inline void cd321x_pm_new_connection(struct cd321x_pm_state *pm)
 {
 	pm->link_events_left = CD321X_LINK_EVENTS;
+	pm->provider_busy = false;
 }
 
 static inline void cd321x_pm_init(struct cd321x_pm_state *pm)
@@ -66,12 +71,29 @@ static inline bool cd321x_pm_ready(struct cd321x_pm_state *pm)
 		return false;
 	pm->phase = CD321X_PM_REVALIDATE;
 	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+	if (pm->setup_pending)
+		pm->setup_attempts_left = CD321X_RESUME_ATTEMPTS;
 	return true;
 }
 
 static inline bool cd321x_pm_can_update(const struct cd321x_pm_state *pm)
 {
-	return pm->phase == CD321X_PM_RUNNING || pm->phase == CD321X_PM_APPLY;
+	return !pm->setup_pending &&
+	       (pm->phase == CD321X_PM_RUNNING || pm->phase == CD321X_PM_APPLY);
+}
+
+/*
+ * Ends the retries of a change that a mux held up, see cd321x_pm_mux_held().
+ * Returns true if there were any.
+ */
+static inline bool cd321x_pm_mux_done(struct cd321x_pm_state *pm)
+{
+	bool retried = pm->mux_retry_ms;
+
+	pm->mux_retry_ms = 0;
+	pm->mux_retries = 0;
+	pm->mux_since_ms = 0;
+	return retried;
 }
 
 /*
@@ -95,6 +117,8 @@ static inline void cd321x_pm_prepare(struct cd321x_pm_state *pm)
 	pm->attempts_left = 0;
 	/* The resume read applies the state afresh. */
 	cd321x_pm_mux_done(pm);
+	pm->setup_attempts_left = 0;
+	pm->provider_busy = false;
 }
 
 static inline bool cd321x_pm_resume(struct cd321x_pm_state *pm)
@@ -103,6 +127,8 @@ static inline bool cd321x_pm_resume(struct cd321x_pm_state *pm)
 		return false;
 	pm->phase = CD321X_PM_REVALIDATE;
 	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+	if (pm->setup_pending)
+		pm->setup_attempts_left = CD321X_RESUME_ATTEMPTS;
 	cd321x_pm_new_connection(pm);
 	return true;
 }
@@ -116,10 +142,67 @@ static inline bool cd321x_pm_link_event(struct cd321x_pm_state *pm)
 
 	/* Host reprobes must not create an unlimited series of recovery runs. */
 	pm->link_events_left--;
+	pm->provider_busy = false;
 	pm->phase = CD321X_PM_REVALIDATE;
 	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
 	/* A stale notification does not itself prove the current session failed. */
 	return true;
+}
+
+static inline bool cd321x_pm_activation_ready(struct cd321x_pm_state *pm)
+{
+	/* A completion cannot refill failed recovery or restart a healthy cable. */
+	if (!pm->provider_busy || pm->force_reconnect ||
+	    (pm->phase != CD321X_PM_REVALIDATE && pm->phase != CD321X_PM_APPLY &&
+	     pm->phase != CD321X_PM_STALE))
+		return false;
+
+	pm->provider_busy = false;
+	pm->phase = CD321X_PM_REVALIDATE;
+	if (!pm->attempts_left)
+		pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+	return true;
+}
+
+static inline bool cd321x_pm_restore(struct cd321x_pm_state *pm)
+{
+	/* A prepared port revalidates on its own resume. */
+	if (pm->phase == CD321X_PM_INITIALIZING ||
+	    pm->phase == CD321X_PM_PREPARED || pm->phase == CD321X_PM_REMOVED)
+		return false;
+
+	/* One bounded fresh read per request; not charged to the fault budget. */
+	pm->provider_busy = false;
+	pm->phase = CD321X_PM_REVALIDATE;
+	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+	return true;
+}
+
+#define CD321X_PM_FAULT_ACCEPTED	0x1U
+#define CD321X_PM_FAULT_REFUSED		0x2U
+#define CD321X_PM_READY_ACCEPTED	0x4U
+#define CD321X_PM_RESTORE_ACCEPTED	0x8U
+
+/*
+ * Apply the link fault and activation completion one worker pass collected.
+ * An accepted fault clears provider_busy, so a completion that came with it
+ * changes nothing more. A fault the budget refuses must not swallow the
+ * completion.
+ */
+static inline unsigned int cd321x_pm_notifications(struct cd321x_pm_state *pm,
+						   bool fault, bool ready,
+						   bool restore)
+{
+	unsigned int res = 0;
+
+	if (restore && cd321x_pm_restore(pm))
+		res |= CD321X_PM_RESTORE_ACCEPTED;
+	if (fault)
+		res |= cd321x_pm_link_event(pm) ? CD321X_PM_FAULT_ACCEPTED :
+						  CD321X_PM_FAULT_REFUSED;
+	if (ready && cd321x_pm_activation_ready(pm))
+		res |= CD321X_PM_READY_ACCEPTED;
+	return res;
 }
 
 static inline bool cd321x_pm_begin_read(struct cd321x_pm_state *pm)
@@ -141,6 +224,7 @@ static inline bool cd321x_pm_retry(struct cd321x_pm_state *pm, bool reconnect)
 	cd321x_pm_mux_done(pm);
 	/* Runtime cable updates need the same bounded fresh-read recovery. */
 	if (pm->phase == CD321X_PM_RUNNING) {
+		pm->provider_busy = !reconnect;
 		pm->force_reconnect |= reconnect;
 		pm->phase = CD321X_PM_REVALIDATE;
 		pm->attempts_left = CD321X_RESUME_ATTEMPTS;
@@ -148,6 +232,7 @@ static inline bool cd321x_pm_retry(struct cd321x_pm_state *pm, bool reconnect)
 	}
 	if (pm->phase != CD321X_PM_REVALIDATE && pm->phase != CD321X_PM_APPLY)
 		return false;
+	pm->provider_busy = !reconnect;
 	pm->force_reconnect |= reconnect;
 	if (pm->attempts_left) {
 		pm->phase = CD321X_PM_REVALIDATE;
@@ -270,6 +355,7 @@ static inline void cd321x_pm_complete(struct cd321x_pm_state *pm)
 		pm->phase = CD321X_PM_RUNNING;
 		pm->attempts_left = 0;
 		pm->force_reconnect = false;
+		pm->provider_busy = false;
 	}
 }
 
@@ -286,9 +372,33 @@ static inline void cd321x_pm_remove(struct cd321x_pm_state *pm)
  * USB path is set up without the display and nothing is retried.  Any other
  * error, such as -EBUSY from a PHY in the middle of a transition, is retried.
  */
-static inline bool cd321x_display_taken(int ret)
+static inline bool cd321x_display_taken(int ret, bool enospc)
 {
-	return ret == -ENOSPC;
+	return ret == (enospc ? -ENOSPC : -EBUSY);
+}
+
+enum cd321x_dp_send {
+	CD321X_DP_SEND_NONE,	/* the display route holds this status */
+	CD321X_DP_SEND,		/* send the status */
+	CD321X_DP_SEND_EDGE,	/* send it without IRQ_HPD first, then with it */
+};
+
+/*
+ * What a DP alt mode update with DP status @status sends to the display
+ * route, which holds @applied for the same pin assignment and configuration.
+ * The route drops a status equal to the one it holds, and so does this: an
+ * IRQ_HPD that the partner's last status still carries is not a new request.
+ * @pulse is a new request: the sink dropped HPD and raised it again since the
+ * last update (@status has IRQ_HPD set for it). When the route holds IRQ_HPD
+ * already, the request is sent as an edge, so that the route sees it.
+ */
+static inline enum cd321x_dp_send cd321x_dp_send(u32 applied, u32 status,
+						 bool pulse)
+{
+	if (pulse)
+		return applied & DP_STATUS_IRQ_HPD ? CD321X_DP_SEND_EDGE :
+						     CD321X_DP_SEND;
+	return applied == status ? CD321X_DP_SEND_NONE : CD321X_DP_SEND;
 }
 
 #endif /* __CD321X_PM_H__ */

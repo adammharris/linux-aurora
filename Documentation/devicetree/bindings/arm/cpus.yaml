@@ -85,6 +85,8 @@ properties:
           - apm,strega
           - apple,avalanche
           - apple,blizzard
+          - apple,brava-e
+          - apple,brava-p
           - apple,cyclone
           - apple,donan-e
           - apple,donan-p
@@ -95,13 +97,13 @@ properties:
           - apple,mistral
           - apple,monsoon
           - apple,sawtooth
-          - apple,t8142-e
-          - apple,t8142-p
           - apple,t8152-e
           - apple,t8152-m
           - apple,t8152-p
           - apple,tahiti-e
           - apple,tahiti-p
+          - apple,t8142-e
+          - apple,t8142-p
           - apple,twister
           - apple,typhoon
           - arm,arm710t
@@ -232,6 +234,7 @@ properties:
           - qcom,oryon-1-2
           - qcom,oryon-1-3
           - qcom,oryon-1-4
+          - qcom,oryon-1-5
           - qcom,oryon-2-1
           - qcom,oryon-2-2
           - qcom,oryon-2-3

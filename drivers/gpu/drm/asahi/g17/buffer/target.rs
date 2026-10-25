@@ -6,11 +6,11 @@
 
 use super::compact_alias;
 use crate::g17::{
-    fw::render::RenderPass,
+    fw::render::{RegisterPrograms, RenderPass},
     object::{CpuMap, KernelObject},
 };
 use crate::{
-    driver::AsahiDevice,
+    driver::AsahiDrmDevice,
     hw::t8140::{queues, resources as cfg},
     mmu,
 };
@@ -25,6 +25,12 @@ fn aligned(value: usize, alignment: usize) -> Result<usize> {
         .ok_or(EOVERFLOW)
 }
 
+/// The 25G83 tiler parameter block: the TPC and seven sub-buffers the tiling registers name, at
+/// the default parameter-buffer sizes. Sizes are
+/// [TPC, tile map × 64, 0x4000 for layered targets, 0, 0xc00, 0xa00, 0x600, 0x80].
+const GTP_ALIGNMENTS: [usize; 8] = [0x40, 0x40, 0x100, 1, 0x20, 0x20, 0x80, 0x40];
+const GTP_FIXED_SIZES: [usize; 4] = [0xc00, 0xa00, 0x600, 0x80];
+
 /// Per-command geometry, independent of the capacity already allocated.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Layout {
@@ -33,9 +39,18 @@ pub(crate) struct Layout {
     pub(crate) used: usize,
     pub(crate) tpc_size: usize,
     pub(crate) tvb_blocks: usize,
+    /// Offsets of the tiler parameter sub-buffers in the TPC object (25G83), `None` for an
+    /// empty one; the TPC is entry 0.
+    gtp: [Option<usize>; 8],
+    /// Bytes of the TPC object the command uses.
+    tpc_end: usize,
 }
 impl Layout {
-    pub(crate) fn new(pass: &RenderPass, clusters: u32) -> Result<Self> {
+    pub(crate) fn new(
+        pass: &RenderPass,
+        clusters: u32,
+        programs: RegisterPrograms,
+    ) -> Result<Self> {
         let width = pass.width as usize;
         let height = pass.height as usize;
         let layers = pass.layers as usize;
@@ -90,16 +105,41 @@ impl Layout {
             );
         }
         tvb_blocks = tvb_blocks.max(cfg::TVB_INITIAL_PAGES.len());
+        let mut gtp = [None; 8];
+        let mut tpc_end = tpc_size;
+        if programs == RegisterPrograms::V25G83 {
+            let sizes = [
+                tpc_size,
+                tilemap_size.checked_mul(64).ok_or(EOVERFLOW)?,
+                if layers > 1 { 0x4000 } else { 0 },
+                0,
+                GTP_FIXED_SIZES[0],
+                GTP_FIXED_SIZES[1],
+                GTP_FIXED_SIZES[2],
+                GTP_FIXED_SIZES[3],
+            ];
+            let mut position = 0;
+            for ((offset, size), alignment) in gtp.iter_mut().zip(sizes).zip(GTP_ALIGNMENTS) {
+                position = aligned(position, alignment)?;
+                if size != 0 {
+                    *offset = Some(position);
+                }
+                position = position.checked_add(size).ok_or(EOVERFLOW)?;
+            }
+            tpc_end = position;
+        }
         Ok(Self {
             layer_offset,
             heap_offset,
             used,
             tpc_size,
             tvb_blocks,
+            gtp,
+            tpc_end,
         })
     }
     pub(crate) fn tpc_capacity(&self) -> Result<usize> {
-        Ok(aligned(self.tpc_size, mmu::UAT_PGSZ)?.max(cfg::TPC_MIN))
+        Ok(aligned(self.tpc_end, mmu::UAT_PGSZ)?.max(cfg::TPC_MIN))
     }
     pub(crate) fn record_stride(&self) -> Result<usize> {
         Ok(aligned(self.used, mmu::UAT_PGSZ)?.max(cfg::TARGET_RECORD_MIN))
@@ -112,7 +152,7 @@ struct Object {
     backing: KernelObject,
 }
 impl Object {
-    fn new(dev: &AsahiDevice, vm: &mmu::Vm, size: usize) -> Result<Self> {
+    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, size: usize) -> Result<Self> {
         let backing = KernelObject::backing(dev, size, CpuMap::WriteCombined)?;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let mapping = compact_alias(&backing, vm, 0..size, cfg::TVB_PAGE, prot, mmu::UAT_PGSZ)?;
@@ -145,7 +185,7 @@ pub(crate) struct Target {
 impl Target {
     /// Keep this allocation frame separate from the rest of the render graph.
     #[inline(never)]
-    pub(crate) fn new(dev: &AsahiDevice, vm: &mmu::Vm, layout: &Layout) -> Result<KBox<Self>> {
+    pub(crate) fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, layout: &Layout) -> Result<KBox<Self>> {
         let tpc = layout.tpc_capacity()?;
         let stride = layout.record_stride()?;
         if tpc > cfg::TPC_MAX || stride > cfg::TARGET_RECORD_MAX {
@@ -167,6 +207,21 @@ impl Target {
     }
     pub(crate) fn tpc_va(&self) -> u64 {
         self.tpc.address
+    }
+
+    /// GPU addresses of the tiler parameter sub-buffers of `layout` (25G83), zero for an empty
+    /// or absent one. The TPC object holds them after the TPC.
+    pub(crate) fn gtp_va(&self, layout: &Layout) -> Result<[u64; 8]> {
+        if layout.tpc_end > self.tpc.backing.size() {
+            return Err(ERANGE);
+        }
+        let mut addresses = [0; 8];
+        for (address, offset) in addresses.iter_mut().zip(layout.gtp) {
+            if let Some(offset) = offset {
+                *address = self.tpc.address.checked_add(offset as u64).ok_or(EOVERFLOW)?;
+            }
+        }
+        Ok(addresses)
     }
 
     /// Only the span consumed by this render is cleared. A small render does
@@ -208,7 +263,7 @@ impl Target {
     /// stays enlarged even if allocating the following record object fails.
     pub(crate) fn ensure_capacity(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         layout: &Layout,
         owners: &[Option<u64>; DEPTH],
@@ -244,7 +299,7 @@ impl Target {
     fn replace(
         retired: &mut KVec<Retired>,
         old: &mut Object,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         size: usize,
         owners: &[Option<u64>; DEPTH],

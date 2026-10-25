@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 obj-$(CONFIG_DRM_ACCEL_ANE) += ane.o ane_t6021.o
+obj-$(CONFIG_DRM_ACCEL_ANE_KUNIT_TEST) += ane_drv_test.o
 
 ane-y := \
 	ane_drv.o \

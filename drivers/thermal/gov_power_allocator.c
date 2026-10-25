@@ -8,6 +8,8 @@
 
 #define pr_fmt(fmt) "Power allocator: " fmt
 
+#include <linux/limits.h>
+#include <linux/math64.h>
 #include <linux/slab.h>
 #include <linux/thermal.h>
 
@@ -174,7 +176,16 @@ static void estimate_pid_constants(struct thermal_zone_device *tz,
 	tz->tzp->k_pu = int_to_frac(2 * sustainable_power) /
 		temperature_threshold;
 
-	k_i = tz->tzp->k_pu / 10;
+	if (tz->tzp->integral_time_constant_ms && tz->passive_delay_jiffies) {
+		u64 gain = (u64)tz->tzp->k_pu *
+			   jiffies_to_msecs(tz->passive_delay_jiffies);
+
+		gain = div_u64(gain, tz->tzp->integral_time_constant_ms);
+		k_i = min_t(u64, gain, S32_MAX);
+	} else {
+		/* Preserve the existing estimate unless a time is supplied. */
+		k_i = tz->tzp->k_pu / 10;
+	}
 	tz->tzp->k_i = k_i > 0 ? k_i : 1;
 
 	/*
@@ -263,12 +274,25 @@ static u32 pid_controller(struct thermal_zone_device *tz,
 	 */
 	i = mul_frac(tz->tzp->k_i, params->err_integral);
 
-	if (err < int_to_frac(tz->tzp->integral_cutoff)) {
-		s64 i_next = i + mul_frac(tz->tzp->k_i, err);
+	if (err < int_to_frac(tz->tzp->integral_cutoff) ||
+	    (err > 0 && params->err_integral < 0)) {
+		s64 integral_err = err;
+		s64 i_next;
+
+		/*
+		 * The cutoff prevents positive wind-up while below the target,
+		 * but must not retain a power reduction after an overshoot.
+		 * Allow that reduction to unwind, without crossing zero unless
+		 * the error also satisfies the configured cutoff.
+		 */
+		if (err >= int_to_frac(tz->tzp->integral_cutoff))
+			integral_err = min_t(s64, integral_err,
+					     -params->err_integral);
+		i_next = i + mul_frac(tz->tzp->k_i, integral_err);
 
 		if (abs(i_next) < max_power_frac) {
 			i = i_next;
-			params->err_integral += err;
+			params->err_integral += integral_err;
 		}
 	}
 
@@ -798,3 +822,7 @@ static struct thermal_governor thermal_gov_power_allocator = {
 	.update_tz	= power_allocator_update_tz,
 };
 THERMAL_GOVERNOR_DECLARE(thermal_gov_power_allocator);
+
+#if IS_ENABLED(CONFIG_THERMAL_GOV_POWER_ALLOCATOR_KUNIT_TEST)
+#include "gov_power_allocator_test.c"
+#endif

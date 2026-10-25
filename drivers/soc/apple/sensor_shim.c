@@ -440,6 +440,7 @@ static int sep_sensor_probe(struct spi_device *spi)
 		if (!error) {
 			spi_set_drvdata(spi, sensor);
 			sep_active_sensor = sensor;
+			sep_diag_set_sensor_bound(true);
 		}
 	}
 	mutex_unlock(&sep_sensor_registry_lock);
@@ -456,6 +457,7 @@ static void sep_sensor_remove(struct spi_device *spi)
 	sep_sensor_irq_teardown_locked();
 	sep_release_power();
 	sep_spi = NULL;
+	sep_diag_set_sensor_bound(false);
 	mutex_unlock(&sensor->lock);
 	mutex_unlock(&sep_sensor_registry_lock);
 }

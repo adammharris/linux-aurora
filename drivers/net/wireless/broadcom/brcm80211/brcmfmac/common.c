@@ -56,6 +56,14 @@ static int brcmf_p2p_enable;
 module_param_named(p2pon, brcmf_p2p_enable, int, 0);
 MODULE_PARM_DESC(p2pon, "Enable legacy p2p management functionality");
 
+/* AWDL interface creation through the vendor command is on by default.
+ * awdl=0 at module load turns it off: the AWDL vendor command is then not
+ * registered, and nothing in the driver creates or drives an AWDL interface.
+ */
+static int brcmf_awdl_enable = 1;
+module_param_named(awdl, brcmf_awdl_enable, int, 0444);
+MODULE_PARM_DESC(awdl, "AWDL interface creation through the vendor command (default 1, 0 turns it off)");
+
 static int brcmf_feature_disable;
 module_param_named(feature_disable, brcmf_feature_disable, int, 0);
 MODULE_PARM_DESC(feature_disable, "Disable features");
@@ -105,6 +113,10 @@ void brcmf_c_set_joinpref_default(struct brcmf_if *ifp)
 	join_pref_params[1].band = 0;
 	err = brcmf_fil_iovar_data_set(ifp, "join_pref", join_pref_params,
 				       sizeof(join_pref_params));
+	if (err == -EBADE)
+		err = brcmf_fil_iovar_data_set(ifp, "join_pref",
+					       &join_pref_params[1],
+					       sizeof(join_pref_params[1]));
 	if (err)
 		bphy_err(drvr, "Set join_pref error (%d)\n", err);
 }
@@ -514,6 +526,7 @@ struct brcmf_mp_device *brcmf_get_module_param(struct device *dev,
 
 	/* start by using the module parameters */
 	settings->p2p_enable = !!brcmf_p2p_enable;
+	settings->awdl_enable = !!brcmf_awdl_enable;
 	settings->feature_disable = brcmf_feature_disable;
 	settings->fcmode = brcmf_fcmode;
 	settings->roamoff = !!brcmf_roamoff;

@@ -406,7 +406,7 @@ unsigned long __weak arch_randomize_brk(struct mm_struct *mm)
 	return randomize_page_shift(mm->brk, SZ_1G, mm_page_shift(mm));
 }
 
-unsigned long arch_mmap_rnd(void)
+static unsigned long mmap_rnd(const struct mm_struct *mm)
 {
 	unsigned int bits;
 	unsigned long mask;
@@ -418,8 +418,13 @@ unsigned long arch_mmap_rnd(void)
 #endif /* CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS */
 		bits = mmap_rnd_bits;
 
-	mask = mm_aslr_mask(current->mm, (1UL << bits) - 1);
-	return (get_random_long() & mask) << mm_page_shift(current->mm);
+	mask = mm_aslr_mask(mm, (1UL << bits) - 1);
+	return (get_random_long() & mask) << mm_page_shift(mm);
+}
+
+unsigned long arch_mmap_rnd(void)
+{
+	return mmap_rnd(current->mm);
 }
 
 static int mmap_is_legacy(const struct rlimit *rlim_stack)
@@ -443,7 +448,8 @@ static int mmap_is_legacy(const struct rlimit *rlim_stack)
 #define MIN_GAP		(SZ_128M)
 #define MAX_GAP		(STACK_TOP / 6 * 5)
 
-static unsigned long mmap_base(const unsigned long rnd, const struct rlimit *rlim_stack)
+static unsigned long mmap_base(const struct mm_struct *mm, const unsigned long rnd,
+			       const struct rlimit *rlim_stack)
 {
 #ifdef CONFIG_STACK_GROWSUP
 	/*
@@ -452,15 +458,15 @@ static unsigned long mmap_base(const unsigned long rnd, const struct rlimit *rli
 	 * task. mmap_base starts directly below the stack and grows
 	 * downwards.
 	 */
-	return (mmap_upper_limit(rlim_stack) - rnd) & mm_page_mask(current->mm);
+	return (mmap_upper_limit(rlim_stack) - rnd) & mm_page_mask(mm);
 #else
 	unsigned long gap = rlim_stack->rlim_cur;
 	unsigned long pad = stack_guard_gap;
 
 	/* Account for stack randomization if necessary */
 	if (current->flags & PF_RANDOMIZE)
-		pad += mm_aslr_mask(current->mm, STACK_RND_MASK) <<
-			mm_page_shift(current->mm);
+		pad += mm_aslr_mask(mm, STACK_RND_MASK) <<
+			mm_page_shift(mm);
 
 	/* Values close to RLIM_INFINITY can overflow. */
 	if (gap + pad > gap)
@@ -471,7 +477,7 @@ static unsigned long mmap_base(const unsigned long rnd, const struct rlimit *rli
 	else if (gap > MAX_GAP)
 		gap = MAX_GAP;
 
-	return mm_page_align(current->mm, STACK_TOP - gap - rnd);
+	return mm_page_align(mm, STACK_TOP - gap - rnd);
 #endif
 }
 
@@ -480,13 +486,13 @@ void arch_pick_mmap_layout(struct mm_struct *mm, const struct rlimit *rlim_stack
 	unsigned long random_factor = 0UL;
 
 	if (current->flags & PF_RANDOMIZE)
-		random_factor = arch_mmap_rnd();
+		random_factor = mmap_rnd(mm);
 
 	if (mmap_is_legacy(rlim_stack)) {
 		mm->mmap_base = TASK_UNMAPPED_BASE + random_factor;
 		mm_flags_clear(MMF_TOPDOWN, mm);
 	} else {
-		mm->mmap_base = mmap_base(random_factor, rlim_stack);
+		mm->mmap_base = mmap_base(mm, random_factor, rlim_stack);
 		mm_flags_set(MMF_TOPDOWN, mm);
 	}
 }
@@ -516,6 +522,7 @@ EXPORT_SYMBOL_IF_KUNIT(arch_pick_mmap_layout);
  * * 0       on success
  * * -ENOMEM if RLIMIT_MEMLOCK would be exceeded.
  */
+#ifdef CONFIG_MM_SUBPAGE
 int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
 			const struct task_struct *task, bool bypass_rlim)
 {
@@ -553,6 +560,45 @@ int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
 
 	return ret;
 }
+#else
+int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
+			const struct task_struct *task, bool bypass_rlim)
+{
+	unsigned long locked_vm, limit;
+	unsigned int shift = PAGE_SHIFT - MM_ACCOUNT_SHIFT;
+	int ret = 0;
+
+	mmap_assert_write_locked(mm);
+
+	/* This exported API receives native physical-page counts. */
+	if (pages > ULONG_MAX >> shift)
+		return -ENOMEM;
+	pages <<= shift;
+	locked_vm = mm->locked_vm;
+	if (inc) {
+		if (!bypass_rlim) {
+			limit = task_rlimit(task, RLIMIT_MEMLOCK) >> MM_ACCOUNT_SHIFT;
+			if (pages > limit || locked_vm > limit - pages)
+				ret = -ENOMEM;
+		}
+		if (!ret && pages > ULONG_MAX - locked_vm)
+			ret = -ENOMEM;
+		if (!ret)
+			mm->locked_vm = locked_vm + pages;
+	} else {
+		if (WARN_ON_ONCE(pages > locked_vm))
+			return -EINVAL;
+		mm->locked_vm = locked_vm - pages;
+	}
+
+	pr_debug("%s: [%d] caller %ps %c%lu %lu/%lu%s\n", __func__, task->pid,
+		 (void *)_RET_IP_, (inc) ? '+' : '-', pages << MM_ACCOUNT_SHIFT,
+		 locked_vm << MM_ACCOUNT_SHIFT, task_rlimit(task, RLIMIT_MEMLOCK),
+		 ret ? " - exceeded" : "");
+
+	return ret;
+}
+#endif
 EXPORT_SYMBOL_GPL(__account_locked_vm);
 
 /**
@@ -600,9 +646,11 @@ static unsigned long vm_mmap_offset_internal(struct file *file, unsigned long ad
 		if (mmap_write_lock_killable(mm))
 			return -EINTR;
 #ifdef CONFIG_MM_SUBPAGE
-		ret = do_mmap_offset(file, addr, len, prot, flag, 0, pos, &populate, &uf);
+		ret = do_mmap_offset(file, addr, len, prot, flag, EMPTY_VMA_FLAGS, pos,
+				     &populate, &uf);
 #else
-		ret = do_mmap(file, addr, len, prot, flag, 0, pos.index, &populate, &uf);
+		ret = do_mmap(file, addr, len, prot, flag, EMPTY_VMA_FLAGS, pos.index,
+			      &populate, &uf);
 #endif
 		mmap_write_unlock(mm);
 		userfaultfd_unmap_complete(mm, &uf);
@@ -659,20 +707,20 @@ EXPORT_SYMBOL(vm_mmap);
 unsigned long vm_mmap_shadow_stack(unsigned long addr, unsigned long len,
 		unsigned long flags)
 {
+	vma_flags_t vma_flags = VMA_SHADOW_STACK;
 	struct mm_struct *mm = current->mm;
 	unsigned long ret, unused;
-	vm_flags_t vm_flags = VM_SHADOW_STACK;
 
 	flags |= MAP_ANONYMOUS | MAP_PRIVATE;
 	if (addr)
 		flags |= MAP_FIXED_NOREPLACE;
 
 	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
-		vm_flags |= VM_NOHUGEPAGE;
+		vma_flags_set(&vma_flags, VMA_NOHUGEPAGE_BIT);
 
 	mmap_write_lock(mm);
 	ret = do_mmap(NULL, addr, len, PROT_READ | PROT_WRITE, flags,
-		      vm_flags, 0, &unused, NULL);
+		      vma_flags, 0, &unused, NULL);
 	mmap_write_unlock(mm);
 
 	return ret;
@@ -1228,13 +1276,14 @@ void compat_set_desc_from_vma(struct vm_area_desc *desc,
 	desc->start = vma->vm_start;
 	desc->end = vma->vm_end;
 
-	desc->pgoff = vma->vm_pgoff;
+	desc->pgoff = vma_start_pgoff(vma);
 #ifdef CONFIG_MM_SUBPAGE
 	desc->subpage_offset = vma->vm_subpage_offset;
 #endif
 	desc->vm_file = vma->vm_file;
 	desc->vma_flags = vma->flags;
 	desc->page_prot = vma->vm_page_prot;
+	desc->vm_ops = vma->vm_ops;
 
 	/* Default. */
 	desc->action.type = MMAP_NOTHING;
@@ -1421,7 +1470,7 @@ static int call_vma_mapped(struct vm_area_struct *vma)
 	if (!vm_ops || !vm_ops->mapped)
 		return 0;
 
-	err = vm_ops->mapped(vma->vm_start, vma->vm_end, vma->vm_pgoff,
+	err = vm_ops->mapped(vma->vm_start, vma->vm_end, vma_start_pgoff(vma),
 			     vma->vm_file, &vm_private_data);
 	if (err)
 		return err;
@@ -1439,8 +1488,6 @@ static int mmap_action_finish(struct vm_area_struct *vma,
 
 	if (!err)
 		err = call_vma_mapped(vma);
-	if (!err && action->success_hook)
-		err = action->success_hook(vma);
 
 	/* do_munmap() might take rmap lock, so release if held. */
 	maybe_rmap_unlock_action(vma, action);
@@ -1458,16 +1505,22 @@ static int mmap_action_finish(struct vm_area_struct *vma,
 	 */
 	len = vma_pages(vma) << PAGE_SHIFT;
 	do_munmap(current->mm, vma->vm_start, len, NULL);
-	if (action->error_hook) {
-		/* We may want to filter the error. */
-		err = action->error_hook(err);
-		/* The caller should not clear the error. */
-		VM_WARN_ON_ONCE(!err);
-	}
-	return err;
+
+	return action->error_override ?: err;
 }
 
 #ifdef CONFIG_MMU
+
+static int check_mmap_action(struct mmap_action *action)
+{
+	const unsigned long override = action->error_override;
+
+	if (WARN_ON_ONCE(override && !IS_ERR_VALUE(override)))
+		return -EINVAL;
+
+	return 0;
+}
+
 /**
  * mmap_action_prepare - Perform preparatory setup for an VMA descriptor
  * action which need to be performed.
@@ -1477,7 +1530,14 @@ static int mmap_action_finish(struct vm_area_struct *vma,
  */
 int mmap_action_prepare(struct vm_area_desc *desc)
 {
-	switch (desc->action.type) {
+	struct mmap_action *action = &desc->action;
+	int err;
+
+	err = check_mmap_action(action);
+	if (err)
+		return err;
+
+	switch (action->type) {
 	case MMAP_NOTHING:
 		return 0;
 	case MMAP_REMAP_PFN:

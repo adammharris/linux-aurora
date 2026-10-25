@@ -150,7 +150,8 @@ struct mt7932_cal_piece {
 
 /* Type1 group0/1, taking the validated operating center, not always primary.
  */
-static inline int mt7932_cal_association(const u8 *data, size_t size, u8 channel,
+static inline int mt7932_cal_association(const u8 *data, size_t size,
+					 enum nl80211_band band, u8 channel,
 					struct mt7932_cal_piece pieces[2], unsigned int *input_tag)
 {
 	struct mt7932_cal_segment segment;
@@ -158,12 +159,21 @@ static inline int mt7932_cal_association(const u8 *data, size_t size, u8 channel
 	int ret;
 
 	*input_tag = 0;
-	if (channel >= 1 && channel <= 13)
+	if (mt7932_channel_band(band, channel) == 1) {
 		group = 0;
-	else if (mt7932_channel_5g_cal(channel))
+	} else if (band == NL80211_BAND_5GHZ && mt7932_channel_5g_cal(channel)) {
 		group = 1;
-	else
+	} else if (band == NL80211_BAND_6GHZ && channel && channel <= 233) {
+		unsigned int frequency = 5950 + 5 * channel;
+
+		/* Band-3 OCA groups from the association-start channel selector. */
+		if (frequency >= 6025 && frequency <= 6825 && !((frequency - 6025) % 160))
+			group = 28 + (frequency - 6025) / 160;
+		else
+			group = frequency <= 6025 ? 9 : 10 + (frequency - 6026) / 80;
+	} else {
 		return -EOPNOTSUPP;
+	}
 	ret = mt7932_cal_validate(data, size);
 	if (ret)
 		return ret;
@@ -261,7 +271,8 @@ static inline int mt7932_cal_requested_5g(const u8 *data, size_t size,
 		if (segment.data[i])
 			return -EOPNOTSUPP;
 	/* Own row610f07 does not remap center selectors1/2; only primaries. */
-	selected = mt7932_channel_band(channel) ? mt7932_channel_cal_centre(channel) : channel;
+	selected = mt7932_channel_band(NL80211_BAND_5GHZ, channel) ?
+		mt7932_channel_cal_centre(channel) : channel;
 	params[0] = 0x10000001;
 	params[1] = 0x10001000 | channel;
 	params[2] = 0x10001000 | (channel << 17) | selected;

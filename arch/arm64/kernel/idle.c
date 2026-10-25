@@ -6,7 +6,6 @@
 #include <linux/cpu.h>
 #include <linux/init.h>
 #include <linux/irqflags.h>
-#include <linux/jump_label.h>
 
 #include <asm/apple-idle.h>
 #include <asm/barrier.h>
@@ -41,36 +40,28 @@ early_param("idle", setup_idle);
 
 #ifdef CONFIG_ARCH_APPLE
 /*
- * Apple T8140 (A18 Pro), T8142 (M5), and T8152 (M6) CPUs can return from
- * WFI with general-purpose registers cleared. T8140 also loses FP/SIMD
- * state; conservatively preserve it on all three parts. The key is enabled once
- * at boot on those parts; everywhere else the check is a patched-out branch.
+ * Preserve general-purpose and FP/SIMD state across WFI on M4 and later
+ * Apple cores.
+ *
+ * The decision has to be made before the boot CPU first idles, which can
+ * happen as soon as rest_init() starts its idle thread, long before any
+ * initcall runs: on these SoCs the boot CPU loses its registers too. It is
+ * made from smp_prepare_boot_cpu(), where static keys cannot be flipped
+ * yet, so it is a plain flag.
  */
-static DEFINE_STATIC_KEY_FALSE(apple_wfi_loses_regs);
+static bool apple_wfi_loses_regs __ro_after_init;
 
-static const struct midr_range apple_wfi_loses_regs_cpus[] __initconst = {
-	MIDR_ALL_VERSIONS(MIDR_APPLE_TAHITI_E),
-	MIDR_ALL_VERSIONS(MIDR_APPLE_TAHITI_P),
-	MIDR_ALL_VERSIONS(MIDR_APPLE_T8142_E),
-	MIDR_ALL_VERSIONS(MIDR_APPLE_T8142_P),
-	MIDR_ALL_VERSIONS(MIDR_APPLE_T8152_E),
-	MIDR_ALL_VERSIONS(MIDR_APPLE_T8152_P),
-	{}
-};
-
-static int __init apple_wfi_quirk_init(void)
+void __init apple_wfi_quirk_init(void)
 {
-	if (is_midr_in_range_list(apple_wfi_loses_regs_cpus)) {
-		static_branch_enable(&apple_wfi_loses_regs);
+	if (midr_is_apple_m4_or_later(read_cpuid_id())) {
+		apple_wfi_loses_regs = true;
 		pr_info("Apple: preserving registers across WFI\n");
 	}
-	return 0;
 }
-early_initcall(apple_wfi_quirk_init);
 
 static __always_inline bool apple_wfi_needs_save(void)
 {
-	return static_branch_unlikely(&apple_wfi_loses_regs);
+	return unlikely(READ_ONCE(apple_wfi_loses_regs));
 }
 #else
 static __always_inline bool apple_wfi_needs_save(void)

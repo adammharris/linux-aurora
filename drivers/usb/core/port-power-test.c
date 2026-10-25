@@ -14,12 +14,16 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/mount.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/usb.h>
 #include <linux/usb/ch11.h>
 #include <linux/usb/hcd.h>
+#include <linux/usb/of.h>
+
+#include "hub.h"
 
 struct port_power_test_hc {
 	spinlock_t lock;	/* protects the port status, as hub_wq reads it too */
@@ -230,6 +234,11 @@ static int port_power_test_hub_status_data(struct usb_hcd *hcd, char *buf)
 	return 0;
 }
 
+static int port_power_test_raw_port(struct usb_hcd *hcd, int port1)
+{
+	return hcd->speed >= HCD_USB3 ? port1 + 1 : port1;
+}
+
 static const struct hc_driver port_power_test_hc_driver = {
 	.description = "usb-port-power-test",
 	.product_desc = "USB port power test controller",
@@ -243,6 +252,7 @@ static const struct hc_driver port_power_test_hc_driver = {
 	.get_frame_number = port_power_test_get_frame_number,
 	.hub_status_data = port_power_test_hub_status_data,
 	.hub_control = port_power_test_hub_control,
+	.find_raw_port_number = port_power_test_raw_port,
 };
 
 static void port_power_test_put_hcds(void *data)
@@ -649,7 +659,282 @@ static void port_power_test_unowned_off(struct kunit *test)
 	pm_runtime_enable(t->ss_port);
 }
 
+/* No device connects to the software HCD for these decision tests. */
+static void port_power_test_late_ss_decision(struct kunit *test)
+{
+	struct usb_device *hs = kunit_kzalloc(test, sizeof(*hs), GFP_KERNEL);
+	struct usb_device *ss = kunit_kzalloc(test, sizeof(*ss), GFP_KERNEL);
+	struct usb_port *port = kunit_kzalloc(test, sizeof(*port), GFP_KERNEL);
+	struct usb_port *peer = kunit_kzalloc(test, sizeof(*peer), GFP_KERNEL);
+	struct device_node *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, hs);
+	KUNIT_ASSERT_NOT_NULL(test, ss);
+	KUNIT_ASSERT_NOT_NULL(test, port);
+	KUNIT_ASSERT_NOT_NULL(test, peer);
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+	hs->state = USB_STATE_CONFIGURED;
+	hs->speed = USB_SPEED_HIGH;
+	hs->descriptor.bDeviceClass = USB_CLASS_HUB;
+	ss->state = USB_STATE_CONFIGURED;
+	ss->speed = USB_SPEED_SUPER_PLUS;
+	ss->descriptor.bDeviceClass = USB_CLASS_HUB;
+	port->child = hs;
+	port->peer = peer;
+	port->connector_node = connector;
+	peer->child = ss;
+	peer->is_superspeed = true;
+	peer->connector_node = connector;
+
+	/* The SS half on the same connector proves USB3 support, even without BOS. */
+	KUNIT_EXPECT_TRUE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	hs->speed = USB_SPEED_FULL;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	hs->speed = USB_SPEED_HIGH;
+	hs->descriptor.bDeviceClass = USB_CLASS_MASS_STORAGE;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	hs->descriptor.bDeviceClass = USB_CLASS_HUB;
+	ss->descriptor.bDeviceClass = USB_CLASS_MASS_STORAGE;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	ss->descriptor.bDeviceClass = USB_CLASS_HUB;
+
+	port->ss_reconnected = true;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	port->ss_reconnected = false;
+
+	port->disabled = true;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	port->disabled = false;
+	port->held_off = true;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	port->held_off = false;
+	port->port_owner = (struct usb_dev_state *)test;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	port->port_owner = NULL;
+
+	/* A pending request cannot act on an unplug, replacement or changed peer. */
+	port->child = NULL;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	port->child = ss;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	port->child = hs;
+	peer->child = NULL;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	peer->child = ss;
+	peer->connector_node = NULL;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	peer->connector_node = connector;
+	ss->state = USB_STATE_NOTATTACHED;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	ss->state = USB_STATE_CONFIGURED;
+	hs->state = USB_STATE_NOTATTACHED;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	hs->state = USB_STATE_CONFIGURED;
+	port->peer = NULL;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	port->peer = peer;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, NULL, ss));
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, NULL));
+	KUNIT_EXPECT_TRUE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+}
+
+static void port_power_test_late_ss_attachment(struct kunit *test)
+{
+	struct usb_port port = { .ss_reconnected = true, .ss_reconnect_pending = true };
+
+	/* A logical scan before the powered-on hub connects keeps the guard. */
+	usb_port_ss_reconnect_event(&port, 0, 0);
+	KUNIT_EXPECT_TRUE(test, port.ss_reconnected);
+	KUNIT_EXPECT_TRUE(test, port.ss_reconnect_pending);
+
+	/* Our own power-on does not request another power cycle. */
+	usb_port_ss_reconnect_event(&port, USB_PORT_STAT_CONNECTION, USB_PORT_STAT_C_CONNECTION);
+	KUNIT_EXPECT_TRUE(test, port.ss_reconnected);
+	KUNIT_EXPECT_FALSE(test, port.ss_reconnect_pending);
+
+	/* A fast unplug/replug may coalesce into a connected change event. */
+	usb_port_ss_reconnect_event(&port, USB_PORT_STAT_CONNECTION, USB_PORT_STAT_C_CONNECTION);
+	KUNIT_EXPECT_FALSE(test, port.ss_reconnected);
+
+	port.ss_reconnected = true;
+	port.ss_reconnect_pending = true;
+	port.held_off = true;
+	usb_port_ss_reconnect_event(&port, 0, USB_PORT_STAT_C_CONNECTION);
+	KUNIT_EXPECT_TRUE(test, port.ss_reconnected);
+	KUNIT_EXPECT_TRUE(test, port.ss_reconnect_pending);
+	port.held_off = false;
+	usb_port_ss_reconnect_event(&port, 0, USB_PORT_STAT_C_CONNECTION);
+	KUNIT_EXPECT_FALSE(test, port.ss_reconnected);
+	KUNIT_EXPECT_FALSE(test, port.ss_reconnect_pending);
+}
+
+#if IS_ENABLED(CONFIG_OF_DYNAMIC)
+/* A synthetic J700 graph: fixed USB2 hub at raw 1, SS through a mux at raw 2. */
+enum port_graph_node {
+	PG_ROOT, PG_HOST, PG_HOST_PORTS, PG_FIXED, PG_FIXED_PORTS, PG_REAR,
+	PG_HS_EP, PG_SS_PORT, PG_SS_EP,
+	PG_MUX, PG_MUX_IN, PG_MI_EP, PG_MUX_OUT, PG_MO_EP,
+	PG_CONNECTOR, PG_CON_HS, PG_CH_EP, PG_CON_SS, PG_CS_EP, PG_COUNT,
+};
+
+struct port_graph_test {
+	struct of_changeset changes;
+	struct device_node *nodes[PG_COUNT];
+	struct port_power_test *ports;
+	unsigned int count;
+	bool applied;
+};
+
+static void port_graph_test_cleanup(void *data)
+{
+	struct port_graph_test *g = data;
+
+	if (g->ports) {
+		of_node_put(g->ports->hs_root->dev.of_node);
+		of_node_put(g->ports->ss_root->dev.of_node);
+		g->ports->hs_root->dev.of_node = NULL;
+		g->ports->ss_root->dev.of_node = NULL;
+	}
+	if (g->applied)
+		of_changeset_revert(&g->changes);
+	of_changeset_destroy(&g->changes);
+	while (g->count)
+		of_node_put(g->nodes[--g->count]);
+}
+
+/*
+ * The highest phandle in the live tree, walked with the exported child
+ * iterator: the test can be a module, and for_each_of_allnodes() is not.
+ */
+static u32 port_graph_test_max_phandle(struct device_node *np)
+{
+	struct device_node *child;
+	u32 max = np->phandle;
+
+	for_each_child_of_node(np, child)
+		max = max_t(u32, max, port_graph_test_max_phandle(child));
+	return max;
+}
+
+static void port_power_test_connector_graph_model(struct kunit *test, bool legacy)
+{
+	static const struct {
+		int parent;
+		const char *name;
+		int reg;
+		int remote;
+	} desc[] = {
+		[PG_ROOT] = { -1, "usb-port-power-test", -1, -1 },
+		[PG_HOST] = { PG_ROOT, "host", -1, -1 },
+		[PG_HOST_PORTS] = { PG_HOST, "ports", -1, -1 },
+		[PG_FIXED] = { PG_HOST, "hub@1", 1, -1 },
+		[PG_FIXED_PORTS] = { PG_FIXED, "ports", -1, -1 },
+		[PG_REAR] = { PG_FIXED_PORTS, "port@2", 2, -1 },
+		[PG_HS_EP] = { PG_REAR, "endpoint", -1, PG_CH_EP },
+		[PG_SS_PORT] = { PG_HOST_PORTS, "port@2", 2, -1 },
+		[PG_SS_EP] = { PG_SS_PORT, "endpoint", -1, PG_MI_EP },
+		[PG_MUX] = { PG_ROOT, "mux", -1, -1 },
+		[PG_MUX_IN] = { PG_MUX, "port@1", 1, -1 },
+		[PG_MI_EP] = { PG_MUX_IN, "endpoint", -1, PG_SS_EP },
+		[PG_MUX_OUT] = { PG_MUX, "port@0", 0, -1 },
+		[PG_MO_EP] = { PG_MUX_OUT, "endpoint", -1, PG_CS_EP },
+		[PG_CONNECTOR] = { PG_ROOT, "connector", -1, -1 },
+		[PG_CON_HS] = { PG_CONNECTOR, "port@0", 0, -1 },
+		[PG_CH_EP] = { PG_CON_HS, "endpoint", -1, PG_HS_EP },
+		[PG_CON_SS] = { PG_CONNECTOR, "port@1", 1, -1 },
+		[PG_CS_EP] = { PG_CON_SS, "endpoint", -1, PG_MO_EP },
+	};
+	struct device_node *root __free(device_node) = of_find_node_by_path("/");
+	struct device_node *hs __free(device_node) = NULL;
+	struct device_node *ss __free(device_node) = NULL;
+	struct port_power_test *t = test->priv;
+	struct port_graph_test *g;
+	struct usb_device *fixed;
+	u32 phandle;
+
+	KUNIT_ASSERT_NOT_NULL(test, root);
+	phandle = port_graph_test_max_phandle(root);
+	KUNIT_ASSERT_LT(test, phandle, (u32)(U32_MAX - PG_COUNT));
+	phandle++;
+	g = kunit_kzalloc(test, sizeof(*g), GFP_KERNEL);
+	fixed = kunit_kzalloc(test, sizeof(*fixed), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, g);
+	KUNIT_ASSERT_NOT_NULL(test, fixed);
+	of_changeset_init(&g->changes);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, port_graph_test_cleanup, g), 0);
+	for (int i = 0; i < PG_COUNT; i++) {
+		struct device_node *parent = desc[i].parent < 0 ? root : g->nodes[desc[i].parent];
+		struct device_node *np;
+		struct list_head *attach;
+		u32 remote = phandle + desc[i].remote;
+		int reg = desc[i].reg;
+		const char *name = desc[i].name;
+
+		if (legacy && i == PG_SS_PORT) {
+			reg = 1;
+			name = "port@1";
+		}
+		np = of_changeset_create_node(&g->changes, parent, name);
+		KUNIT_ASSERT_NOT_NULL(test, np);
+		g->nodes[i] = np;
+		g->count++;
+		attach = g->changes.entries.prev;
+		KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32(&g->changes, np,
+								"phandle", phandle + i), 0);
+		if (reg >= 0)
+			KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32(&g->changes, np,
+									"reg", reg), 0);
+		if (desc[i].remote >= 0)
+			KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32(&g->changes, np,
+									"remote-endpoint",
+									remote), 0);
+		/* Attach must see the phandle property, as on an unflattened tree. */
+		list_move_tail(attach, &g->changes.entries);
+	}
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_string(&g->changes, g->nodes[PG_CONNECTOR],
+							   "compatible", "usb-c-connector"), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_bool(&g->changes, g->nodes[PG_MUX],
+							 "mode-switch"), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_apply(&g->changes), 0);
+	g->applied = true;
+	KUNIT_ASSERT_NULL(test, t->hs_root->dev.of_node);
+	KUNIT_ASSERT_NULL(test, t->ss_root->dev.of_node);
+	t->hs_root->dev.of_node = of_node_get(g->nodes[PG_HOST]);
+	t->ss_root->dev.of_node = of_node_get(g->nodes[PG_HOST]);
+	g->ports = t;
+	fixed->parent = t->hs_root;
+	fixed->dev.of_node = g->nodes[PG_FIXED];
+
+	KUNIT_EXPECT_EQ(test, usb_of_get_connect_type(t->hs_root, 1),
+			USB_PORT_CONNECT_TYPE_HARD_WIRED);
+	KUNIT_EXPECT_EQ(test, usb_of_get_connect_type(t->ss_root, 1),
+			USB_PORT_CONNECT_TYPE_HOT_PLUG);
+	hs = usb_of_get_port_connector(fixed, 2);
+	ss = usb_of_get_port_connector(t->ss_root, 1);
+	KUNIT_EXPECT_PTR_EQ(test, hs, g->nodes[PG_CONNECTOR]);
+	KUNIT_EXPECT_PTR_EQ(test, ss, hs);
+	KUNIT_EXPECT_NULL(test, usb_of_get_port_connector(t->hs_root, 1));
+	KUNIT_EXPECT_NULL(test, usb_of_get_port_connector(fixed, 1));
+}
+
+static void port_power_test_connector_graph(struct kunit *test)
+{
+	port_power_test_connector_graph_model(test, false);
+}
+
+static void port_power_test_connector_graph_legacy(struct kunit *test)
+{
+	port_power_test_connector_graph_model(test, true);
+}
+#endif
+
 static struct kunit_case port_power_test_cases[] = {
+#if IS_ENABLED(CONFIG_OF_DYNAMIC)
+	KUNIT_CASE(port_power_test_connector_graph),
+	KUNIT_CASE(port_power_test_connector_graph_legacy),
+#endif
+	KUNIT_CASE(port_power_test_late_ss_decision),
+	KUNIT_CASE(port_power_test_late_ss_attachment),
 	KUNIT_CASE(port_power_test_hold),
 	KUNIT_CASE(port_power_test_runtime_pm),
 	KUNIT_CASE(port_power_test_runtime_suspended),

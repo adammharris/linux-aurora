@@ -174,6 +174,16 @@ config THERMAL_GOV_POWER_ALLOCATOR
 	  Enable this to manage platform thermals by dynamically
 	  allocating and limiting power to devices.
 
+config THERMAL_GOV_POWER_ALLOCATOR_KUNIT_TEST
+	bool "KUnit tests for the power allocator governor" if !KUNIT_ALL_TESTS
+	depends on THERMAL_GOV_POWER_ALLOCATOR && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test integral recovery after a temperature overshoot, the configured
+	  integral cutoff, power bounds and polling-period gain calibration.
+	  The tests use synthetic thermal zones and do not need hardware.
+	  Only useful for kernel developers; say N unless testing the governor.
+
 config CPU_THERMAL
 	bool "Generic cpu cooling support"
 	depends on THERMAL_OF
@@ -436,6 +446,7 @@ config AMLOGIC_THERMAL
 	tristate "Amlogic Thermal Support"
 	default ARCH_MESON
 	depends on OF && ARCH_MESON
+	depends on MESON_SM
 	help
 	  If you say yes here you get support for Amlogic Thermal
 	  for G12 SoC Family.
@@ -471,6 +482,8 @@ source "drivers/thermal/st/Kconfig"
 endmenu
 
 source "drivers/thermal/renesas/Kconfig"
+
+source "drivers/thermal/spacemit/Kconfig"
 
 source "drivers/thermal/tegra/Kconfig"
 
@@ -526,5 +539,31 @@ config LOONGSON2_THERMAL
 	  temperature range to trigger the interrupt. When the input temperature
 	  is higher than the high temperature threshold or lower than the low
 	  temperature threshold, the interrupt will occur.
+
+config APPLE_PMP_POLICY_KUNIT_TEST
+	tristate "KUnit tests for Apple PMP thermal policy" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Check fault guards, time-based recovery, critical confirmation and
+	  power-record validation using the actual shared policy helpers.
+	  No firmware or hardware access is required to run these tests.
+	  Enable this only for kernel development and regression testing.
+
+config APPLE_PMP_THERMAL
+	tristate "Apple PMP CPU/GPU thermal policy"
+	depends on ARCH_APPLE && THERMAL_OF && ARM_APPLE_SOC_CPUFREQ
+	depends on APPLE_PMP && HWMON && MFD_MACSMC
+	select CPU_THERMAL
+	select CPU_FREQ_THERMAL
+	select THERMAL_GOV_STEP_WISE
+	help
+	  CPU/GPU cooling, measured-rail power budgets and fault guards fed by the PMP
+	  firmware owner. Higher CPU states remain capped until protection is
+	  installed. The sensor topology is qualified for J713 only. Cooling,
+	  measured-rail budgets and the separate emergency shutdown are provisional
+	  Linux policies, not Apple firmware limits. A T8132 firmware effort lane,
+	  emergency limit and advancing telemetry heartbeat remain unqualified.
+	  The firmware itself remains owned by the PMP parent driver.
 
 endif

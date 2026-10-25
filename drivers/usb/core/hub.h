@@ -89,6 +89,11 @@ struct usb_hub {
  * @dev: generic device interface
  * @port_owner: port's owner
  * @peer: related usb2 and usb3 ports (share the same connector)
+ * @connector_node: firmware identity of the physical connector
+ * @reconnect_hs: USB2 hub observed before its SuperSpeed connection
+ * @reconnect_ss: SuperSpeed hub requesting that USB2 connection restart
+ * @ss_reconnected: the current USB2 attachment already had its late-SS handover
+ * @ss_reconnect_pending: consume the connection event from our own power cycle
  * @connector: USB Type-C connector
  * @req: default pm qos request for hubs without port power control
  * @connect_type: port's connect type
@@ -113,6 +118,9 @@ struct usb_port {
 	struct usb_dev_state *port_owner;
 	struct usb_port *peer;
 	struct typec_connector *connector;
+	struct device_node *connector_node;
+	struct usb_device *reconnect_hs;
+	struct usb_device *reconnect_ss;
 	struct dev_pm_qos_request *req;
 	enum usb_port_connect_type connect_type;
 	enum usb_device_state state;
@@ -130,7 +138,39 @@ struct usb_port {
 	unsigned int usb3_lpm_u2_permit:1;
 	bool disabled;
 	bool held_off;
+	bool ss_reconnected;
+	bool ss_reconnect_pending;
 };
+
+/* Caller holds the hub lock and usb_port_peer_mutex. */
+static inline void usb_port_ss_reconnect_event(struct usb_port *port, u16 status, u16 change)
+{
+	if (port->held_off ||
+	    (port->ss_reconnect_pending && !(status & USB_PORT_STAT_CONNECTION) &&
+	     !(change & USB_PORT_STAT_C_CONNECTION)))
+		return;
+	if (!(status & USB_PORT_STAT_CONNECTION) ||
+	    (!port->ss_reconnect_pending && (change & USB_PORT_STAT_C_CONNECTION)))
+		port->ss_reconnected = false;
+	port->ss_reconnect_pending = false;
+}
+
+/* A late SS hub may restart only the same, still-live USB3-capable USB2 hub. */
+static inline bool usb_port_needs_ss_reconnect(const struct usb_port *port,
+					       const struct usb_device *hs,
+					       const struct usb_device *ss)
+{
+	return hs && ss && !port->ss_reconnected && !port->is_superspeed &&
+	       port->child == hs && port->peer &&
+	       port->peer->is_superspeed && port->connector_node &&
+	       port->peer->connector_node == port->connector_node &&
+	       READ_ONCE(port->peer->child) == ss && !port->disabled && !port->held_off &&
+	       !port->port_owner && READ_ONCE(hs->state) == USB_STATE_CONFIGURED &&
+	       READ_ONCE(ss->state) == USB_STATE_CONFIGURED && hs->speed == USB_SPEED_HIGH &&
+	       ss->speed >= USB_SPEED_SUPER &&
+	       hs->descriptor.bDeviceClass == USB_CLASS_HUB &&
+	       ss->descriptor.bDeviceClass == USB_CLASS_HUB;
+}
 
 #define to_usb_port(_dev) \
 	container_of(_dev, struct usb_port, dev)

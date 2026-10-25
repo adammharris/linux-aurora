@@ -3,7 +3,7 @@
  * Producer-side ANE counters and submission ring, shared by ane.ko and
  * ane_t6021.ko.
  *
- * Contract:
+ * Interface:
  *   - sysfs under /sys/class/accel/accel<digit>/device/ane_stats,
  *     mode 0444, ASCII "key value" lines, integers only: busy_ns
  *     (cumulative u64), jobs (cumulative u64). busy_ns counts only
@@ -358,7 +358,7 @@ static inline int ane_timeline_show(struct seq_file *m, void *v)
 #define ANE_STATS_RING_ORDER_DEFAULT 8  /* 256 slots */
 
 /*
- * Accounting rule (coreglass producer contract): jobs counts completed
+ * Accounting rule: jobs counts completed
  * submissions, one begin/complete pair per engine submission — one per
  * ANE_SUBMIT on ane.ko (so libane ane_exec is 1 job and ane_exec_loop
  * with N iterations is N jobs) and one per firmware PROCEDURE_CALL
@@ -375,9 +375,8 @@ static inline int ane_timeline_show(struct seq_file *m, void *v)
  * show callbacks fetch the counters from their real drvdata type
  * (struct ane_device * on ane.ko, struct ane_rtclient * on
  * ane_t6021.ko) and pass &...->stats_ctrs here. The formatter never
- * sees the device pointer, so the drvdata type confusion that shipped
- * in the first round (reading the head of ane_device as counters)
- * cannot compile again: there is no cast to remove.
+ * sees the device pointer, so a drvdata type confusion (reading the
+ * head of ane_device as counters) cannot compile: there is no cast.
  */
 /*
  * Consistent counter snapshot across the tiny close/open transition:

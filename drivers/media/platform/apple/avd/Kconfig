@@ -17,3 +17,15 @@ config VIDEO_APPLE_AVD
 	  Build the decoder firmware from https://github.com/aurora-silicon/avd-fw
 	  and install it under /lib/firmware/apple/. J700/T8140 uses the
 	  avd-fw-v5-t0.bin image. Firmware is supplied separately from this driver.
+
+config VIDEO_APPLE_AVD_KUNIT_TEST
+	tristate "KUnit tests for the Apple video decoder" if !KUNIT_ALL_TESTS
+	depends on VIDEO_APPLE_AVD && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Build KUnit tests for the Apple video decoder. They exercise the
+	  checks that the H.264 path makes on the slices that userspace
+	  queues, such as finding the slice data after the slice header,
+	  at the limits and one past them.
+
+	  If unsure, say N.

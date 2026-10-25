@@ -72,8 +72,18 @@ fn enable_als(
     offset: usize,
 ) -> Result<()> {
     if offset != LUX_OFFSET_CT817 {
-        let fw = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref())?;
-        set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
+        // The calibration blob comes from macOS and is not installed on every
+        // system. Without it the sensor still reports, uncalibrated.
+        match Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
+            Ok(fw) => {
+                set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
+            }
+            Err(e) => dev_warn!(
+                dev.as_ref(),
+                "no calibration ({:?}); readings are uncalibrated\n",
+                e
+            ),
+        }
         set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
         return Ok(());
     }
@@ -170,17 +180,20 @@ struct IIOAopAlsDriver {
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     (),
     [(of::DeviceId::new(c_str!("apple,aop-als")), ())]
 );
 
 impl platform::Driver for IIOAopAlsDriver {
     type IdInfo = ();
+    type Data<'bound> = IIOAopAlsDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(pdev: &platform::Device<Core>, _info: Option<&()>) -> impl PinInit<Self, Error> {
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        _info: Option<&'bound ()>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev = pdev.as_ref();
         // SAFETY: This driver binds only to the service devices the AOP core
         // registers, and `pdev` is being probed.
@@ -200,14 +213,14 @@ impl platform::Driver for IIOAopAlsDriver {
         enable_als(adata.as_ref(), pdev, &service, offset)?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
         let iio =
-            IIORegistration::<MsgProc>::new(data, c"aop-sensors-als", ty, info_mask, &THIS_MODULE)?;
+            IIORegistration::<MsgProc>::new(data, c"aop-sensors-als", ty, info_mask, kernel::module::this_module::<crate::LocalModule>())?;
         Ok(IIOAopAlsDriver {
             listener,
             _iio: iio,
         })
     }
 
-    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         this.listener.unregister();
     }
 }
