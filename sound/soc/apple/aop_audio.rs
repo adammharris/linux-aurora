@@ -958,8 +958,10 @@ impl SndSocAopDriver {
         }
 
         let mut pcm = ptr::null_mut();
-        let ret =
-            unsafe { bindings::snd_pcm_new(this.card, longname.as_ptr() as _, 0, 0, 1, &mut pcm) };
+        // Like the T8140 card, identify the high-quality array by its service
+        // and give the PCM a readable name. Keep the card ID and long name:
+        // UCM and the existing Asahi microphone rules use them for discovery.
+        let ret = unsafe { bindings::snd_pcm_new(this.card, c"hpai".as_ptr(), 0, 0, 1, &mut pcm) };
         if ret < 0 {
             dev_err!(data.dev, "Unable to allocate PCM device");
             return Err(Error::from_errno(ret));
@@ -977,7 +979,10 @@ impl SndSocAopDriver {
             (*pcm).private_data = data.clone().into_foreign() as _;
             (*pcm).private_free = Some(aop_pcm_free_private);
             (*pcm).info_flags = 0;
-            copy_str(&mut (*pcm).name, c"aop_audio".to_bytes_with_nul());
+            copy_str(
+                &mut (*pcm).name,
+                c"High-Quality Microphone".to_bytes_with_nul(),
+            );
         }
 
         let ret = unsafe { bindings::snd_card_register(this.card) };
