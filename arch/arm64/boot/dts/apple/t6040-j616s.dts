@@ -569,7 +569,7 @@
 		device_type = "pci";
 
 		port00: pci@0,0 {
-				reg = <0 0 0 0 0>;
+			reg = <0 0 0 0 0>;
 			ranges;
 			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
 			interrupt-map-mask = <0 0 0 7>;
