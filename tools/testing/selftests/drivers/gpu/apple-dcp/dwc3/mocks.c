@@ -69,6 +69,7 @@ static void regulator_disable(int p)
 	assert(!p);
 }
 struct dwc3 {
+	unsigned int current_dr_role;
 	struct phy *usb2_generic_phy[3], *usb3_generic_phy[3];
 	int num_usb2_ports, num_usb3_ports, usb2_phy, usb3_phy;
 	struct reset_controller_dev *reset;
@@ -83,7 +84,7 @@ struct dwc3_apple {
 	void *dev;
 	struct phy *usb2_phy, *usb3_phy;
 	bool fixed_hub, core_active, core_exit_pending, reset_pending, shutting_down;
-	bool rpm_held;
+	bool rpm_held, host_only;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 };
 static unsigned int polls, fail_poll, reset_calls, reset_writes, core_writes;
@@ -314,6 +315,9 @@ static int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state s,
 	*m = s == DWC3_APPLE_HOST ? PHY_MODE_INVALID : PHY_MODE_USB_DEVICE;
 	return 0;
 }
+/* Register tuning is outside this teardown fixture's simulated device. */
+static void dwc3_apple_apply_tunables(struct dwc3_apple *a) { (void)a; }
+#define dev_info_ratelimited(...) ((void)0)
 static int dwc3_apple_set_role(struct dwc3_apple *a, enum dwc3_apple_state s);
 static int dwc3_host_init(struct dwc3 *d)
 {

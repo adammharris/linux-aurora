@@ -264,7 +264,7 @@ impl<F: StoreIo> Store<F> {
             return Ok(store);
         }
         if size < STORE_SIZE as u64 {
-            return Err(store.refuse(Damage::Size, size));
+            return Err(store.refuse(Damage::Size));
         }
 
         let mut sb = KVec::with_capacity(BLOCK_SIZE, GFP_KERNEL)?;
