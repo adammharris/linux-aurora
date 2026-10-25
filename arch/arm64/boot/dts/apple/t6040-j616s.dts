@@ -26,6 +26,7 @@
 		/* used by the loader to hand over the display */
 		dcp = &dcp;
 		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
 		/* the boot loader finds the GPU node through this alias */
 		gpu = &gpu;
 	};

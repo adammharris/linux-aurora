@@ -259,6 +259,21 @@ config APPLE_T6030_DISPLAY_GATE
 
 	  Say 'y' if you want the native display on M3 Pro MacBook Pros.
 
+config APPLE_T6041_DISPLAY_GATE
+	bool "Apple T6041 internal display enable gate"
+	depends on ARCH_APPLE && OF_DYNAMIC
+	default ARCH_APPLE
+	help
+	  The J616s (M4 Pro) device tree keeps the internal display nodes
+	  disabled, so the display stays on the boot framebuffer until the
+	  boot loader has handed the running display coprocessor over. This
+	  option enables those nodes before devices are created, only when
+	  the boot loader has published a complete T6041 handoff for the
+	  26.6.2 display firmware. Without it, or with nomodeset, it does
+	  nothing.
+
+	  Say 'y' if you want the native display on M4 Pro MacBook Pros.
+
 config APPLE_T6030_GPU_PMP_LINK
 	bool
 	depends on APPLE_T6030_DISPLAY_GATE

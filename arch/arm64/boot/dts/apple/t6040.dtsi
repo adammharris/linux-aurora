@@ -647,6 +647,7 @@
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x4 0x02300000 0x0 0xc000>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1090 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
@@ -656,6 +657,7 @@
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x4 0x02340000 0x0 0x20000>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1090 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
@@ -674,7 +676,10 @@
 		iommus = <&dcp_dart 23>;
 		apple,bw-scratch = <&pmgr_dcp 0 4 0x20000>;
 		apple,iomfb-surfaces = <1 1 0 0>;
-		/* the boot loader enables it when it hands the display over */
+		/* the boot loader describes the piodma's regions with 2+2 cells */
+		#address-cells = <2>;
+		#size-cells = <2>;
+		/* enabled once the boot loader has handed the display over */
 		status = "disabled";
 
 		disp0_piodma: piodma {
