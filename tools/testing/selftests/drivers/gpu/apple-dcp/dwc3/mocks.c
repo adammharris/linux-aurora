@@ -83,6 +83,7 @@ struct dwc3_apple {
 	void *dev;
 	struct phy *usb2_phy, *usb3_phy;
 	bool fixed_hub, core_active, core_exit_pending, reset_pending, shutting_down;
+	bool rpm_held;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 };
 static unsigned int polls, fail_poll, reset_calls, reset_writes, core_writes;
@@ -327,6 +328,21 @@ static int dwc3_gadget_init(struct dwc3 *d)
 {
 	(void)d;
 	return gadget_init_error;
+}
+/* Observe the runtime reference taken by the production role transition. */
+static unsigned int rpm_gets, rpm_puts;
+static int pm_runtime_resume_and_get(void *dev)
+{
+    (void)dev;
+    rpm_gets++;
+    return 0;
+}
+static void pm_runtime_mark_last_busy(void *dev) { (void)dev; }
+static void pm_runtime_put_autosuspend(void *dev)
+{
+    (void)dev;
+    assert(rpm_puts < rpm_gets);
+    rpm_puts++;
 }
 #define pm_runtime_get_sync(...) ((void)0)
 #define pm_runtime_allow(...) ((void)0)

@@ -150,7 +150,7 @@ def queue_tests(root, source):
     #[derive(Clone,Copy)] struct Identity {id:Id,published:bool}
     '''+constants+'\n'+item(s,'pub(crate) struct QueueIds')+'\nimpl QueueIds {\n'+''.join(item(s,'pub(crate) fn '+name+'(')+'\n' for name in ['reserve_initial_render','reserve','publish','can_cancel_unpublished','cancel_unpublished'])+'}\n'
     test='''
-    fn fresh()->QueueIds {QueueIds {entries:[None;QID_COUNT],initial_render:[None;2],compute_publication:0,leased:0}}
+    fn fresh()->QueueIds {QueueIds {entries:[None;QID_COUNT],initial_render:[None;2],publication:0,leased:0,floor:0}}
     fn main(){
      for render in [0,2,16,32,112,126] {
       let mut q=fresh();

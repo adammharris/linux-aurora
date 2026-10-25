@@ -31,6 +31,7 @@ def main():
 #include <errno.h>
 #include <stdio.h>
 typedef uint64_t u64;
+typedef uint32_t u32;
 #define BITS_TO_LONGS(n) 1
 #define atomic_long_read(x) (*(x))
 #define bitmap_empty(x, n) (!(x)[0])
@@ -45,7 +46,7 @@ struct apple_dart_hw { int (*invalidate_tlb)(struct apple_dart_stream_map *); };
 struct apple_dart { int num_streams, locked, version; void *dev; struct apple_dart_hw *hw; };
 struct apple_dart_atomic_stream_map { struct apple_dart *dart; unsigned long sidmap[1]; };
 struct apple_dart_domain {
- void *pgtbl_ops; struct apple_dart_atomic_stream_map streams[2]; int count;
+ void *pgtbl_ops, *dcp; struct apple_dart_atomic_stream_map streams[2]; int count;
  u64 dma_offset, mask;
 };
 #define for_each_stream_map(i,d,m) for ((i)=0; (i)<(d)->count && ((m)=&(d)->streams[i],1); (i)++)
@@ -53,8 +54,11 @@ static int powered, power_error, sync_error, range_error, syncs, ranges, fulls;
 static u64 seen_first, seen_last;
 static int pm_runtime_resume_and_get(void *dev) { if (power_error) return power_error; powered++; return 0; }
 static void pm_runtime_put(void *dev) { assert(powered>0); powered--; }
-static int apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg, struct apple_dart_stream_map *stream) {
- syncs++; return sync_error;
+static int apple_dart_dcp_domain_flush(struct apple_dart_domain *domain) {
+ (void)domain; assert(!"unexpected DCP dispatch in range fixture"); return -EINVAL;
+}
+static int apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg, struct apple_dart_stream_map *stream, bool sync) {
+ assert(sync); syncs++; return sync_error;
 }
 static int apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream,
  int command, bool range, u64 first, u64 last) {
