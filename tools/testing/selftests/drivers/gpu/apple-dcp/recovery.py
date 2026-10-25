@@ -258,6 +258,18 @@ def check(root, output):
     static bool apple_rtkit_is_running(void *r) { (void)r;assert(!"T6030 dcpext diagnostic on H17P");return false; }
     static bool apple_rtkit_is_crashed(void *r) { (void)r;assert(!"T6030 dcpext diagnostic on H17P");return false; }
     '''+sender
+    if 'afk_send_compact_command(' in sender:
+        # Compact EPIC is the desktop 26.6 (T6041) wire; this H17P endpoint
+        # never switches to it, so the classic sender runs.
+        unit=unit.replace('struct apple_epic_service services[AFK_MAX_CHANNEL]; };',
+                          'struct apple_epic_service services[AFK_MAX_CHANNEL];bool compact; };',1)
+        sender='''#ifndef DCP_FIRMWARE_V_26_6_DESKTOP
+    #define DCP_FIRMWARE_V_26_6_DESKTOP (DCP_FIRMWARE_H17P + 3)
+    #endif
+    static u32 afk_compact_next_status(struct apple_epic_service *s) { (void)s;assert(!"compact EPIC on H17P");return 0; }
+    static int afk_send_compact_command(struct apple_epic_service *s,u8 type,const void *payload,size_t payload_len,void *output,size_t output_len,u32 request_status,u32 *retcode,size_t *copied,unsigned long timeout)
+    { (void)s;(void)type;(void)payload;(void)payload_len;(void)output;(void)output_len;(void)request_status;(void)retcode;(void)copied;(void)timeout;assert(!"compact EPIC on H17P");return -EIO; }
+    '''+sender
     unit+=sender+'\n'+tests
 
     out.mkdir(parents=True,exist_ok=True)
@@ -343,6 +355,19 @@ def check(root, output):
     }
     '''
     af=(root/'drivers/gpu/drm/apple/afk.c').read_text()
+    if 'static bool afk_compact_capable(' in af:
+        # The desktop 26.x ring messages and compact state; the actual
+        # capability check keeps this H17P endpoint on the classic path.
+        import re
+        queued=queued.replace('bool compact; };','bool compact;void *tx_wq,*compact_rx_data; };',1)
+        for message in ('RBEP_SPACE_AVAILABLE','RBEP_WAIT_FOR_SPACE'):
+            queued+='#define %s %s\n'%(message,re.search(r'\b'+message+r'\s*=\s*(\w+)',af).group(1))
+        queued+=r'''
+    #define FIELD_PREP(mask,val) ((val)&(mask))
+    #define dma_wmb() ((void)0)
+    static void afk_send(struct apple_dcp_afkep *e,u64 m) { (void)e;(void)m;assert(!"compact ring message on H17P"); }
+    static void afk_cancel_commands(struct apple_dcp_afkep *e) { assert(e && !e->compact); }
+    '''+extract(af,'static bool afk_compact_capable(')+'\n'
     for signature in ['static inline unsigned int afk_ring_drain_budget(', 'static inline unsigned int afk_ring_drain(']:
         queued+=extract(afh,signature)+'\n'
     for signature in ['static bool afk_recv_entry(', 'static void afk_recv_drain(',

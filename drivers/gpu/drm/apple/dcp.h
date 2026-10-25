@@ -63,6 +63,13 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 int dcp_get_connector_type(struct platform_device *pdev);
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
+bool dcp_fw_compat_is_desktop(struct platform_device *pdev);
+unsigned int dcp_gamma_lut_size(struct platform_device *pdev);
+/* T6041 external display processors may join the DRM device. */
+bool dcp_t6041_ext_enabled(void);
+void dcp_backlight_takeover_registered(struct platform_device *pdev);
+int dcp_takeover_trial(struct platform_device *pdev, const char **reason);
+void dcp_takeover_aborted(struct platform_device *pdev);
 bool dcp_ext_unusable(struct platform_device *pdev);
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev);
 int dcp_start(struct platform_device *pdev);
@@ -118,6 +125,7 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);
 
 int systemep_init(struct apple_dcp *dcp);
 int dptxep_init(struct apple_dcp *dcp);
+int dptxep_init_desktop(struct apple_dcp *dcp, u32 endpoint);
 int dptx_controller_init(struct apple_dcp *dcp);
 int ibootep_init(struct apple_dcp *dcp);
 int dpavservep_init(struct apple_dcp *dcp);

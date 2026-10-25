@@ -200,6 +200,18 @@ def apple_function(root, name):
     return ''
 
 
+def firmware_lineage(root):
+    """The 26.x lineage tests of version_utils.h (DCP_FW_H17() and friends).
+
+    Units define their own DCP_FW_VERSION(); a plain 26 is the H17 lineage,
+    since only a desktop template instance carries DCP_FW_DESKTOP.
+    """
+    text = (root / 'drivers/gpu/drm/apple/version_utils.h').read_text()
+    names = ('DCP_FW_DESKTOP', 'DCP_FW_VERSION_DESKTOP', 'DCP_FW_H17', 'DCP_FW_DESKTOP_26')
+    return ''.join(d + '\n' for d in source_defines(text)
+                   if re.match(r'#define (\w+)', d).group(1) in names)
+
+
 def internal_inline(root, name):
     """A static inline helper from dcp-internal.h, marked unused; '' if absent.
 

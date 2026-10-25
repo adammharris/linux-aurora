@@ -2,7 +2,7 @@
 # Copyright 2026 Ryan Murray
 """Actual native EDID admission, service epochs, stale replies and RX progress."""
 from pathlib import Path
-from common import block, source_defines, apple_function, internal_inline
+from common import block, source_defines, apple_function, internal_inline, firmware_lineage
 
 def rebind(root):
     base = root / 'drivers/gpu/drm/apple'
@@ -600,6 +600,8 @@ static void schedule_work(int *p) { (*p)++; }
 #define DCP_FIRMWARE_H17P 2
 /* The 14.7 open-before-EDID handshake is for T6030 external processors only. */
 #define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
+/* Nor is any processor here a desktop 26.6 one: it has no auxiliary graph. */
+#define DCP_FIRMWARE_V_26_6_DESKTOP (DCP_FIRMWARE_H17P + 3)
 #define AV_ENDPOINT 0x29
 #define SYSTEM_ENDPOINT 0x20
 #define DISP0_ENDPOINT 0x23
@@ -623,6 +625,7 @@ struct apple_dcp {
     u64 typec_generation;
     int fw_compat;
     void *dev;
+    struct dcp_desktop_state { struct apple_dcp_afkep *graph[0x20]; } *desktop;
 };
 struct drm_edid { int identity; };
 '''+internal_inline(root,'dcp_is_v14_7_external')+r'''static unsigned int reads, allocations, legacy_reads, receives;
@@ -803,6 +806,8 @@ typedef uint64_t u64;
 #define dev_dbg_ratelimited(...) ((void)0)
 #define trace_dcp_recv_msg(...) ((void)0)
 #define DCP_FIRMWARE_H17P 2
+/* The H17P external processor is not a desktop 26.6 one. */
+#define DCP_FIRMWARE_V_26_6_DESKTOP (DCP_FIRMWARE_H17P + 3)
 #define IOMFB_ENDPOINT 0x37
 #define AV_ENDPOINT 0x29
 #define SYSTEM_ENDPOINT 0x20
@@ -846,6 +851,7 @@ struct apple_dcp {
     struct apple_connector *connector;
     struct apple_dcp_afkep *dcpavservep,*dptxep,*avep,*systemep,*ibootep,*dptx_controller_ep;
     struct { struct mutex lock; bool stopped; void *owner; } iomfb;
+    struct dcp_desktop_state { struct apple_dcp_afkep *graph[0x20]; } *desktop;
 };
 struct afk_receive_message_work { struct apple_dcp_afkep *ep; u64 message; struct work_struct work; };
 struct apple_rtkit_ops { void (*recv_message)(void *,u8,u64); };
@@ -1004,7 +1010,7 @@ static u64 dcp_modes_transfer_begin(struct apple_dcp *d);''',1)
         old_join='''    assert(!pthread_join(rx,NULL) && !pthread_join(afk,NULL) && !pthread_join(dimensions,NULL));'''
         assert old_join in suffix
         suffix=suffix.replace(old_join,old_join+'\n    assert(!pthread_join(hotplug,NULL));',1)
-    return prefix + '\n'.join(parts) + suffix
+    return prefix + firmware_lineage(root) + '\n'.join(parts) + suffix
 
 
 def startup(root):

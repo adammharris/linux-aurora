@@ -4,6 +4,7 @@
 #ifndef __APPLE_DCP_INTERNAL_H__
 #define __APPLE_DCP_INTERNAL_H__
 
+#include <drm/drm_mode.h>
 #include <linux/backlight.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
@@ -33,6 +34,7 @@
 #include "iomfb_v14_7.h"
 #include "iomfb_v14_7_tpl.h"
 #include "iomfb_v26_6.h"
+#include "iomfb_v26_6_desktop.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
 
@@ -85,6 +87,11 @@ enum {
 	 * publishes the port service used by DPTX 0x2a.
 	 */
 	DPAV_CTRL_ENDPOINT = 0x24,
+	/* Desktop 26.x (T6041) auxiliary endpoints, see dcp_start_desktop(). */
+	EPIC25_ENDPOINT = 0x25,
+	DPSAC_ENDPOINT = 0x26,
+	DPDEV_ENDPOINT = 0x27,
+	EPIC2C_ENDPOINT = 0x2c,
 	DPAVSERV_ENDPOINT = 0x28,
 	DPAVSERV_ENDPOINT_V2 = 0x2a,
 	AV_ENDPOINT = 0x29,
@@ -164,6 +171,8 @@ struct dcp_brightness {
 	int nits;
 	int scale;
 	bool update;
+	/* A level was written through the backlight device (desktop 26.x). */
+	bool requested;
 };
 
 struct audiosrv_data;
@@ -212,6 +221,66 @@ enum dcp_test_point {
 	DCP_TEST_ANNOUNCE_TIMER_DONE,		/* past hpd_mutex in the timeout work */
 	DCP_TEST_UNBIND_ANNOUNCE_STOPPED,	/* unbind drained the timeout work */
 	DCP_TEST_HOTPLUG_EVENT,			/* the hotplug worker sends its event */
+};
+
+/*
+ * DCP_FIRMWARE_V_26_6_DESKTOP state, see iomfb_v26_6_desktop.c; allocated
+ * for such a DCP only.
+ */
+struct dcp_desktop_state {
+	/* Queued swap; too large for the shared swap union. */
+	struct dcp_swap_submit_req_v26_6_desktop swap;
+	/* Opaque client identity the firmware's IOMFB calls carry. */
+	u64 client;
+	/*
+	 * A mode was set since the display last went away.  Until then the
+	 * firmware's generic pipe is bootstrapped through a virtual color
+	 * element before the real one is selected.
+	 */
+	bool mode_live;
+	/*
+	 * GAMMA_LUT: the firmware's own table, read before the first change;
+	 * the table being sent; the LUT it is composed from, if any.
+	 */
+	struct iomfb_gamma_table_req *gamma_fw, *gamma_out;
+	struct drm_color_lut gamma_lut[IOMFB_GAMMA_ENTRIES];
+	bool gamma_fw_read, gamma_user, gamma_pending, gamma_unusable;
+	/*
+	 * Endpoints 0x20..0x3f this processor's start brought up beside the
+	 * system endpoint (bit = endpoint - 0x20), and those it skipped.
+	 */
+	struct apple_dcp_afkep *graph[0x20];
+	u32 graph_started, graph_skipped;
+	/* DPAVCTRL (0x24): its two AV controllers and the deferred service. */
+	struct apple_epic_service *dpavctrl_av_controller[2];
+	struct apple_epic_service *dpavctrl_late_service;
+	struct completion dpavctrl_ready;
+	/*
+	 * Takeover trial: power-on and a mode set ran before the boot
+	 * framebuffer was evicted; the first atomic enable reuses them.
+	 */
+	bool trial_powered, trial_modeset_ok;
+	u32 trial_timing_mode_id, trial_color_mode_id;
+	/* Result of the last power-on: 0 ok, 1 timeout, 2 failed. */
+	u8 poweron_result;
+	/* The takeover was refused: leave the DCP alone until the reboot. */
+	bool takeover_aborted;
+	/*
+	 * External processors: the firmware powered the pipe off with the
+	 * display (unplug); the next swap needs a power-on and a mode set.
+	 */
+	bool ext_pipe_off;
+	/*
+	 * Dynamic Type-C DP route (T6041 dcpext1): the DP PHYs and crossbars
+	 * of every Type-C port, the one in use (or -1), the DPTX target PHY
+	 * of each and the crossbar state selecting this processor.
+	 */
+	unsigned int ndyn;
+	int dyn_active;
+	struct phy *dyn_phy[3];
+	struct mux_control *dyn_xbar[3];
+	u32 dyn_dptx_phy[3];
+	u32 dyn_mux_index;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -644,6 +713,9 @@ struct apple_dcp {
 	struct delayed_work hdmi_recheck_wq;
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
 	struct dcp_hdmi *hdmi;
+
+	/* Kept last: the template instances share the layout above. */
+	struct dcp_desktop_state *desktop;
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
@@ -709,6 +781,7 @@ void dcp_announce_arm(struct apple_dcp *dcp);
 void dcp_announce_work(struct work_struct *work);
 void dcp_external_crtc_released(struct apple_dcp *dcp);
 void dcp_external_link_fault(struct apple_dcp *dcp);
+irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp);
 
 /* A KUnit test can wait here for the work it races with. */
 static inline void dcp_test_point(struct apple_dcp *dcp, enum dcp_test_point point)

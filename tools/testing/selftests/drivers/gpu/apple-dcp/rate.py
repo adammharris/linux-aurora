@@ -3,7 +3,7 @@
 """Actual parser, bounded rate admission, catalog replacement and HPD."""
 from pathlib import Path
 import copy, re, struct
-from common import block, source_defines, apple_function, internal_inline
+from common import block, source_defines, apple_function, internal_inline, firmware_lineage
 
 def parser_fixture(root):
 
@@ -677,7 +677,9 @@ static void disable_work_sync(struct work_struct *w) { (void)w; }
 #define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
 #define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
 #endif
-'''+internal_inline(root,'dcp_fw_is_14_7')+r'''/* Off T6030 machines the direct crossbar output is not clocked separately. */
+/* Nor the desktop 26.6 firmware, the one that withholds VRR modes. */
+#define DCP_FIRMWARE_V_26_6_DESKTOP (DCP_FIRMWARE_H17P + 3)
+'''+firmware_lineage(root)+internal_inline(root,'dcp_fw_is_14_7')+r'''/* Off T6030 machines the direct crossbar output is not clocked separately. */
 static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,bool up) { (void)d;(void)up;return 0; }
 '''
     transport = '\n'.join(block(av,marker) for marker in [
@@ -698,7 +700,7 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
                     + ''.join(apple_function(root, name) for name in ('dcp_queue_hotplug', 'dcp_modes_for_connector',
                               'apple_connector_invalidate_edid', 'apple_connector_edid_set_live'))
                     + mode_helpers)
-    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+block(iomfb,'int dcp_get_modes(')+block(iomfb,re.search(r'^[^\n;]*\blookup_mode\(',iomfb,re.M).start())
+    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+block(iomfb,'static bool dcp_mode_vrr_supported(')+'\n'+block(iomfb,'int dcp_get_modes(')+block(iomfb,re.search(r'^[^\n;(]*\blookup_mode\(',iomfb,re.M).start())
     # Drive malformed replacements through the same chunk/end ingress as firmware.
     # The dictionary cache is a boundary substitute and takes ownership of the blob.
     receipt = r'''

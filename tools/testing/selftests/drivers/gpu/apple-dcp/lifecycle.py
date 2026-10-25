@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header
+from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -459,6 +459,15 @@ static void dcp_relink_attach(int *s, u64 generation)
 static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, unsigned long now)
 { (void)s; (void)generation; (void)now; assert(!"legacy relink timestamp in an H17P scenario"); }
 """
+    # The desktop 26.6 (T6041) connect has its own path; an H17P display is
+    # never on that firmware.
+    if 'dcp_desktop_dptx_connect(' in funcs:
+        old = ' struct dcp_announce announce;\n'
+        assert prefix.count(old) == 1
+        prefix = prefix.replace(old, old + ' int fw_compat; /* zero: not the desktop 26.6 firmware */\n')
+        prefix += ('#define DCP_FIRMWARE_V_26_6_DESKTOP 100\n'
+                   'static int __attribute__((unused)) dcp_desktop_dptx_connect(struct apple_dcp *d, u32 port)\n'
+                   '{ (void)d; (void)port; assert(!"desktop 26.6 connect in an H17P scenario"); return -EINVAL; }\n')
     # How long a held mux has been retried is measured on the driver's clock.
     if 'jiffies_to_msecs(jiffies)' in funcs:
         shim += ('\nstatic unsigned long jiffies;\n'
@@ -492,7 +501,8 @@ def bounce(root):
          ' void *phy, *dev, *active_typec_route;\n'
          ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
          ' bool external, external_link_ready, crashed;\n'
-         ' bool typec_work_enabled; int fw_compat; struct { bool fw_14_7_endpoints; } hw;\n'
+         ' bool typec_work_enabled;' + ('' if '\n int fw_compat;' in unit else ' int fw_compat;') +
+         ' struct { bool fw_14_7_endpoints; } hw;\n'
          ' struct { bool active; } split;')
     old_raw = unit[unit.index('static int dcp_dptx_connect_raw('):]
     old_raw = old_raw[:old_raw.index('return raw_error; }') + len('return raw_error; }')]
@@ -1395,6 +1405,9 @@ static bool __attribute__((unused)) dcp_t6030_ext_native(const struct device_nod
 { (void)n; assert(!"T6030 dcpext in a J700 scenario"); return false; }
 static int __attribute__((unused)) iomfb_v14_7_external_prepare(struct apple_dcp *d)
 { (void)d; assert(!"T6030 external processor in a J700 scenario"); return -ENODEV; }
+/* Nor a T6041 dcpext. */
+static bool __attribute__((unused)) dcp_t6041_ext_enabled(void)
+{ assert(!"T6041 dcpext in a J700 scenario"); return false; }
 static void __attribute__((unused)) iomfb_v14_7_external_refuse(struct apple_dcp *d, const char *why)
 { (void)d; (void)why; assert(!"T6030 external processor in a J700 scenario"); }
 struct drm_device { int unused; };
@@ -1668,7 +1681,7 @@ struct apple_dcp {
 struct platform_device { struct apple_dcp *data; };
 struct drm_crtc { struct platform_device *dcp; void *primary; };
 struct drm_display_mode { int unused; };
-struct drm_crtc_state { bool enable, vrr_enabled, modeset; struct drm_display_mode mode; void *ctm, *degamma_lut, *gamma_lut; unsigned plane_mask; };
+struct drm_crtc_state { bool enable, vrr_enabled, modeset, color_mgmt_changed; struct drm_display_mode mode; void *ctm, *degamma_lut, *gamma_lut; unsigned plane_mask; };
 /* mainline 7.2 renamed struct drm_atomic_state to struct drm_atomic_commit */
 struct drm_atomic_commit { struct drm_crtc_state crtc; };
 #define to_apple_crtc(x) (x)
@@ -1691,6 +1704,11 @@ static int iomfb_m4_get_mode(struct apple_dcp *d,struct drm_display_mode *m)
 static unsigned drm_plane_mask(void *p) { (void)p; assert(false); return 0; }
 static bool drm_mode_equal(const struct drm_display_mode *a,const struct drm_display_mode *b)
 { (void)a; (void)b; assert(false); return false; }
+/* These commits change no colour management, so no gamma table is sized. */
+static int __attribute__((unused)) drm_color_lut_size(const void *blob)
+{ (void)blob; assert(!"gamma LUT without a colour-management change"); return 0; }
+static unsigned int __attribute__((unused)) dcp_gamma_lut_size(struct platform_device *p)
+{ (void)p; assert(!"gamma LUT without a colour-management change"); return 0; }
 /* Route-follow is for Type-C displays; this DCP has no Type-C routes. */
 static bool __attribute__((unused)) typec_follow_crtc = true;
 static int __attribute__((unused)) dcp_typec_follow_check(struct apple_dcp *d, struct drm_crtc *c,
