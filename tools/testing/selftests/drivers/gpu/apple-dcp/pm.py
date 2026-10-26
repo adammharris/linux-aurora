@@ -547,7 +547,7 @@ static void balanced(void) {
 int main(void) {
  (void)cd321x_pm_notifications;
  struct cd321x c;
- struct cd321x_pm_state budget;
+ struct cd321x_pm_state budget={0};
  cd321x_pm_init(&budget);assert(cd321x_pm_ready(&budget));
  assert(cd321x_display_taken(-ENOSPC,true)&&!cd321x_display_taken(-EBUSY,true)&&!cd321x_display_taken(0,true)&&cd321x_display_taken(-EBUSY,false)&&!cd321x_display_taken(-ENOSPC,false)&&!cd321x_display_taken(0,false));
  for(unsigned int i=0;i<CD321X_RESUME_ATTEMPTS;i++){
