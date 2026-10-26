@@ -2,7 +2,7 @@
 # Copyright 2026 Ryan Murray
 """Actual PM/HCD/mux/probe boundaries using the shared PHY extraction fixture."""
 from pathlib import Path
-import os, re, subprocess
+import os, re, shlex, shutil, subprocess
 import phy
 from common import block, tipd_pm_header, atc_function
 
@@ -681,7 +681,8 @@ def kconfig(root, output):
                       'config PHY_APPLE_ATC\n\ttristate "PHY"\n\t' + dependency + '\n')
     compiler = Path(os.environ.get('KCONFIG_CONF', root / 'scripts/kconfig/conf'))
     if not compiler.is_file():
-        subprocess.run(['make', '-C', str(root), 'O=' + str(directory / 'producer'),
+        make = shlex.split(os.environ.get('MAKE', shutil.which('gmake') or 'make'))
+        subprocess.run(make + ['-C', str(root), 'O=' + str(directory / 'producer'),
                         'ARCH=arm64', 'LLVM=1', 'allnoconfig'], check=True)
         compiler = directory / 'producer/scripts/kconfig/conf'
     for usb, phy_setting in [('n', 'y'), ('y', 'y'), ('m', 'y'), ('m', 'm')]:

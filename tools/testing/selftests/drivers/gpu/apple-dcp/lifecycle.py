@@ -1770,6 +1770,10 @@ def power_reply(root):
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+/* Darwin has no EREMOTEIO; this synthetic status is never passed to libc. */
+#ifndef EREMOTEIO
+#define EREMOTEIO 121
+#endif
 typedef uint32_t u32; typedef uint64_t u64;
 #define WRITE_ONCE(p,v) ((p)=(v))
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))

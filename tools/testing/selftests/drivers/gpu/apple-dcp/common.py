@@ -47,6 +47,8 @@ def source_defines(source):
 def tipd_pm_header(root):
     """CD321x PM state machine for host units, with a host clamp() for minmax.h."""
     header = (root / 'drivers/usb/typec/tipd/cd321x-pm.h').read_text()
+    # Use the host errno namespace, not the AFK Linux-numbered shim.
+    header = header.replace('#include <linux/errno.h>', '#include <errno.h>')
     # Host integer types; a repeated identical typedef is valid C11.
     header = header.replace('#include <linux/types.h>',
         '#include <stdint.h>\ntypedef uint32_t u32;')
