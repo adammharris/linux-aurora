@@ -72,6 +72,15 @@ impl event::Queues for Service<'_> {
     fn context_killed(&mut self, cookie: u64) {
         self.firmware.queues.acknowledge_compute_exit(cookie);
     }
+    fn compute_fault(&mut self, qid: u8, stamp: u32) {
+        for entry in self.firmware.queues.compute.iter_mut().flatten() {
+            if let Some(mut queue) = entry.queue.as_deref_mut() {
+                if queue.qid() == qid {
+                    queue.note_fault(stamp);
+                }
+            }
+        }
+    }
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
     }
