@@ -29,6 +29,8 @@
 		disp0-piodma = &disp0_piodma;
 		/* the boot loader finds the GPU node through this alias */
 		gpu = &gpu;
+		/* the boot loader reserves the SEP firmware through this alias */
+		sep = &sep;
 	};
 
 	chosen {
@@ -1348,6 +1350,33 @@
 
 &fpwm0 {
 	status = "okay";
+};
+
+/* apple_sep enables the SEP and its DART when it loads. */
+&sep_mbox {
+	status = "okay";
+};
+
+/*
+ * Touch ID sensor (Mesa 0x3356). Its power is NUB GPIO 53 and its
+ * data-ready line is AP GPIO 116, as the J616s ADT describes them.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_nub 53 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl>;
+	interrupts = <116 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/*
+	 * Per-device factory data from this Mac's own iBoot system container:
+	 * the sealed calibration and the sealed root key.
+	 */
+	firmware-name = "apple/mesacal-j616s.bin", "apple/msrk-j616s.bin";
 };
 
 /* The Type-C retimers (ADT atcrt at 0x18/0x19/0x1a) sit on this bus; no driver yet. */
