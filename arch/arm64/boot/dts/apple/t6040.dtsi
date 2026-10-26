@@ -702,6 +702,48 @@
 		status = "disabled";
 	};
 
+	/*
+	 * iBoot hands over a running SEP. Keep Linux off its DART at boot;
+	 * apple_sep enables it when the driver binds. The SEP only accepts
+	 * IOVAs in the window iBoot programmed (ADT vm-base 0x10000004000,
+	 * vm-size 0x3ff00000), which carries the BIT(40) alias the DART
+	 * translates.
+	 */
+	sep_dart: iommu@404c80000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x04c80000 0x0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 676 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0x3ff00000>;
+		apple,dma-offset = /bits/ 64 <0x0>;
+		status = "disabled";
+	};
+
+	sep: sep@406600000 {
+		compatible = "apple,sep";
+		reg = <0x4 0x06600000 0x0 0x88000>;
+		mboxes = <&sep_mbox>;
+		mbox-names = "mbox";
+		iommus = <&sep_dart 0>;
+		power-domains = <&ps_sep>;
+		status = "disabled";
+	};
+
+	sep_mbox: mailbox@406608000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x06608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 666 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 667 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 668 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 669 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
 	ans_mbox: mailbox@409608000 {
 		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
 		reg = <0x4 0x09608000 0x0 0x4000>;
@@ -825,6 +867,30 @@
 		power-domains = <&ps_fpwm0>;
 		#pwm-cells = <2>;
 		status = "disabled";
+	};
+
+	/*
+	 * Touch ID. iBoot leaves the pads muxed and the controller uses its
+	 * native chip select, so there is no pinctrl here.
+	 */
+	spi2: spi@429108000 {
+		compatible = "apple,t6041-spi", "apple,t8103-spi";
+		reg = <0x4 0x29108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1569 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
+		power-domains = <&ps_spi2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		mesa: fingerprint@0 {
+			compatible = "apple,mesa-fingerprint";
+			reg = <0>;
+			spi-max-frequency = <8000000>;
+			spi-cpol;
+			status = "disabled";
+		};
 	};
 
 	nvme: nvme@44dcc0000 {
