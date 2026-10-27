@@ -277,6 +277,8 @@ properties:
   '#size-cells':
     const: 2
 
+  ranges: true
+
   piodma:
     type: object
     properties:

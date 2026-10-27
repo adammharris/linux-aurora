@@ -680,6 +680,7 @@
 		/* the boot loader describes the piodma's regions with 2+2 cells */
 		#address-cells = <2>;
 		#size-cells = <2>;
+		ranges;
 		/* enabled once the boot loader has handed the display over */
 		status = "disabled";
 
