@@ -2403,3 +2403,4 @@
 };
 
 #include "t6040-pmgr.dtsi"
+#include "t6040-dpaudio.dtsi"

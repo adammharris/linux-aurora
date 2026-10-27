@@ -4,29 +4,36 @@
 $id: http://devicetree.org/schemas/sound/apple,t6030-dpaudio.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T6030 DisplayPort audio
+title: Apple T6030 and T6041 DisplayPort audio
 
 maintainers:
   - Ryan Murray <ryan@aurorasilicon.org>
 
 description: |
-  The external display processor provides the HDMI port's audio service.
-  Its DisplayPort audio interface has no application-processor registers.
-  Samples arrive through SIO, and the graph connects this interface to
-  port 0 of the display processor that owns the audio service.
+  Each DisplayPort audio interface has no application-processor registers.
+  Samples arrive through SIO, and the graph connects the interface to port 0
+  of the display processor that owns its audio service. An interface without
+  an assigned display processor has no graph connection and remains disabled.
+
+  T6041 requires a generation-specific SIO firmware backend and a compatible
+  display audio service before these interfaces can be enabled.
 
 select:
   properties:
     compatible:
       contains:
-        const: apple,t6030-dpaudio
+        enum:
+          - apple,t6030-dpaudio
+          - apple,t6041-dpaudio
   required:
     - compatible
 
 properties:
   compatible:
     items:
-      - const: apple,t6030-dpaudio
+      - enum:
+          - apple,t6030-dpaudio
+          - apple,t6041-dpaudio
       - const: apple,dpaudio
 
   dmas:
@@ -52,6 +59,26 @@ required:
   - dmas
   - dma-names
   - power-domains
-  - ports
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6030-dpaudio
+    then:
+      required:
+        - ports
+
+  - if:
+      not:
+        required:
+          - ports
+    then:
+      properties:
+        status:
+          const: disabled
+      required:
+        - status
 
 additionalProperties: false
