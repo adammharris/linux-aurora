@@ -39,3 +39,29 @@ jobs:
           python3 -m unittest tools/aurora-sep/tests/test_enrol_admission.py -v
           python3 -m unittest tools/aurora-sep/tests/test_owner_preparation.py -v
           python3 -m unittest discover -s tools/aurora-sep/tests -p test_packaging.py -v
+
+  rust-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+            flex bison bc pkg-config make perl
+          rustup component add rust-src
+          cargo install bindgen-cli --version 0.71.1 --locked
+      - name: Compile Apple SEP module for arm64
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: |
+          make LLVM=1 ARCH=arm64 rustavailable
+          make LLVM=1 ARCH=arm64 defconfig
+          scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/asahi.config
+          make LLVM=1 ARCH=arm64 olddefconfig
+          grep -qx 'CONFIG_APPLE_SEP=m' .config
+          make -j2 LLVM=1 ARCH=arm64 modules_prepare
+          make -j2 LLVM=1 ARCH=arm64 drivers/soc/apple/apple-sep.o
