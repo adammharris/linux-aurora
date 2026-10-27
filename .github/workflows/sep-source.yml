@@ -35,4 +35,5 @@ jobs:
       - name: Test recovery utility and package sources
         run: |
           python3 -m unittest tools/aurora-sep/tests/test_sep_bio_identities.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_orphan_delete.py -v
           python3 -m unittest discover -s tools/aurora-sep/tests -p test_packaging.py -v
