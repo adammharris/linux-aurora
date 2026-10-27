@@ -3542,6 +3542,12 @@ impl SepData {
         if !self.touchid_started.load(Relaxed) || self.xarm.lock().os_uuid.is_none() {
             return Err(ENXIO);
         }
+        if !self.keybag_designated.load(Relaxed)
+            || self.enrol_material.lock().is_none()
+            || !matches!(keybag::read(keybag::Slot::Identity),
+                         Ok(keybag::State::Present(_))) {
+            return Err(ENODATA);
+        }
         Ok(())
     }
 
