@@ -1808,6 +1808,179 @@
 		phy-names = "usb2-phy", "usb3-phy";
 		status = "disabled";
 	};
+	/* Additional DARTs; enabled together with their DMA consumers. */
+	ave0_dart1: iommu@283080000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x2 0x83080000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1461 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc0_sys>;
+		status = "disabled";
+	};
+
+	ave0_dart0: iommu@2830a0000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x2 0x830a0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1461 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc0_sys>;
+		status = "disabled";
+	};
+
+	apr0_dart: iommu@301020000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x01020000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1959 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+
+	apciec0_dart: iommu@384000000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x84000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1606 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	apciec1_dart: iommu@38c000000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x8c000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1638 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	apciec2_dart: iommu@394000000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x94000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1670 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	dispext0_dart: iommu@3a2300000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0xa2300000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1165 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	dcpext0_dart: iommu@3a2340000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0xa2340000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1165 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	apcie1_dart: iommu@411000000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x11000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1733 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	sio_dart: iommu@429060000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x29060000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1587 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_sio>;
+		status = "disabled";
+	};
+
+	ane0_dart0: iommu@485800000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x85800000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		status = "disabled";
+	};
+
+	ane0_dart1: iommu@485820000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x85820000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		status = "disabled";
+	};
+
+	ane0_dart2: iommu@485840000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x85840000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		status = "disabled";
+	};
+
+	jpeg0_dart: iommu@487020000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x87020000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1539 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_jpg>;
+		status = "disabled";
+	};
+
+	jpeg1_dart: iommu@487080000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x87080000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1544 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_jpg>;
+		status = "disabled";
+	};
+
+	scaler0_dart: iommu@521260000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x21260000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1548 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr0>;
+		status = "disabled";
+	};
+
+	dispext1_dart: iommu@602300000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x6 0x02300000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1237 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	dcpext1_dart: iommu@602340000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x6 0x02340000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1237 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
 };
 
 #include "t6040-pmgr.dtsi"
