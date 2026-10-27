@@ -297,6 +297,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "avd_sys";
+		power-domains = <&ps_fab0_soc>;
 	};
 
 	ps_afc: power-controller@178 {
@@ -315,6 +316,7 @@
 		#reset-cells = <0>;
 		label = "pmp";
 		apple,always-on;
+		power-domains = <&ps_pms>;
 	};
 
 	ps_pms_sram: power-controller@418 {
@@ -324,6 +326,7 @@
 		#reset-cells = <0>;
 		label = "pms_sram";
 		apple,always-on;
+		power-domains = <&ps_pms>;
 	};
 
 	ps_fab6_soc: power-controller@480 {
@@ -358,6 +361,7 @@
 		#reset-cells = <0>;
 		label = "atc0_common";
 		apple,always-on;
+		power-domains = <&ps_fab2_soc>;
 	};
 
 	ps_atc1_common: power-controller@3b8 {
@@ -367,6 +371,7 @@
 		#reset-cells = <0>;
 		label = "atc1_common";
 		apple,always-on;
+		power-domains = <&ps_fab2_soc>;
 	};
 
 	ps_atc2_common: power-controller@3e0 {
@@ -376,6 +381,7 @@
 		#reset-cells = <0>;
 		label = "atc2_common";
 		apple,always-on;
+		power-domains = <&ps_fab2_soc>;
 	};
 };
 
@@ -1380,7 +1386,6 @@
 		label = "fab0_soc";
 		power-domains = <&ps_afi>;
 		apple,always-on;
-		status = "disabled";
 	};
 
 	ps_amcc0: power-controller@180 {
@@ -1648,7 +1653,6 @@
 		label = "fab2_soc";
 		power-domains = <&ps_afi>;
 		apple,always-on;
-		status = "disabled";
 	};
 
 	ps_dispext0_sys: power-controller@340 {
