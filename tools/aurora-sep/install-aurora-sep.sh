@@ -815,7 +815,7 @@ M3_STUB_IBOOT=iBoot-10151.140.19
 # M1N1_PACKAGE is linked to end its file part below 0x120000 (0xe0000 for the
 # aurora8.5 line it comes from), so a stage 1 allowlist there would only
 # refuse Macs that boot today.
-M3_STAGE1_VERSIONS="v1.6.1-dirty"
+M3_STAGE1_VERSIONS="v1.6.1-dirty v1.6.1"
 # m1n1 (aurora8.5-2 and later) adds this node when one of those log buffers
 # overlaps where stage 1 loaded it. It keeps the buffer reserved and boots on,
 # but it was never checked in that layout.
