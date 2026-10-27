@@ -1981,6 +1981,95 @@
 		status = "disabled";
 	};
 
+	pinctrl_aop: pinctrl@510824000 {
+		compatible = "apple,t6041-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x5 0x10824000 0x0 0x4000>;
+		clocks = <&clkref>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_aop 0 0 85>;
+		apple,npins = <85>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 700 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 701 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 702 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 703 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 704 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 705 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 706 IRQ_TYPE_LEVEL_HIGH>;
+		/* Coprocessor pins and interrupt groups need an ownership handoff. */
+		status = "disabled";
+	};
+
+	pinctrl_smc: pinctrl@50c824000 {
+		compatible = "apple,t6041-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x5 0x0c824000 0x0 0x4000>;
+		clocks = <&clkref>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_smc 0 0 24>;
+		apple,npins = <24>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 985 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 986 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 987 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 988 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 989 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 990 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 991 IRQ_TYPE_LEVEL_HIGH>;
+		/* Coprocessor pins and interrupt groups need an ownership handoff. */
+		status = "disabled";
+	};
+
+	nub_spmi1: spmi@509054000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x09054000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		power-domains = <&ps_nub_spmi1>;
+		status = "disabled";
+	};
+
+	nub_spmi2: spmi@509094000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x09094000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		power-domains = <&ps_nub_spmi2>;
+		status = "disabled";
+	};
+
+	nub_spmi3: spmi@5090d4000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x090d4000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		power-domains = <&ps_nub_spmi3>;
+		status = "disabled";
+	};
+
+	nub_spmi4: spmi@509114000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x09114000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		power-domains = <&ps_nub_spmi4>;
+		status = "disabled";
+	};
+
+	aop_spmi0: spmi@510914000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x10914000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		/* Shared with AOP firmware; no AP bus ownership handoff yet. */
+		status = "disabled";
+	};
+
 };
 
 #include "t6040-pmgr.dtsi"
