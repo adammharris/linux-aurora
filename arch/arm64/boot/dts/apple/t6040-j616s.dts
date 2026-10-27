@@ -29,6 +29,7 @@
 		disp0-piodma = &disp0_piodma;
 		/* the boot loader finds the GPU node through this alias */
 		gpu = &gpu;
+		pmp = &pmp;
 		/* the boot loader reserves the SEP firmware through this alias */
 		sep = &sep;
 	};

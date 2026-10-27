@@ -2301,6 +2301,31 @@
 		status = "disabled";
 	};
 
+	serial0: serial@429200000 {
+		compatible = "apple,s5l-uart";
+		reg = <0x4 0x29200000 0x0 0x4000>;
+		reg-io-width = <4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1559 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>, <&clkref>;
+		clock-names = "uart", "clk_uart_baud0";
+		power-domains = <&ps_uart0>;
+		status = "disabled";
+	};
+
+	dcuart: serial@50883c000 {
+		compatible = "apple,dockchannel-uart";
+		reg = <0x5 0x0883c000 0x0 0x4000>,
+		      <0x5 0x08838000 0x0 0x4000>,
+		      <0x5 0x0880c000 0x0 0x4000>;
+		reg-names = "data", "config", "irq";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 360 IRQ_TYPE_LEVEL_HIGH>;
+		apple,channel = <2>;
+		apple,sw-drain;
+		status = "disabled";
+	};
+
 };
 
 #include "t6040-pmgr.dtsi"
