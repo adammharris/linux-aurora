@@ -3618,6 +3618,7 @@ impl SepData {
         bio::validate_enrol_start_arg(arg)?;
         self.require_linux_bio_lane()?;
         if !bio::idle_for_mutation(&self.bio_session.lock()) { return Err(EBUSY); }
+        if !sensor::is_bound() { return Err(ENODEV); }
         if !self.xart_writable() { return Err(EROFS); }
         let ids = self.enclave_identities_for(SBIO_PROBE_USER_ID).ok_or(EIO)?;
         if !ids.is_empty() {
@@ -3635,6 +3636,14 @@ impl SepData {
                 .is_some_and(|material| material.snapshot_identity.is_some()) {
             return Err(ENODATA);
         }
+        if shim::StoreFile::open_writable_existing(keybag::Slot::Identity.path()).is_err() {
+            return Err(EROFS);
+        }
+        let index = self.bio_index.lock();
+        if !self.with_host_store(|store| index.can_persist_next(store)).unwrap_or(false) {
+            return Err(ENOSPC);
+        }
+        drop(index);
         let user = crate::sbio::UserId::new(SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
         loop {
             self.wait_until_awake()?;
