@@ -4385,3 +4385,36 @@
 &ps_nub_spmi2 {
 	status = "okay";
 };
+
+&pinctrl {
+	sd_clkreq_pins: sd-clkreq-pins {
+		pinmux = <APPLE_PINMUX(1, 1)>;
+	};
+};
+
+&pcie0 {
+	interrupts = <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 1732 IRQ_TYPE_LEVEL_HIGH>;
+	bus-range = <0 2>;
+	iommu-map = <0x100 &pcie_dart 1 2>, <0x200 &apcie1_dart 1 1>;
+
+	port01: pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0 0 0 0>;
+		reset-gpios = <&pinctrl 5 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&sd_clkreq_pins>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
+				<0 0 0 2 &port01 0 0 0 1>,
+				<0 0 0 3 &port01 0 0 0 2>,
+				<0 0 0 4 &port01 0 0 0 3>;
+		/* The SD power switch needs an SMC service binding. */
+		status = "disabled";
+	};
+};
