@@ -2070,6 +2070,67 @@
 		status = "disabled";
 	};
 
+	/* The QSPIMC input is ADT clock 434 (200 MHz). */
+	clk_200m: clock-200m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "clk_200m";
+	};
+
+	spi4: spi@429110000 {
+		compatible = "apple,t6041-spi", "apple,t8103-spi";
+		reg = <0x4 0x29110000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1571 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
+		power-domains = <&ps_spi4>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* Panel/TCON control belongs to the display firmware. */
+		status = "disabled";
+	};
+
+	qspi: spi@429118000 {
+		compatible = "apple,t6041-qspi";
+		reg = <0x4 0x29118000 0x0 0x4800>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1573 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_200m>;
+		power-domains = <&ps_qspi>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* The firmware NOR needs a qualified partition/write policy. */
+		status = "disabled";
+	};
+
+	/* The loader supplies the SIO firmware regions and protocol tables. */
+	sio: dma-controller@429e00000 {
+		compatible = "apple,t6041-sio", "apple,sio";
+		reg = <0x4 0x29e00000 0x0 0x8000>;
+		dma-channels = <128>;
+		#dma-cells = <1>;
+		mboxes = <&sio_mbox>;
+		iommus = <&sio_dart 0>;
+		power-domains = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
+	sio_mbox: mailbox@429e08000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x29e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1591 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1592 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1593 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1594 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
 };
 
 #include "t6040-pmgr.dtsi"

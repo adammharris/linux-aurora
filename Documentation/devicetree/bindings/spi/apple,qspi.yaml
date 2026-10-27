@@ -22,6 +22,7 @@ properties:
     enum:
       - apple,t8122-qspi
       - apple,t8132-qspi
+      - apple,t6041-qspi
       - apple,t8140-qspi
 
   reg:
