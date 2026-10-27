@@ -3645,6 +3645,9 @@ impl SepData {
         }
         drop(index);
         let user = crate::sbio::UserId::new(SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
+        // The host must be able to create and sync the owner file before a
+        // system-context write. A pre-existing invalid file is left intact.
+        crate::catacomb::prepare_missing_owner()?;
         loop {
             self.wait_until_awake()?;
             let _writer = self.catacomb_writer.lock();
