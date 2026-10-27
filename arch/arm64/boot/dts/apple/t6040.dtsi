@@ -2269,6 +2269,18 @@
 		status = "disabled";
 	};
 
+	/* Firmware interface support is required before enabling the ANE. */
+	ane: ane@484000000 {
+		compatible = "apple,t6041-ane";
+		reg = <0x4 0x84000000 0x0 0x2000000>;
+		reg-names = "engine";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1054 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ane0_dart0 0>, <&ane0_dart1 0>, <&ane0_dart2 0>;
+		power-domains = <&ps_ane_cpu>;
+		status = "disabled";
+	};
+
 };
 
 #include "t6040-pmgr.dtsi"

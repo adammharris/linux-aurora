@@ -15,7 +15,9 @@ description:
   drives the engine through its register window. On T602x and T8112 a
   coprocessor runs the ANE firmware and the host talks to it through an ASC
   mailbox. T8140 has two interrupts and one system power domain; its
-  coprocessor uses a different firmware interface.
+  coprocessor uses a different firmware interface. T6041 likewise needs a
+  generation-specific firmware backend; it has one interrupt and its CPU
+  power state supplies the engine through the ANE system domain.
 
 properties:
   compatible:
@@ -25,6 +27,7 @@ properties:
       - apple,t6020-ane
       - apple,t6021-ane
       - apple,t6022-ane
+      - apple,t6041-ane
       - apple,t8112-ane
       - apple,t8140-ane
 
@@ -90,16 +93,32 @@ allOf:
   - if:
       properties:
         compatible:
+          const: apple,t8140-ane
+    then:
+      properties:
+        interrupts:
+          minItems: 2
+  - if:
+      properties:
+        compatible:
+          const: apple,t6041-ane
+    then:
+      properties:
+        interrupts:
+          maxItems: 1
+  - if:
+      properties:
+        compatible:
           contains:
-            const: apple,t8140-ane
+            enum:
+              - apple,t8140-ane
+              - apple,t6041-ane
     then:
       properties:
         reg:
           maxItems: 1
         reg-names:
           maxItems: 1
-        interrupts:
-          minItems: 2
         interrupt-names: false
         iommus:
           minItems: 3
