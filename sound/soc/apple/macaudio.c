@@ -1507,9 +1507,6 @@ static int macaudio_probe(struct snd_soc_card *card)
 	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_2, KEY_VOLUMEDOWN);
 	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_3, KEY_VOICECOMMAND);
 
-	if (ma->speaker_id_gpios)
-		return snd_soc_add_card_controls(card, &macaudio_speaker_id_control, 1);
-
 	return ret;
 }
 
@@ -1632,6 +1629,13 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		mutex_lock(&ma->volume_lock_mutex);
 		macaudio_vlimit_unlock(ma, false);
 		mutex_unlock(&ma->volume_lock_mutex);
+	}
+
+	/* Append identity metadata without renumbering the existing controls. */
+	if (ma->speaker_id_gpios) {
+		ret = snd_soc_add_card_controls(card, &macaudio_speaker_id_control, 1);
+		if (ret)
+			return ret;
 	}
 
 	/* The notifier walks the card's controls: only while the card is bound */
