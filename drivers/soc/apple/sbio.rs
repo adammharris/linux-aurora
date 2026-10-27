@@ -4037,7 +4037,7 @@ impl SepData {
         }
 
         // 0x57 cannot be undone. Ensure the host can save the affected user
-        // and master Catacombs before sending it. For an unindexed orphan the
+        // and master Catacombs before sending it. For an explicit recovery the
         // owner Catacomb provides the recovery path even when the bag snapshot
         // has no binding; export that owner first if this install lacks a file.
         for kind in [PRIVATE_TYPE_CATACOMB_USER, PRIVATE_TYPE_CATACOMB_MASTER] {
@@ -4071,6 +4071,11 @@ impl SepData {
             dev_err!(self.dev, "bio: not deleting: indexed identity has no identity-bag binding\n");
             return Err(EIO);
         }
+        if orphan && !matches!(keybag::read(keybag::Slot::Identity),
+                               Ok(keybag::State::Present(_))) {
+            dev_err!(self.dev, "bio: not deleting: Linux identity bag file is unavailable\n");
+            return Err(EIO);
+        }
 
         let op = crate::sbio::sbio_delete_identity(identity);
 
@@ -4091,9 +4096,10 @@ impl SepData {
     /// the enclave marks save-pending (a SAVE_CATACOMB of one that is not has
     /// been refused), the user before the master because saving the user can
     /// change the master, state re-read before each, then the lockout and the
-    /// identity bag, which must match the Catacombs. Safe to repeat after a
-    /// failure partway: a `retry` accepts a user Catacomb an earlier attempt
-    /// already saved.
+    /// identity bag when a verified binding exists. An exact-ID orphan
+    /// recovery without that binding saves the Linux owner Catacomb instead.
+    /// Safe to repeat after a failure partway: a `retry` accepts a user
+    /// Catacomb an earlier attempt already saved.
     fn persist_deletion(&self, retry: bool, orphan: bool) -> Result<()> {
         let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
             return Err(EIO);
@@ -4151,18 +4157,23 @@ impl SepData {
             dev_err!(self.dev, "bio: lockout persistence failed after the deletion\n");
             return Err(EIO);
         }
-        if !orphan && !self.resnapshot_identity_keybag() {
-            dev_err!(
-                self.dev,
-                "bio: Catacombs saved after the deletion but the identity-bag snapshot failed\n"
-            );
-            return Err(EIO);
-        }
-        if orphan {
+        let bag_bound = self.enrol_material.lock().as_ref()
+            .is_some_and(|material| material.snapshot_identity.is_some());
+        if bag_bound {
+            if !self.resnapshot_identity_keybag() {
+                dev_err!(
+                    self.dev,
+                    "bio: Catacombs saved after the deletion but the identity-bag snapshot failed\n"
+                );
+                return Err(EIO);
+            }
+        } else if orphan {
             dev_info!(
                 self.dev,
-                "bio: orphan deletion saved via Linux user/master/owner Catacombs; no unbound identity bag was snapshotted\n"
+                "bio: orphan deletion saved via Linux user/master/owner Catacombs without a bag snapshot binding\n"
             );
+        } else {
+            return Err(EIO);
         }
         Ok(())
     }
