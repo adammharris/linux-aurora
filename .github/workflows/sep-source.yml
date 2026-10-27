@@ -61,7 +61,9 @@ jobs:
           make LLVM=1 ARCH=arm64 rustavailable
           make LLVM=1 ARCH=arm64 defconfig
           scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/asahi.config
+          scripts/config -e KUNIT -e APPLE_SEP_KUNIT_TEST
           make LLVM=1 ARCH=arm64 olddefconfig
           grep -qx 'CONFIG_APPLE_SEP=m' .config
+          grep -qx 'CONFIG_APPLE_SEP_KUNIT_TEST=y' .config
           make -j2 LLVM=1 ARCH=arm64 modules_prepare
           make -j2 LLVM=1 ARCH=arm64 drivers/soc/apple/apple-sep.o
