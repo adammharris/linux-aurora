@@ -4360,3 +4360,34 @@
 };
 
 #include "t6040-j616s-usb3.dtsi"
+
+/* Additional Abbey PMICs on the two independent NUB SPMI buses. */
+&nub_spmi1 {
+	status = "okay";
+
+	pmic@e {
+		compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+	};
+};
+
+&nub_spmi2 {
+	status = "okay";
+
+	pmic@e {
+		compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+	};
+};
+
+&ps_nub_spmi_ahb {
+	status = "okay";
+};
+
+&ps_nub_spmi1 {
+	status = "okay";
+};
+
+&ps_nub_spmi2 {
+	status = "okay";
+};
