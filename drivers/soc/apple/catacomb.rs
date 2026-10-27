@@ -28,6 +28,12 @@ pub(crate) fn is_kind(kind: u8) -> bool {
     path_for(kind).is_some()
 }
 
+pub(crate) fn writable(kind: u8) -> bool {
+    path_for(kind)
+        .and_then(|path| shim::StoreFile::open_writable_existing(path).ok())
+        .is_some()
+}
+
 pub(crate) fn write(kind: u8, blob: &[u8]) -> Result<()> {
     let path = path_for(kind).ok_or(EINVAL)?;
     if blob.len() > MAX_CATACOMB {
