@@ -34,6 +34,7 @@ properties:
               - apple,t6000-dcpext
               - apple,t6020-dcpext
           - const: apple,dcpext
+      - const: apple,t6041-dcpext
       - items:
           - const: apple,t8140-dcpext
           - const: apple,dcp
@@ -372,10 +373,19 @@ allOf:
             pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
       not:
-        properties:
-          compatible:
-            contains:
-              const: apple,t8132-dcp
+        anyOf:
+          - properties:
+              compatible:
+                contains:
+                  const: apple,t8132-dcp
+          - properties:
+              compatible:
+                contains:
+                  const: apple,t6041-dcpext
+              status:
+                const: disabled
+            required:
+              - status
     then:
       required:
         - apple,bw-scratch
