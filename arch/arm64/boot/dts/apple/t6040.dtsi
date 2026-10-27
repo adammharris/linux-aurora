@@ -2107,7 +2107,7 @@
 
 	/* The loader supplies the SIO firmware regions and protocol tables. */
 	sio: dma-controller@429e00000 {
-		compatible = "apple,t6041-sio", "apple,sio";
+		compatible = "apple,t6041-sio";
 		reg = <0x4 0x29e00000 0x0 0x8000>;
 		dma-channels = <128>;
 		#dma-cells = <1>;
