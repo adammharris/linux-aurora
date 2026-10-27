@@ -12,6 +12,10 @@
 	status = "okay";
 };
 
+&ps_uart_p {
+	status = "okay";
+};
+
 &ps_uart0 {
 	status = "okay";
 };

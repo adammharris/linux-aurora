@@ -2246,7 +2246,6 @@
 		reg-names = "bank0", "bank1", "core", "cfg", "cpu", "cpu-data",
 			    "axi2af", "axi2af-lioa", "fabric", "common-cfg";
 		#phy-cells = <1>;
-		#reset-cells = <0>;
 		power-domains = <&ps_atc3_common_dp>;
 		mboxes = <&atcphy3_mbox>;
 		mbox-names = "phy-cpu";
