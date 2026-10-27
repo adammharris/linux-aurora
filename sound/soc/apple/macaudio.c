@@ -24,6 +24,7 @@
 
 #include <linux/module.h>
 #include <linux/atomic.h>
+#include <linux/gpio/consumer.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/suspend.h>
@@ -62,6 +63,7 @@
 #define MACAUDIO_NUM_FE_LINKS	3
 /* milliseconds */
 #define SPEAKER_LOCK_TIMEOUT 250
+#define MACAUDIO_MAX_SPEAKER_ID_GPIOS 8
 
 enum macaudio_amp_type {
 	AMP_NONE,
@@ -166,6 +168,7 @@ struct macaudio_snd_data {
 	bool has_sense;
 	bool has_safety;
 	unsigned int max_channels;
+	struct gpio_descs *speaker_id_gpios;
 
 	struct macaudio_link_props {
 		/* frontend props */
@@ -1430,6 +1433,50 @@ static const struct snd_soc_jack_pin macaudio_jack_pins[] = {
 	},
 };
 
+static int macaudio_speaker_id_info(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_info *uinfo)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = BIT(ma->speaker_id_gpios->ndescs) - 1;
+	uinfo->value.integer.step = 1;
+
+	return 0;
+}
+
+static int macaudio_speaker_id_get(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *uvalue)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	unsigned int value = 0;
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ma->speaker_id_gpios->ndescs; i++) {
+		ret = gpiod_get_value_cansleep(ma->speaker_id_gpios->desc[i]);
+		if (ret < 0)
+			return ret;
+		if (ret)
+			value |= BIT(i);
+	}
+	uvalue->value.integer.value[0] = value;
+
+	return 0;
+}
+
+static const struct snd_kcontrol_new macaudio_speaker_id_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Speaker Variant ID",
+	.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	.info = macaudio_speaker_id_info,
+	.get = macaudio_speaker_id_get,
+};
+
 static int macaudio_probe(struct snd_soc_card *card)
 {
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
@@ -1459,6 +1506,9 @@ static int macaudio_probe(struct snd_soc_card *card)
 	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_1, KEY_VOLUMEUP);
 	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_2, KEY_VOLUMEDOWN);
 	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_3, KEY_VOICECOMMAND);
+
+	if (ma->speaker_id_gpios)
+		return snd_soc_add_card_controls(card, &macaudio_speaker_id_control, 1);
 
 	return ret;
 }
@@ -2182,6 +2232,16 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	ret = macaudio_parse_of(data);
 	if (ret)
 		return ret;
+
+	data->speaker_id_gpios = devm_gpiod_get_array_optional(dev, "speaker-id",
+							       GPIOD_IN);
+	if (IS_ERR(data->speaker_id_gpios))
+		return dev_err_probe(dev, PTR_ERR(data->speaker_id_gpios),
+				     "Failed to get speaker ID inputs\n");
+	if (data->speaker_id_gpios &&
+	    (!data->speaker_id_gpios->ndescs ||
+	     data->speaker_id_gpios->ndescs > MACAUDIO_MAX_SPEAKER_ID_GPIOS))
+		return dev_err_probe(dev, -EINVAL, "Invalid speaker ID input count\n");
 
 	/*
 	 * Without sense the PCM2 link is gone, and a card whose front-ends

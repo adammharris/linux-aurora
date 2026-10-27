@@ -1258,6 +1258,8 @@
 	sound: sound {
 		compatible = "apple,j616-macaudio", "apple,macaudio";
 		model = "MacBook Pro J616";
+		speaker-id-gpios = <&pinctrl 52 GPIO_ACTIVE_HIGH>,
+				   <&pinctrl 53 GPIO_ACTIVE_HIGH>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 
