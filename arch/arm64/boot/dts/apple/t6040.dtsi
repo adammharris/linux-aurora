@@ -2281,6 +2281,26 @@
 		status = "disabled";
 	};
 
+	/* The video encoder stays disabled until its firmware backend is available. */
+	ave: video-codec@283100000 {
+		compatible = "apple,t6041-ave";
+		reg = <0x2 0x83100000 0x0 0x45c000>,
+		      <0x2 0x83050000 0x0 0x4000>,
+		      <0x2 0x83800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1464 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1458 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1457 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1460 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1459 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
+				<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+		iommus = <&ave0_dart0 0>, <&ave0_dart1 0>;
+		status = "disabled";
+	};
+
 };
 
 #include "t6040-pmgr.dtsi"
