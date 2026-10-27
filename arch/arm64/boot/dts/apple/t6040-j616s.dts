@@ -4358,6 +4358,43 @@
 
 #include "t6040-j616s-usb3.dtsi"
 
+/*
+ * The HDMI bridge is fed by the fourth ATC's fixed DisplayPort output.
+ * Keep the external DCP disabled until its firmware handoff and the SMC
+ * bridge-power services are supported; those services are not GPIO outputs.
+ */
+&dcpext0 {
+	apple,connector-type = "HDMI-A";
+	hdmi-hpd-gpios = <&pinctrl_aop 36 GPIO_ACTIVE_HIGH>;
+	phys = <&atcphy3 PHY_TYPE_DP>;
+	phy-names = "dp-phy";
+	mux-controls = <&atcphy3_xbar 0>;
+	mux-control-names = "dp-xbar";
+	mux-index = <0>;
+	apple,dptx-phy = <3>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+
+			dcpext0_dpout: endpoint {
+				remote-endpoint = <&atcphy3_dp>;
+			};
+		};
+	};
+};
+
+&atcphy3 {
+	port {
+		atcphy3_dp: endpoint {
+			remote-endpoint = <&dcpext0_dpout>;
+		};
+	};
+};
+
 /* Additional Abbey PMICs on the two independent NUB SPMI buses. */
 &nub_spmi1 {
 	status = "okay";
