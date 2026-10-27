@@ -4396,7 +4396,7 @@
 &pcie0 {
 	interrupts = <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>,
 		     <AIC_IRQ 1732 IRQ_TYPE_LEVEL_HIGH>;
-	bus-range = <0 2>;
+	/* Widen bus-range only with the SD power/port ownership handoff. */
 	iommu-map = <0x100 &pcie_dart 1 2>, <0x200 &apcie1_dart 1 1>;
 
 	port01: pci@1,0 {
