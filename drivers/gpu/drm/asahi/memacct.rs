@@ -30,6 +30,10 @@
 //! Imported dma-bufs are charged to their exporter and are not counted here.
 //! Kernel objects (firmware structures, per-queue buffers and the global heaps)
 //! count towards the device total and its limit, but are attributed to no process.
+//!
+//! The limits and the RSS attribution apply only to G17 for now: only its probe
+//! calls [`Ledger::configure`]. Other GPUs keep the totals, with no limit and no
+//! attribution.
 
 use core::sync::atomic::{
     AtomicBool,
@@ -77,6 +81,9 @@ const _: () = {
 
 /// The ledger of the (single) AGX GPU.
 pub(crate) static LEDGER: Ledger = Ledger::new();
+
+/// Whether held user objects are charged to their creator's RSS. Set by [`Ledger::configure`].
+static ATTRIBUTE_RSS: AtomicBool = AtomicBool::new(false);
 
 /// The limits that follow from the amount of RAM and two percentages.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -148,7 +155,7 @@ impl Ledger {
         }
     }
 
-    /// Sets the limits from the module parameters and the amount of RAM.
+    /// Sets the limits and the RSS attribution from the module parameters and the amount of RAM.
     pub(crate) fn configure(&self) {
         // SAFETY: `struct sysinfo` is plain integers, for which all zeroes is a valid value.
         let mut info: kernel::bindings::sysinfo = unsafe { core::mem::zeroed() };
@@ -161,6 +168,10 @@ impl Ledger {
             *module_parameters::client_mem_limit_pct.value(),
         );
         self.set_limits(limits);
+        ATTRIBUTE_RSS.store(
+            *module_parameters::oom_attribution.value() != 0,
+            Ordering::Relaxed,
+        );
         pr_info!(
             "asahi: GPU memory limits: device {} MiB, per client {} MiB (0 = none)\n",
             limits.device >> 20,
@@ -300,11 +311,6 @@ impl Charge {
     /// A user object admitted by `commit`, attributed to `mm` if there is one.
     pub(crate) fn user(commit: Commit, mm: Option<ARef<Mm>>) -> Self {
         let bytes = commit.bytes;
-        let mm = if *module_parameters::oom_attribution.value() != 0 {
-            mm
-        } else {
-            None
-        };
         Self {
             kind: Kind::User { commit, mm },
             bytes,
@@ -312,9 +318,13 @@ impl Charge {
         }
     }
 
-    /// A user object attributed to the current process.
+    /// A user object attributed to the current process, if the ledger attributes RSS.
     pub(crate) fn user_current(commit: Commit) -> Self {
-        let mm = kernel::current!().mm().map(|mm| ARef::from(&**mm));
+        let mm = if ATTRIBUTE_RSS.load(Ordering::Relaxed) {
+            kernel::current!().mm().map(|mm| ARef::from(&**mm))
+        } else {
+            None
+        };
         Self::user(commit, mm)
     }
 
