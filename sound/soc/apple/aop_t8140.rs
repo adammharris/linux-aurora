@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-#![recursion_limit = "2048"]
 
 //! Apple T8140 (J700, MacBook Neo) AOP audio
 //!
@@ -34,9 +33,8 @@
 //! Closing the lid disconnects both internal microphones in hardware.  The
 //! array then reads back as digital silence, but the low-power microphone's
 //! decimator, fed a PDM line held low, reads back as a constant close to
-//! negative full scale.  The driver follows the lid switch through the input
-//! core: while a lid is closed its card's "Internal Mic" jack reads
-//! unplugged, so userspace stops offering the microphones.
+//! negative full scale.  While a lid is closed the card's "Internal Mic" jack
+//! reads unplugged (`aop_lid`), so userspace stops offering the microphones.
 //!
 //! Copyright (C) The Asahi Linux Contributors
 //! Copyright (C) 2026 The Aurora Silicon Contributors
@@ -58,10 +56,8 @@ use kernel::{
         DmaMask, //
     },
     error::from_err_ptr,
-    module_platform_driver,
     new_mutex,
     new_spinlock,
-    of,
     platform,
     prelude::*,
     soc::apple::aop::{
@@ -95,6 +91,8 @@ use kernel::{
         WorkItem, //
     }, //
 };
+
+use crate::aop_lid::MicLid;
 
 const EPIC_SUBTYPE_WRAPPED_CALL: u16 = 0x20;
 const EPIC_SUBTYPE_PRODUCER_REPORT: u16 = 0x20;
@@ -451,106 +449,6 @@ struct LpaiRun {
     running: bool,
 }
 
-/// The lid switches seen through the input core.  The internal microphones
-/// are disconnected while any of them reads closed.
-///
-/// Each switch's flag (in its [`LidHandle`]) and the count change together:
-/// every writer of one switch runs under that input device's event lock (the
-/// event callback, and the resynchronizations in `lid_resync`), or after the
-/// device stopped delivering events to it (`lid_disconnect`).  The count is
-/// the only state shared between switches, and it is a single atomic word.
-struct LidState {
-    /// Lid switches currently closed.
-    closed: Atomic<u32>,
-}
-
-impl LidState {
-    const fn new() -> Self {
-        LidState {
-            closed: Atomic::new(0),
-        }
-    }
-
-    /// Records that the switch whose state is `switch` now reads `closed`.
-    /// Returns whether that changed anything; a repeated state does not.
-    fn set(&self, switch: &AtomicFlag, closed: bool) -> bool {
-        if switch.xchg(closed, Relaxed) == closed {
-            return false;
-        }
-        if closed {
-            self.closed.add(1, Relaxed);
-        } else {
-            let _ = self.closed.fetch_sub(1, Relaxed);
-        }
-        true
-    }
-
-    fn mic_cut(&self) -> bool {
-        self.closed.load(Relaxed) != 0
-    }
-}
-
-/// The "Internal Mic" jack status for the lid state.
-fn mic_jack_status(mic_cut: bool) -> i32 {
-    if mic_cut {
-        0
-    } else {
-        bindings::snd_jack_types_SND_JACK_MICROPHONE as i32
-    }
-}
-
-/// The input handler that follows the lid switches.  Only its address is
-/// shared: the input core owns its contents once it is registered.
-struct LidHandler(Opaque<bindings::input_handler>);
-
-// SAFETY: the handler is filled in before registration and only the input
-// core, which serializes its own access, touches it after that.
-unsafe impl Send for LidHandler {}
-// SAFETY: as for `Send`.
-unsafe impl Sync for LidHandler {}
-
-/// One lid switch the handler is connected to.  `handle` comes first so the
-/// input core's handle pointer is also a pointer to this.
-#[repr(C)]
-struct LidHandle {
-    handle: Opaque<bindings::input_handle>,
-    /// The switch reads closed, as recorded in [`LidState`].
-    closed: AtomicFlag,
-    /// Readings are recorded: the handle is open.
-    open: AtomicFlag,
-}
-
-impl LidHandle {
-    /// Records a reading of this switch, once the handle is open.
-    ///
-    /// `input_register_handle()` calls `lid_start()` before `lid_connect()`
-    /// knows whether opening the handle succeeds, and a handle that fails to
-    /// open is freed without `lid_disconnect()`: a reading recorded then
-    /// could never be taken back.  `lid_connect()` reads the switch again
-    /// once the handle is open.
-    fn record(&self, lid: &LidState, closed: bool) -> bool {
-        self.open.load(Relaxed) && lid.set(&self.closed, closed)
-    }
-
-    /// Records the switch as read under its device's event lock.  With
-    /// `activate`, readings are enabled first: `lid_connect()` enables and
-    /// reads the switch in one step after opening the handle, so an event
-    /// delivered between the open and this reading, which `record()` ignored,
-    /// is caught up with.
-    fn sync(&self, lid: &LidState, closed: bool, activate: bool) -> bool {
-        if activate {
-            self.open.store(true, Relaxed);
-        }
-        self.record(lid, closed)
-    }
-
-    /// The switch goes away: it no longer disconnects the microphones.
-    fn forget(&self, lid: &LidState) -> bool {
-        self.open.store(false, Relaxed);
-        lid.set(&self.closed, false)
-    }
-}
-
 #[pin_data]
 struct SndSocT8140AopData {
     dev: ARef<device::Device>,
@@ -599,14 +497,8 @@ struct SndSocT8140AopData {
     spkr_start_work: Work<Self, SPKR_START_WORK>,
     #[pin]
     hpai_start_work: Work<Self, HPAI_START_WORK>,
-    /// The lid switches, and the card's "Internal Mic" jack that follows
-    /// them (null outside the card's lifetime), reported from `jack_work`
-    /// because the input core delivers switch events in atomic context.
-    lid: LidState,
-    lid_handler: LidHandler,
-    mic_jack: Atomic<*mut bindings::snd_jack>,
-    #[pin]
-    jack_work: Work<Self, JACK_WORK>,
+    /// The card's "Internal Mic" jack, unplugged while a lid is closed.
+    mic: Arc<MicLid>,
     #[pin]
     stream: SpinLock<StreamState>,
     /// Every lpai power request goes through here, see
@@ -617,21 +509,10 @@ struct SndSocT8140AopData {
 
 const SPKR_START_WORK: u64 = 0;
 const HPAI_START_WORK: u64 = 1;
-const JACK_WORK: u64 = 2;
 
 impl_has_work! {
     impl HasWork<Self, SPKR_START_WORK> for SndSocT8140AopData { self.spkr_start_work }
     impl HasWork<Self, HPAI_START_WORK> for SndSocT8140AopData { self.hpai_start_work }
-    impl HasWork<Self, JACK_WORK> for SndSocT8140AopData { self.jack_work }
-}
-
-/// The "Internal Mic" jack report after a lid change: it takes mutexes.
-impl WorkItem<JACK_WORK> for SndSocT8140AopData {
-    type Pointer = Arc<Self>;
-
-    fn run(this: Arc<Self>) {
-        this.report_mic_jack();
-    }
 }
 
 /// The speaker stream start (pwrd + unmute), queued by the back-end DAI's
@@ -1089,46 +970,6 @@ impl SndSocT8140AopData {
         self.service_shutdown(&self.hpai, &self.hpai_domains())
     }
 
-    // ---- the lid: both microphones are disconnected in hardware while it
-    // is closed ----
-
-    /// A lid switch now reads `closed`: queue the jack report on a change.
-    fn lid_set(self: ArcBorrow<'_, Self>, switch: &LidHandle, closed: bool) {
-        if switch.record(&self.lid, closed) {
-            self.queue_jack_report();
-        }
-    }
-
-    /// A lid switch went away.
-    fn lid_forget(self: ArcBorrow<'_, Self>, switch: &LidHandle) {
-        if switch.forget(&self.lid) {
-            self.queue_jack_report();
-        }
-    }
-
-    /// The jack work is the only reporter, so reports reach ALSA in the order
-    /// of the states they read: a queued or running report that read an
-    /// older state is followed by another run.
-    fn queue_jack_report(self: ArcBorrow<'_, Self>) {
-        // Err = already queued: the pending report reads the new state.
-        let _ = workqueue::system_dfl().enqueue::<_, JACK_WORK>(Arc::from(self));
-    }
-
-    fn report_mic_jack(&self) {
-        let jack = self.mic_jack.load(Relaxed);
-        if !jack.is_null() {
-            // SAFETY: the jack belongs to the card, which teardown frees only
-            // after clearing `mic_jack` and flushing this work.
-            unsafe { bindings::snd_jack_report(jack, mic_jack_status(self.lid.mic_cut())) };
-        }
-    }
-
-    fn flush_jack_report(&self) {
-        // SAFETY: the work item lives in `self` for the driver's lifetime;
-        // flushing waits for a queued report to finish.
-        unsafe { bindings::flush_work(Work::raw_get(&self.jack_work)) };
-    }
-
     // ---- internal speakers: the spkr service on LEAP TX0 (leap-ns ADMAC
     // channel 0); the leaves are tx0 (-> leap_c -> leap_a -> audio_fr ->
     // audio_a), leap_mca (-> audio_p) and the MCA0 serializer the LEAP
@@ -1361,166 +1202,6 @@ impl ReportListener for SndSocT8140AopData {
         }
         Ok(())
     }
-}
-
-// ---- the lid switch handler: an input handler on every device with
-// SW_LID, observing the events of the lid switch userspace already
-// listens to ----
-
-/// Devices with a lid switch, and the terminating entry.
-static LID_IDS: [bindings::input_device_id; 2] = {
-    // SAFETY: the ID is plain integers, for which zero is valid.
-    let mut lid: bindings::input_device_id = unsafe { mem::zeroed() };
-    lid.flags = (bindings::INPUT_DEVICE_ID_MATCH_EVBIT | bindings::INPUT_DEVICE_ID_MATCH_SWBIT)
-        as bindings::kernel_ulong_t;
-    lid.evbit[0] = 1 << bindings::EV_SW;
-    lid.swbit[0] = 1 << bindings::SW_LID;
-    // SAFETY: as above.
-    [lid, unsafe { mem::zeroed() }]
-};
-
-/// The driver data behind an input handle of the lid handler.
-///
-/// # Safety
-///
-/// `handle` must be a handle `lid_connect` registered and the handler must
-/// still be registered, so the `Arc` leaked into its private data is live.
-unsafe fn lid_data<'a>(handle: *mut bindings::input_handle) -> ArcBorrow<'a, SndSocT8140AopData> {
-    // SAFETY: by the caller's contract.
-    unsafe { Arc::<SndSocT8140AopData>::borrow((*(*handle).handler).private.cast()) }
-}
-
-/// Reads the switch from the device's state and records it, under the
-/// device's event lock: events are delivered under that lock after the input
-/// core updated the state, so no event can be overtaken by an older reading.
-/// `activate` enables readings first (see [`LidHandle::sync`]).
-///
-/// # Safety
-///
-/// `handle` must be a handle `lid_connect` registered, with the handler
-/// still registered.
-unsafe fn lid_resync(handle: *mut bindings::input_handle, activate: bool) {
-    // SAFETY: the handle and its device are live while it is registered.
-    let dev = unsafe { (*handle).dev };
-    // SAFETY: `dev` is live; its event lock is a spinlock taken with
-    // interrupts saved, as the input core takes it.
-    let lock = unsafe { &raw mut (*dev).event_lock };
-    // SAFETY: as above.
-    let flags = unsafe { bindings::spin_lock_irqsave(lock) };
-    // SAFETY: the switch bitmap is written under the event lock, held here.
-    let closed = unsafe { (*dev).sw[0] } & (1 << bindings::SW_LID) != 0;
-    // SAFETY: the handle is the first field of a `LidHandle`, live while it
-    // is registered, and the handler is registered.
-    let (lid, data) = unsafe { (&*handle.cast::<LidHandle>(), lid_data(handle)) };
-    if lid.sync(&data.lid, closed, activate) {
-        data.queue_jack_report();
-    }
-    // SAFETY: taken above with these flags.
-    unsafe { bindings::spin_unlock_irqrestore(lock, flags) };
-}
-
-/// Called after the handle is registered, and again when a client that
-/// grabbed the device releases it: events delivered only to the grabbing
-/// client in between never reached `lid_event`.
-///
-/// # Safety
-///
-/// Called by the input core with a handle `lid_connect` registered.
-unsafe extern "C" fn lid_start(handle: *mut bindings::input_handle) {
-    // SAFETY: by the caller's contract; the input core calls this without
-    // the event lock.
-    unsafe { lid_resync(handle, false) };
-}
-
-/// # Safety
-///
-/// Called by the input core, in atomic context with the device's event lock
-/// held, with a handle `lid_connect` registered.
-unsafe extern "C" fn lid_event(
-    handle: *mut bindings::input_handle,
-    type_: u32,
-    code: u32,
-    value: i32,
-) {
-    if type_ != bindings::EV_SW || code != bindings::SW_LID {
-        return;
-    }
-    // SAFETY: the handle is the first field of a `LidHandle`, live until
-    // `lid_disconnect`, and the handler is registered.
-    let (lid, data) = unsafe { (&*handle.cast::<LidHandle>(), lid_data(handle)) };
-    data.lid_set(lid, value != 0);
-}
-
-/// # Safety
-///
-/// Called by the input core with the registered lid handler and a device
-/// that matched `LID_IDS`.
-unsafe extern "C" fn lid_connect(
-    handler: *mut bindings::input_handler,
-    dev: *mut bindings::input_dev,
-    _id: *const bindings::input_device_id,
-) -> i32 {
-    let lid = match KBox::new(
-        LidHandle {
-            handle: Opaque::zeroed(),
-            closed: AtomicFlag::new(false),
-            open: AtomicFlag::new(false),
-        },
-        GFP_KERNEL,
-    ) {
-        Ok(lid) => KBox::into_raw(lid),
-        Err(_) => return ENOMEM.to_errno(),
-    };
-    // SAFETY: `lid` was allocated above; `dev` and `handler` are live for
-    // the handle's lifetime, which ends in `lid_disconnect`.
-    let handle = unsafe { (*lid).handle.get() };
-    // SAFETY: as above; the handle is not registered yet.
-    unsafe {
-        (*handle).dev = dev;
-        (*handle).handler = handler;
-        (*handle).name = c"t8140-aop-audio".as_char_ptr();
-    }
-    // SAFETY: the handle is filled in and stays allocated until it is
-    // unregistered.
-    let ret = unsafe { bindings::input_register_handle(handle) };
-    if ret < 0 {
-        // SAFETY: allocated above and never registered.
-        drop(unsafe { KBox::from_raw(lid) });
-        return ret;
-    }
-    // SAFETY: the handle is registered.
-    let ret = unsafe { bindings::input_open_device(handle) };
-    if ret < 0 {
-        // Nothing was recorded for the handle (`LidHandle::record`).
-        // SAFETY: registered above, not open; nothing else refers to it.
-        unsafe {
-            bindings::input_unregister_handle(handle);
-            drop(KBox::from_raw(lid));
-        }
-        return ret;
-    }
-    // Events reach the handle from here on: enable readings and read the
-    // switch as it is now, in one step under the event lock.
-    // SAFETY: the handle is registered and open, and so is the handler.
-    unsafe { lid_resync(handle, true) };
-    0
-}
-
-/// # Safety
-///
-/// Called by the input core with a handle `lid_connect` registered, while
-/// the handler is still registered.
-unsafe extern "C" fn lid_disconnect(handle: *mut bindings::input_handle) {
-    // SAFETY: the handle is registered and open; after this no event
-    // reaches it.
-    unsafe {
-        bindings::input_close_device(handle);
-        bindings::input_unregister_handle(handle);
-    }
-    // SAFETY: the handle is the first field of the `LidHandle` allocated by
-    // `lid_connect`, and the handler is still registered.
-    let (lid, data) = unsafe { (KBox::from_raw(handle.cast::<LidHandle>()), lid_data(handle)) };
-    data.lid_forget(&lid);
 }
 
 // ---- the driver's own card: the low-power microphone (PCM 0) and the
@@ -2866,12 +2547,11 @@ impl AsocContext {
     }
 }
 
-struct SndSocT8140AopDriver {
+pub(crate) struct SndSocT8140AopDriver {
     card: *mut bindings::snd_card,
     data: Arc<SndSocT8140AopData>,
     asoc: KBox<AsocContext>,
     asoc_registered: bool,
-    lid_registered: bool,
     closed: AtomicFlag,
 }
 
@@ -2927,7 +2607,6 @@ impl SndSocT8140AopDriver {
             asoc: AsocContext::new(data.clone())?,
             data: data.clone(),
             asoc_registered: false,
-            lid_registered: false,
             closed: AtomicFlag::new(false),
         };
 
@@ -2984,30 +2663,7 @@ impl SndSocT8140AopDriver {
         this.new_pcm(1, c"hpai", c"High-Quality Microphone", &Self::HPAI_OPS)?;
 
         // Both microphones' jack: unplugged while a lid is closed.
-        let mut jack = ptr::null_mut();
-        // SAFETY: `card` was created by `snd_card_new` above and is not registered yet; the jack
-        // becomes one of its devices and is freed with it.
-        let ret = unsafe {
-            bindings::snd_jack_new(
-                this.card,
-                c"Internal Mic".as_char_ptr(),
-                bindings::snd_jack_types_SND_JACK_MICROPHONE as i32,
-                &mut jack,
-                true,
-                // No input device of its own: the lid it follows already
-                // is one, and the control is what userspace reads.
-                true,
-            )
-        };
-        if ret < 0 {
-            dev_err!(data.dev, "unable to create the microphone jack\n");
-            return Err(Error::from_errno(ret));
-        }
-        data.mic_jack.store(jack, Relaxed);
-        this.register_lid_handler()?;
-        // The state as the card is registered, from the only reporter.
-        data.as_arc_borrow().queue_jack_report();
-        data.flush_jack_report();
+        data.mic.attach(&data.dev, this.card)?;
 
         // SAFETY: `card` was created by `snd_card_new` above and is not registered yet.
         let ret = unsafe { bindings::snd_card_register(this.card) };
@@ -3034,36 +2690,6 @@ impl SndSocT8140AopDriver {
         }
         this.asoc_registered = true;
         Ok(this)
-    }
-
-    /// Follow the lid switches: the input core connects the handler to every
-    /// device with one, now and as they come.  The handler's private data is
-    /// an `Arc` of the driver data, reclaimed in `teardown`.
-    fn register_lid_handler(&mut self) -> Result<()> {
-        let handler = self.data.lid_handler.0.get();
-        // SAFETY: the handler lives in the driver data, which this driver
-        // keeps allocated until after unregistering it, and is not
-        // registered yet.
-        unsafe {
-            (*handler).private = self.data.clone().into_foreign().cast();
-            (*handler).event = Some(lid_event);
-            (*handler).connect = Some(lid_connect);
-            (*handler).disconnect = Some(lid_disconnect);
-            (*handler).start = Some(lid_start);
-            (*handler).passive_observer = true;
-            (*handler).name = c"t8140-aop-audio".as_char_ptr();
-            (*handler).id_table = LID_IDS.as_ptr();
-        }
-        // SAFETY: the handler is filled in above.
-        let ret = unsafe { bindings::input_register_handler(handler) };
-        if ret < 0 {
-            // SAFETY: the `Arc` leaked above; the handler never registered.
-            drop(unsafe { Arc::<SndSocT8140AopData>::from_foreign((*handler).private.cast()) });
-            dev_err!(self.data.dev, "unable to follow the lid switch: {}\n", ret);
-            return Err(Error::from_errno(ret));
-        }
-        self.lid_registered = true;
-        Ok(())
     }
 
     /// One capture PCM of the card, with the driver data as its private
@@ -3121,18 +2747,9 @@ impl SndSocT8140AopDriver {
             return;
         }
         self.data.running.store(false, Relaxed);
-        if self.lid_registered {
-            let handler = self.data.lid_handler.0.get();
-            // SAFETY: registered in `register_lid_handler`; unregistering
-            // disconnects every handle, after which no callback runs.
-            unsafe { bindings::input_unregister_handler(handler) };
-            // SAFETY: the `Arc` leaked into the handler, unused from here on.
-            drop(unsafe { Arc::<SndSocT8140AopData>::from_foreign((*handler).private.cast()) });
-        }
-        // No lid change can queue a jack report any more: let the last one
-        // finish before the card, and the jack with it, goes away.
-        self.data.flush_jack_report();
-        self.data.mic_jack.store(ptr::null_mut(), Relaxed);
+        // The last jack report finishes before the card, and the jack with
+        // it, goes away.
+        self.data.mic.detach();
         // Stop reports before ALSA destroys any substream or module callback.
         self.data
             .adata
@@ -3195,22 +2812,9 @@ unsafe extern "C" fn hpai_pcm_hw_params(
     }
 }
 
-kernel::of_device_table!(
-    OF_TABLE,
-    <SndSocT8140AopDriver as platform::Driver>::IdInfo,
-    [(of::DeviceId::new(c_str!("apple,t8140-aop-audio")), ())]
-);
-
-impl platform::Driver for SndSocT8140AopDriver {
-    type IdInfo = ();
-    type Data<'bound> = SndSocT8140AopDriver;
-
-    const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
-
-    fn probe<'bound>(
-        pdev: &'bound platform::Device<Core<'_>>,
-        _info: Option<&'bound Self::IdInfo>,
-    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+/// The T8140 backend of the AOP audio driver, selected by its compatible.
+impl SndSocT8140AopDriver {
+    pub(crate) fn probe(pdev: &platform::Device<Core<'_>>) -> Result<Self> {
         let dev = ARef::<device::Device>::from(pdev.as_ref());
         // SAFETY: this is a service device the AOP core registered, being
         // probed here; the lookup defers the probe until the core has
@@ -3250,6 +2854,7 @@ impl platform::Driver for SndSocT8140AopDriver {
         let [pd_mca1, pd_mca0, pd_tx0, pd_leap_mca, pd_rx0] = pds;
 
         let fwnode = pdev.as_ref().fwnode().ok_or(ENOENT)?;
+        let mic = MicLid::new()?;
         let data = Arc::pin_init(
             pin_init!(SndSocT8140AopData {
                 dev,
@@ -3278,10 +2883,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
                 spkr_start_work <- new_work!("SndSocT8140AopData::spkr_start_work"),
                 hpai_start_work <- new_work!("SndSocT8140AopData::hpai_start_work"),
-                lid: LidState::new(),
-                lid_handler: LidHandler(Opaque::zeroed()),
-                mic_jack: Atomic::new(ptr::null_mut()),
-                jack_work <- new_work!("SndSocT8140AopData::jack_work"),
+                mic,
                 stream <- new_spinlock!(StreamState {
                     substream: ptr::null_mut(),
                     copied: None,
@@ -3299,16 +2901,9 @@ impl platform::Driver for SndSocT8140AopDriver {
         Self::new(data, fwnode)
     }
 
-    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
-        this.teardown();
+    pub(crate) fn unbind(&self) {
+        self.teardown();
     }
-}
-
-module_platform_driver! {
-    type: SndSocT8140AopDriver,
-    name: "snd_soc_t8140_aop_audio",
-    description: "Apple T8140 AOP audio: microphones, headphone jack and speakers",
-    license: "Dual MIT/GPL",
 }
 
 /// The speaker ceiling and the copy-path conversion are the whole digital
@@ -3503,136 +3098,5 @@ mod parser_tests {
         ));
         assert!(!producer_cursor_matches(8, u64::MAX, RING_BYTES));
         assert!(!producer_cursor_matches(8, 7, RING_BYTES));
-    }
-}
-
-/// The lid bookkeeping behind the microphone jack.
-#[kunit_tests(snd_soc_t8140_aop_audio_lid)]
-mod lid_tests {
-    use super::*;
-
-    fn handle() -> LidHandle {
-        LidHandle {
-            handle: Opaque::zeroed(),
-            closed: AtomicFlag::new(false),
-            open: AtomicFlag::new(false),
-        }
-    }
-
-    fn opened() -> LidHandle {
-        let h = handle();
-        h.open.store(true, Relaxed);
-        h
-    }
-
-    #[test]
-    fn a_closed_lid_unplugs_the_microphone_jack() {
-        let lid = LidState::new();
-        let switch = opened();
-        assert!(!lid.mic_cut());
-        assert_ne!(mic_jack_status(false), 0);
-
-        assert!(switch.record(&lid, true));
-        assert!(lid.mic_cut());
-        assert_eq!(mic_jack_status(lid.mic_cut()), 0);
-
-        assert!(switch.record(&lid, false));
-        assert!(!lid.mic_cut());
-    }
-
-    #[test]
-    fn a_repeated_switch_state_changes_nothing() {
-        let lid = LidState::new();
-        let switch = opened();
-        // the reading at connect, then the same state again from an event
-        assert!(!switch.record(&lid, false));
-        assert!(switch.record(&lid, true));
-        assert!(!switch.record(&lid, true));
-        assert!(lid.mic_cut());
-        assert!(switch.record(&lid, false));
-        assert!(!switch.record(&lid, false));
-        assert!(!lid.mic_cut());
-    }
-
-    #[test]
-    fn any_closed_lid_switch_cuts_the_microphones() {
-        let lid = LidState::new();
-        let (a, b) = (opened(), opened());
-        a.record(&lid, true);
-        b.record(&lid, true);
-        a.record(&lid, false);
-        assert!(lid.mic_cut());
-        b.record(&lid, false);
-        assert!(!lid.mic_cut());
-    }
-
-    #[test]
-    fn a_lid_switch_that_goes_away_closed_restores_the_microphones() {
-        let lid = LidState::new();
-        let switch = opened();
-        switch.record(&lid, true);
-        assert!(switch.forget(&lid));
-        assert!(!lid.mic_cut());
-        assert_eq!(lid.closed.load(Relaxed), 0);
-        // nothing reaches a forgotten handle any more
-        assert!(!switch.record(&lid, true));
-        assert!(!lid.mic_cut());
-    }
-
-    /// Re-review finding 2: `lid_start()` runs from `input_register_handle()`
-    /// before the open; a handle whose open then fails is freed without
-    /// `lid_disconnect()`, so its closed reading must never have counted.  A
-    /// later handle for the same device that opens counts normally.
-    #[test]
-    fn a_failed_open_leaves_no_closed_switch_behind() {
-        let lid = LidState::new();
-        let failed = handle();
-        // lid_start() during input_register_handle(), switch closed
-        assert!(!failed.record(&lid, true));
-        // input_open_device() fails: unregistered and freed, no disconnect
-        drop(failed);
-        assert!(!lid.mic_cut());
-        assert_eq!(lid.closed.load(Relaxed), 0);
-
-        let attached = handle();
-        // lid_start() during registration, before the open
-        assert!(!attached.sync(&lid, true, false));
-        // opened: lid_connect() enables and reads the switch in one step
-        assert!(attached.sync(&lid, true, true));
-        assert!(lid.mic_cut());
-        assert!(attached.forget(&lid));
-        assert!(!lid.mic_cut());
-    }
-
-    /// Review of v3, minor 3: an initially closed switch must count once the
-    /// handle is open.  `lid_connect()` enables readings and reads the switch
-    /// in the same step, in that order; reading first would drop the reading
-    /// and leave the jack plugged until the next lid event.
-    #[test]
-    fn a_connect_enables_readings_before_reading_the_switch() {
-        let lid = LidState::new();
-        let switch = handle();
-        assert!(switch.sync(&lid, true, true));
-        assert!(lid.mic_cut());
-        // the start() from a grab release reads without enabling anything
-        let other = handle();
-        assert!(!other.sync(&lid, true, false));
-        assert_eq!(lid.closed.load(Relaxed), 1);
-    }
-
-    /// Events delivered only to a client that grabbed the device never reach
-    /// the handler; the resynchronization on release reads the device's
-    /// switch and repairs the state, in both directions.
-    #[test]
-    fn a_resync_after_missed_events_repairs_the_state() {
-        let lid = LidState::new();
-        let switch = opened();
-        switch.record(&lid, true);
-        // grabbed: the lid opens unseen; on release the bitmap reads open
-        assert!(switch.record(&lid, false));
-        assert!(!lid.mic_cut());
-        // grabbed: the lid closes unseen; on release the bitmap reads closed
-        assert!(switch.record(&lid, true));
-        assert!(lid.mic_cut());
     }
 }

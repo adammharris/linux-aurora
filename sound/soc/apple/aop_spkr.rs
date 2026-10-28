@@ -56,7 +56,7 @@
 //! channels.
 //!
 //! The structure (component context with the descriptor as its first field, DAI tables, dmaengine
-//! front-ends) follows aurora's t8140_aop_audio.rs (Copyright (C) 2026 The Aurora Silicon
+//! front-ends) follows aurora's T8140 backend, aop_t8140.rs (Copyright (C) 2026 The Aurora Silicon
 //! Contributors).
 
 use core::{
