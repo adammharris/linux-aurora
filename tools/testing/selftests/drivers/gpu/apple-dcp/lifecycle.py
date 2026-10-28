@@ -192,8 +192,9 @@ struct typec_partner_desc { bool usb_pd; int accessory; struct usb_pd_identity *
 struct cd321x_status { u32 status, data_status, status_changed, data_status_changed, pwr_status;
  struct usb_pd_identity partner_identity;
  bool dp_sid_event,dp_sid_hpd_low,dp_sid_irq;
- struct { u32 status_rx,configure; } dp_sid_status; };
-struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; enum usb_role *role_sw; };
+ struct { u32 status_rx,configure,mode_data; } dp_sid_status; };
+struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; enum usb_role *role_sw;
+ void *partner_altmode_dp; };
 struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
@@ -236,6 +237,20 @@ static void typec_unregister_partner(void *p) { (void)p; }
 static void *typec_register_partner(void *p, struct typec_partner_desc *d)
 { (void)p; (void)d; return (void *)1; }
 static void typec_partner_set_identity(void *p) { (void)p; }
+#ifndef USB_TYPEC_DP_SID
+#define USB_TYPEC_DP_SID 0xff01
+#endif
+#ifndef USB_TYPEC_DP_MODE
+#define USB_TYPEC_DP_MODE 1
+#endif
+struct typec_altmode_desc { unsigned short svid; unsigned char mode; u32 vdo; bool mode_selection; };
+/* The partner DP altmode the firmware entered: registered and dropped in pairs. */
+static int partner_altmodes;
+static void *typec_partner_register_altmode(void *p, const struct typec_altmode_desc *d)
+{ assert(p && d->svid == USB_TYPEC_DP_SID); partner_altmodes++; return &partner_altmodes; }
+static void typec_altmode_update_active(void *a, bool active) { assert(a); (void)active; }
+static void __attribute__((unused)) typec_unregister_altmode(void *a)
+{ if (a == &partner_altmodes) { assert(partner_altmodes > 0); partner_altmodes--; } }
 #define typec_set_pwr_opmode(...) ((void)0)
 #define typec_set_pwr_role(...) ((void)0)
 #define typec_set_vconn_role(...) ((void)0)

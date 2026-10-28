@@ -93,7 +93,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *r,void *x) { (
 struct tps6598x;
 struct tipd_data { REMOVE_RETURN (*remove)(struct tps6598x *); void (*unregister_port)(struct tps6598x *); int (*reset)(struct tps6598x *); };
 struct typec_port { struct typec_mux *mux; };
-struct tps6598x { bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; };
+struct tps6598x { bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset,*partner_altmode_dp; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; };
 struct cd321x { struct tps6598x tps; struct typec_mux *mux; void *tbt_switch; };
 struct typec_thunderbolt_switch_data { int state; };
 static void cd321x_stop_work(struct cd321x *c) { (void)c;event('W'); }
@@ -101,6 +101,9 @@ static int typec_thunderbolt_switch_set(void *p,void *s) { (void)p;(void)s;event
 static int usb_role_switch_set_role(void *p,int r) { (void)p;assert(r==USB_ROLE_NONE);if(ordinary_port&&!role_error){int ret=ordinary_power_off();if(ret)return ret;controller_active=false;phy_off=true;}event('R');role_calls++;return role_error; }
 static enum usb_role __attribute__((unused)) usb_role_switch_get_role(void *p) { (void)p;return controller_active?USB_ROLE_HOST:USB_ROLE_NONE; }
 static void typec_unregister_partner(void *p) { (void)p;event('P'); }
+/* These fixtures never enter DP on the partner, so its altmode stays NULL. */
+static void typec_altmode_update_active(void *a,bool v) { (void)a;(void)v;assert(!"no partner DP altmode here"); }
+static void typec_unregister_altmode(void *a) { (void)a;assert(!"no partner DP altmode here"); }
 #define typec_set_pwr_opmode(...) ((void)0)
 #define typec_set_pwr_role(...) ((void)0)
 #define typec_set_vconn_role(...) ((void)0)
