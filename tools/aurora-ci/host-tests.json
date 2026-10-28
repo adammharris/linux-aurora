@@ -7,7 +7,8 @@
   "commits: history the suite reads; host-tests.py --fetch-commits fetches it into a shallow checkout.",
   "Every test-like file under the discovery roots is listed in suites or excluded (tests/test_host_tests.py checks).",
   "helpers: files that look like suites but are run by a listed suite.",
-  "serial: the suite measures time; it runs alone, after the parallel batch."
+  "serial: the suite measures time; it runs alone, after the parallel batch.",
+  "group: the CI job that runs the suite; aurora-sep-slow holds the longest aurora-sep suites so they run beside the rest."
  ],
  "apt": [
   "bison",
@@ -1286,7 +1287,7 @@
   },
   {
    "name": "tools/aurora-sep/tests/test_m3_air_default.py",
-   "group": "aurora-sep",
+   "group": "aurora-sep-slow",
    "argv": [
     "python3",
     "-m",
@@ -1447,7 +1448,7 @@
   },
   {
    "name": "tools/aurora-sep/tests/test_m3_pro_mesa.py",
-   "group": "aurora-sep",
+   "group": "aurora-sep-slow",
    "argv": [
     "python3",
     "-m",
@@ -1512,7 +1513,7 @@
   },
   {
    "name": "tools/aurora-sep/tests/test_m3max_kit.py",
-   "group": "aurora-sep",
+   "group": "aurora-sep-slow",
    "argv": [
     "python3",
     "-m",
