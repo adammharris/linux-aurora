@@ -229,8 +229,8 @@ config APPLE_CLPC
 
 	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
 
-config APPLE_T6030_DISPLAY_GATE
-	bool "Apple T6030 internal display enable gate"
+config APPLE_DISPLAY_GATE
+	bool "Apple internal display enable gate"
 	depends on ARCH_APPLE && OF_DYNAMIC && OF_OVERLAY
 	default ARCH_APPLE
 	help
@@ -257,28 +257,19 @@ config APPLE_T6030_DISPLAY_GATE
 	  apple_t6031_display.enable=1 on the kernel command line, and only
 	  with the PMP values the boot loader passes.
 
-	  Say 'y' if you want the native display on M3 Pro MacBook Pros.
+	  On T6041 (M4 Pro) device trees it enables the internal display nodes
+	  only when the boot loader has handed the running display coprocessor
+	  over (apple,t6041-handoff, 26.6.2 display firmware), and powers up
+	  the J616s external display chain (HDMI, Type-C DisplayPort) once the
+	  boot loader has given the external display processors their
+	  firmware memory. Without these, or with nomodeset, it does nothing.
 
-config APPLE_T6041_DISPLAY_GATE
-	bool "Apple T6041 internal display enable gate"
-	depends on ARCH_APPLE && OF_DYNAMIC
-	default ARCH_APPLE
-	help
-	  The J616s (M4 Pro) device tree keeps the internal display nodes
-	  disabled, so the display stays on the boot framebuffer until the
-	  boot loader has handed the running display coprocessor over. This
-	  option enables those nodes before devices are created, only when
-	  the boot loader has published a complete T6041 handoff for the
-	  26.6.2 display firmware. It also powers up the J616s external
-	  display chain (HDMI, Type-C DisplayPort) once the boot loader has
-	  given the external display processors their firmware memory.
-	  Without these, or with nomodeset, it does nothing.
-
-	  Say 'y' if you want the native display on M4 Pro MacBook Pros.
+	  Say 'y' if you want the native display on M3 Pro, M3 Max, M3 and
+	  M4 Pro Macs.
 
 config APPLE_T6030_GPU_PMP_LINK
 	bool
-	depends on APPLE_T6030_DISPLAY_GATE
+	depends on APPLE_DISPLAY_GATE
 	default n
 	help
 	  Link an opted-in T6030 GPU to the PMP admitted by the display gate.
@@ -287,7 +278,7 @@ config APPLE_T6030_GPU_PMP_LINK
 
 config APPLE_DISPLAY_GATE_KUNIT_TEST
 	bool "KUnit tests for the Apple display gate" if !KUNIT_ALL_TESTS
-	depends on KUNIT=y && APPLE_T6030_DISPLAY_GATE
+	depends on KUNIT=y && APPLE_DISPLAY_GATE
 	default KUNIT_ALL_TESTS
 	help
 	  Runs the display gate on test device trees with the T6030, T6031

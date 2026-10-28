@@ -4368,7 +4368,7 @@
 
 #include "t6040-j616s-usb3.dtsi"
 
-/* External display chain, all disabled: the gate in drivers/soc/apple/t6041-display-gate.c enables it. */
+/* External display chain, all disabled: the gate in drivers/soc/apple/display-gate.c enables it. */
 #include "t6040-j616s-extdisp.dtsi"
 #include "t6040-j616s-extdisp-mem-loader.dtsi"
 #include "t6040-j616s-extdisp-hdmi.dtsi"

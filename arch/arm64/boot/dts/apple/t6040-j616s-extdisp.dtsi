@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * External display resources of the J616s. Everything here is disabled in
- * the device tree: the enable gate (drivers/soc/apple/t6041-display-gate.c)
+ * the device tree: the enable gate (drivers/soc/apple/display-gate.c)
  * switches the chain on once the boot loader has provided the firmware
  * memory of the external display processors, so without that the booted
  * hardware state is the same as without this file.

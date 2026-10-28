@@ -2,7 +2,7 @@
 /*
  * USB-C DisplayPort: dcpext1 over any of the three Type-C ports. As for
  * HDMI, the DISPEXT1 chain and dcpext1 stay DISABLED in the DTB and are
- * enabled by the enable gate (drivers/soc/apple/t6041-display-gate.c). The
+ * enabled by the enable gate (drivers/soc/apple/display-gate.c). The
  * routes go through the display fabric (typec-routes, end of this file):
  * tipd's mode switch reaches dcpext1, which claims the port. Boot-time
  * changes: mode-switch on atcphy0..2 (the PHY registers a Type-C mode

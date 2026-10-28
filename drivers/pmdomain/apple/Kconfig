@@ -39,7 +39,7 @@ config APPLE_PMP_REPORT
 
 	  On T8122 (M3), T6031 (M3 Max), and opted-in T6030 (M3 Pro) Macs
 	  whose boot loader hands the
-	  internal display over (see APPLE_T6030_DISPLAY_GATE), iBoot leaves
+	  internal display over (see APPLE_DISPLAY_GATE), iBoot leaves
 	  the PMP halted, and this driver starts it when the display driver
 	  first asks for it. Once its nodes are enabled the PMP may run until
 	  the next reboot. That holds when the start then fails, too (the PMP

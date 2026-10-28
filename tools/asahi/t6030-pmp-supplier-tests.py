@@ -21,7 +21,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-GATE = "drivers/soc/apple/t6030-display-gate.c"
+GATE = "drivers/soc/apple/display-gate.c"
 REPORT = "drivers/pmdomain/apple/pmp-report.c"
 EXPORT = "drivers/soc/apple/pmp-export.c"
 
@@ -84,7 +84,7 @@ def main():
     kconfig = (ROOT / "drivers/soc/apple/Kconfig").read_text()
     section = kconfig.split("config APPLE_T6030_GPU_PMP_LINK\n", 1)[1].split("\nconfig ", 1)[0]
     assert '\n\tbool\n' in "\n" + section and "\n\tdefault n\n" in section
-    assert "depends on APPLE_T6030_DISPLAY_GATE" in section
+    assert "depends on APPLE_DISPLAY_GATE" in section
     parts = [function(gate, "static struct device_node *__init gate_find_one("),
              function(gate, "static int __init gate_gpu_pmp_link("),
              function(report, "static struct device_node *apple_pmp_report_t6030_entry("),

@@ -4,7 +4,7 @@
  * -> atcphy3 -> DP-to-HDMI converter) with every node left DISABLED. The
  * nodes must not be enabled at boot in the device tree: powering the DISPEXT
  * chain without the PMP acknowledgement hangs the machine before root. The
- * enable gate (drivers/soc/apple/t6041-display-gate.c) switches them on in
+ * enable gate (drivers/soc/apple/display-gate.c) switches them on in
  * order once the PMP is bound.
  *
  * dispext0's DART is not in the display node's iommus: the gate appends it

@@ -13,7 +13,7 @@
  *  - T8122 (t8122-gate-test.dtso): on by default, with the full handoff,
  *    and nothing changed when a check of the handoff or of the reused PMP
  *    topology fails.
- * Included at the end of t6030-display-gate.c.
+ * Included at the end of display-gate.c.
  *
  * The test trees are applied once and stay: the gate gives some properties
  * names it does not allocate, which the tree must never free. Each case
