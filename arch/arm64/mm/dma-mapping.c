@@ -43,7 +43,12 @@ void arch_setup_dma_ops(struct device *dev, bool coherent)
 	int cls = cache_line_size_of_cpu();
 
 	if (!coherent && !CLIDR_LOC(read_sysreg(clidr_el1))) {
-		dev_warn(dev, "CLIDR_EL1.LoC == 0, treating as coherent\n");
+		/*
+		 * This holds for every device on the system, so say it once
+		 * and keep the per-device line for debugging.
+		 */
+		pr_info_once("CLIDR_EL1.LoC == 0, treating all devices as DMA coherent\n");
+		dev_dbg(dev, "CLIDR_EL1.LoC == 0, treating as coherent\n");
 		coherent = true;
 	}
 
