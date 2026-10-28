@@ -497,7 +497,29 @@ static void retired_completion_in_flight_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, READ_ONCE(dcp->crashed));
 }
 
+static void desktop_present_completion_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	dcp->desktop = kunit_kzalloc(test, sizeof(*dcp->desktop), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->desktop);
+	dcp->desktop->present_id = 42;
+	dcp->desktop->present_pending = true;
+	KUNIT_EXPECT_FALSE(test, dcp_desktop_present_complete(dcp, 41));
+	KUNIT_EXPECT_TRUE(test, dcp->desktop->present_pending);
+	KUNIT_EXPECT_TRUE(test, dcp_desktop_present_complete(dcp, 42));
+	KUNIT_EXPECT_FALSE(test, dcp_desktop_present_complete(dcp, 42));
+	/* A late completion cannot claim the replacement's event. */
+	dcp->desktop->present_id = 43;
+	dcp->desktop->present_pending = true;
+	KUNIT_EXPECT_FALSE(test, dcp_desktop_present_complete(dcp, 42));
+	KUNIT_EXPECT_TRUE(test, dcp->desktop->present_pending);
+	KUNIT_EXPECT_TRUE(test, dcp_desktop_present_complete(dcp, 43));
+}
+
 static struct kunit_case dropped_swap_cases[] = {
+	KUNIT_CASE(desktop_present_completion_test),
 	KUNIT_CASE(dropped_present_retired_test),
 	KUNIT_CASE(dropped_present_buffers_test),
 	KUNIT_CASE(completed_present_kept_test),

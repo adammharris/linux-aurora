@@ -5,6 +5,7 @@
 #define __APPLE_DCP_INTERNAL_H__
 
 #include <drm/drm_mode.h>
+#include <linux/atomic.h>
 #include <linux/backlight.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
@@ -18,6 +19,7 @@
 #include <linux/usb/typec_mux.h>
 
 #include "dcp-fabric.h"
+#include "dcp-peer-v26_6.h"
 #include "dcp-fabric-session.h"
 #include "dcp-relink.h"
 #include "dptxep.h"
@@ -215,6 +217,12 @@ struct apple_dcp_hw_data {
 	 * (the T8122 dcpext), see dcp_fw_is_14_7().
 	 */
 	bool fw_14_7_endpoints;
+	/*
+	 * An external processor with no DCPAV service to read the EDID
+	 * through, whose sinks' EDID is built from their firmware metadata
+	 * (desktop 26.x), see dcp_sink_metadata().
+	 */
+	bool sink_metadata_edid;
 };
 
 enum dcp_test_point {
@@ -228,6 +236,11 @@ enum dcp_test_point {
  * for such a DCP only.
  */
 struct dcp_desktop_state {
+	/* Protected by backlight.lock, independent of framebuffer retirement. */
+	struct dcp_backlight_swap backlight;
+	bool inherited_brightness_valid;
+	u32 inherited_brightness;
+
 	/* Queued swap; too large for the shared swap union. */
 	struct dcp_swap_submit_req_v26_6_desktop swap;
 	/* Opaque client identity the firmware's IOMFB calls carry. */
@@ -238,6 +251,21 @@ struct dcp_desktop_state {
 	 * element before the real one is selected.
 	 */
 	bool mode_live;
+	/* Identity supplied by this fixed panel, independent of optional color data. */
+	struct dcp_display_metadata panel_metadata;
+	struct dcp_display_metadata panel_adt_identity;
+	u64 panel_metadata_generation;
+	bool panel_metadata_valid;
+	atomic_t identity_log_count[4];
+	u8 panel_raw_edid[4096];
+	size_t panel_raw_edid_size;
+	/* RX records an unsupported callback until the modeset RPC has drained. */
+	bool modeset_active;
+	bool modeset_callback_error;
+	/* An adaptive swap that timed out keeps fixed refresh until the next boot. */
+	bool vrr_failed;
+	u32 present_id;
+	bool present_pending;
 	/*
 	 * GAMMA_LUT: the firmware's own table, read before the first change;
 	 * the table being sent; the LUT it is composed from, if any.
@@ -270,22 +298,19 @@ struct dcp_desktop_state {
 	 * display (unplug); the next swap needs a power-on and a mode set.
 	 */
 	bool ext_pipe_off;
-	/*
-	 * Dynamic Type-C DP route (T6041 dcpext1): the DP PHYs and crossbars
-	 * of every Type-C port, the one in use (or -1), the DPTX target PHY
-	 * of each and the crossbar state selecting this processor.
-	 */
-	unsigned int ndyn;
-	int dyn_active;
-	struct phy *dyn_phy[3];
-	struct mux_control *dyn_xbar[3];
-	u32 dyn_dptx_phy[3];
-	u32 dyn_mux_index;
 };
 
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
 struct dcp_hdmi;
+
+bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id);
+void dcp_panel_metadata_replace(struct apple_dcp *dcp,
+				const struct dcp_display_metadata *metadata);
+const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
+					       const struct dcp_display_mode *modes,
+					       unsigned int count, u64 *generation);
+bool dcp_panel_metadata_current(struct apple_dcp *dcp, u64 generation);
 
 struct apple_dcp {
 	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
@@ -298,6 +323,36 @@ struct apple_dcp {
 	bool vblank_works_disabled;
 	struct dcp_fabric_pipeline fabric;
 	struct device *dev;
+	/* Peer DCP for dual-pipe (desktop 26.6): the primary reserves an idle
+	 * peer pipe; the peer records its owner.  Protected by dcp_peer_lock.
+	 */
+	struct apple_dcp *peer_reserved;
+	struct apple_dcp *peer_owner;
+	/*
+	 * This pipeline's Type-C display is wider than one pipe and found no
+	 * peer above it: it needs the hybrid, which was taken when it came.
+	 */
+	bool peer_starved;
+	/*
+	 * Desktop 26.x hybrid with apple,typec-hybrid-first: its HDMI display
+	 * has given the pipeline to a Type-C display wider than one pipe and
+	 * waits until that one fits one pipe again or leaves.
+	 */
+	bool hdmi_yielded;
+	/* The display on this pipeline runs a mode within one pipe. */
+	bool typec_narrow;
+	struct delayed_work hybrid_wq;
+	struct dcp_peer_tiling peer_tiling;
+	bool peer_unbinding;
+	/* Firmware display endpoint (its Disp_Index), apple,dcp-endpoint;
+	 * separate from index, which also selects the doorbell and PHY mode. */
+	u32 peer_endpoint;
+	/* Paired DRM scanout on the primary; under dcp_peer_lock. */
+	bool peer_active, peer_failed;
+	/* The DRM mode the pair was set to (timing, color mode IDs, minRR). */
+	u32 peer_mode_timing, peer_mode_color, peer_min_vrr;
+	/* On the peer: its first completion since the pair was set was logged. */
+	bool peer_complete_logged;
 	struct platform_device *piodma;
 	bool piodma_created;
 	struct iommu_domain *iommu_dom;
@@ -582,7 +637,13 @@ struct apple_dcp {
 	/* these fields are output port specific */
 	struct phy *phy;
 	struct phy *fixed_phy;
+	/*
+	 * The crossbar control a link configuration takes up and down: the
+	 * fixed output's, or on desktop 26.x the active Type-C route's.
+	 */
 	struct mux_control *xbar;
+	/* The fixed (HDMI) output's own crossbar control, selected for it. */
+	struct mux_control *fixed_xbar;
 	struct typec_mux *typec_mux;
 	struct apple_dcp_typec_route typec_routes[DCP_MAX_TYPEC_ROUTES];
 	struct apple_dcp_typec_route *active_typec_route;
@@ -669,6 +730,8 @@ struct apple_dcp {
 		void (*kick)(struct apple_dcp *dcp);
 		/* Steps a running fade; fade_start is its start in jiffies. */
 		struct delayed_work fade_work;
+		struct work_struct notify_work;
+		struct delayed_work retry_work;
 		unsigned long fade_start;
 		/* Rate limit for firmware re-send requests. */
 		unsigned long resent_at;
@@ -707,6 +770,17 @@ struct apple_dcp {
 	/* Hardirq, resume and expiry share one generation under this lock. */
 	spinlock_t hdmi_presence_lock;
 	struct dcp_fabric_presence hdmi_presence;
+	/* The state before the current series of HPD edges began. */
+	enum dcp_fabric_presence_state hdmi_presence_prev;
+	/*
+	 * A desktop 26.x Type-C display that came back from system sleep with a
+	 * partial mode list (the sink was not ready for its EDID yet) is
+	 * connected again after a retrain found no mode.
+	 */
+	struct delayed_work link_recovery_wq;
+	unsigned int link_recovery_tries;
+	unsigned int link_recovery_snap;
+	atomic_t modesets_done;
 	unsigned long hdmi_edge_jiffies;
 	bool hdmi_edge_seen;
 	struct delayed_work hdmi_settle_wq;
@@ -740,6 +814,7 @@ static inline bool dcp_fail_stop(const struct apple_dcp *dcp)
 	       iomfb_is_m4(dcp);
 }
 
+bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp);
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected);
 void dcp_firmware_metadata_announced(struct apple_dcp *dcp);
@@ -863,5 +938,10 @@ static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
 }
 
 #define DCP_AUDIO_MAX_CHANS 15
+
+void dcp_trace_panel_property(struct apple_dcp *dcp, int tag, const char *key,
+			      size_t key_len, const void *blob, size_t len);
+
+void dcp_panel_edid_receive(struct apple_dcp *dcp, const void *blob, size_t len);
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

@@ -449,6 +449,9 @@ const PATCH_POLL_MS: u32 = 20;
 const PATCH_POLL_ATTEMPTS: u32 = 250;
 
 const CALIBRATION_FIRMWARE: &CStr = c"apple/mesa_calibration.bin";
+/// The signed root-key container on boards whose sensor node names only the
+/// calibration (J700).
+const ROOT_KEY_FIRMWARE: &CStr = c"apple/msrk-j700.bin";
 
 const SBIO_PROBE_USER_ID: i32 = 1000;
 static_assert!(SBIO_PROBE_USER_ID >= crate::sks::SKS_DESIGNATE_USER_MIN);
@@ -781,6 +784,9 @@ struct SepData {
     // only under `catacomb_writer`.
     deletion_unsaved: Atomic<bool>,
 
+    // PREPARE_ENROL selected the empty Linux context during this boot.
+    empty_context_prepared: Atomic<bool>,
+
     #[pin]
     rx_work: Work<SepData>,
 
@@ -980,6 +986,7 @@ impl SepData {
                 worker_gone <- new_condvar!("SepData::worker_gone"),
                 catacomb_writer <- new_mutex!(()),
                 deletion_unsaved: Atomic::new(false),
+                empty_context_prepared: Atomic::new(false),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),

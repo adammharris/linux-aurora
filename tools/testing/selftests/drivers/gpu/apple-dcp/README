@@ -12,7 +12,13 @@ Or keep translation units, commands, failure logs and source hashes:
 An installed copy needs --source /path/to/kernel. --group edid, rate, phy or
 lifecycle or boot selects one group. HOSTCC selects the host compiler (default clang).
 Python 3 and a compiler supporting AddressSanitizer/UndefinedBehaviorSanitizer
-are required. No target access, firmware command, captured fixture or kernel
+are required. The usb-kconfig producer also needs GNU Make 4 or newer. The
+runner uses MAKE when set, otherwise gmake if available, then make. On macOS,
+install GNU Make or select an existing producer with KCONFIG_CONF. The host
+fixtures use native errno definitions; Linux-only reply statuses stay local
+to the synthetic callback test.
+
+No target access, firmware command, captured fixture or kernel
 configuration is required.
 
 One TAP entry point uses shared production extraction and compiler handling.
@@ -158,3 +164,41 @@ surviving an unrelated failed AGX request, both reply/timeout lock orderings,
 malformed replies, true owner failure, an unowned or invalid fault SID, probe
 rollback versus published DMA lifetime, exactly-once DRM event ownership, and
 mixed-owner, truncated, failed-translation and invalid-owner IOMMU tuples.
+
+Internal panel policy
+---------------------
+The display group covers the shared nits ramp on a 600-nit panel, retargeting,
+blanking, suspend, rejected submits and both submit/completion callback orders.
+Brightness-only commits retain the active gamma state without marking it changed.
+Synthetic TimingElements exercise 120 Hz and fractional lower refresh rates,
+DCP color/timing identities, invalid geometry and adaptive-sync ranges. The
+adaptive-sync callback test verifies the desktop parameter record, mode-info
+ordering and one fixed-refresh retry after a rejected enable or modeset. The
+watchdog test checks fixed-refresh recovery, retained-buffer arming and late
+completion isolation.
+These tests do not establish which timings a particular panel reports or prove
+refresh rate, flicker, brightness smoothness or adaptive-sync on hardware.
+
+Desktop panel brightness regressions also cover panel EDID parsing and
+publication from ProductAttributes without optional color data. Both bare and
+descriptor-wrapped powerlog reports pass through the production compact receiver,
+systemep handler and mNits parser. Rapid key repeats with interleaved stale and
+new reports must converge monotonically to the last user target in both
+directions. Report observations cannot restart a fade or request another write.
+The callback cases exercise the desktop D202/D454 wire adapters, physical resource
+mapping and release, and unknown-callback failure followed by a successful set.
+
+Panel identity tests also retain the EDID and generation across repeated and
+partial dictionaries, and notify only when valid identity data actually changes.
+
+The identity case also exercises the real D552/D561 table bindings, nested
+DisplayAttributes and direct ProductAttributes, legacy manufacturer codes,
+minimal identity data, and unchanged byte/padded boolean acknowledgments.
+
+Desktop identity diagnostics cover bounded traversal of key names and types,
+including truncated and oversized dictionaries. ADT identity tests use only
+synthetic nodes and panel serials, reject truncated trees transactionally and
+ensure the machine's serial cannot override the panel's. Panel EDID tests cover
+a missing firmware identity, real EDID priority and invalid replacement retention.
+Desktop backlight notification tests exercise accepted, rejected, duplicate and
+out-of-order completions and preserve the requested target during notification.

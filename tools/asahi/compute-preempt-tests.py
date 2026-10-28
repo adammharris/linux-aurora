@@ -48,7 +48,7 @@ mod module_parameters {
     pub static compute_preempt: Parameter = Parameter;
     pub static mut PARAM: i32 = -1;
     pub struct Parameter;
-    impl Parameter { pub fn value(&self) -> &i32 { unsafe { &*std::ptr::addr_of!(PARAM) } } }
+    impl Parameter { pub fn value(&self) -> i32 { unsafe { *std::ptr::addr_of!(PARAM) } } }
 }
 #[derive(Clone, Copy, Debug, PartialEq)] struct U64(u64);
 #[derive(Clone, Copy, Debug, PartialEq)] enum PipeType { Vertex, Fragment, Compute }

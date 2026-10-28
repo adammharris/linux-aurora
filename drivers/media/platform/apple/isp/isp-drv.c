@@ -538,6 +538,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 	mutex_init(&isp->gc_lock);
 	INIT_LIST_HEAD(&isp->bufs_pending);
 	INIT_LIST_HEAD(&isp->bufs_submitted);
+	INIT_LIST_HEAD(&isp->bufs_returned);
 	isp->wq = alloc_workqueue("apple-isp-wq", WQ_UNBOUND, 0);
 	if (!isp->wq) {
 		dev_err(dev, "failed to create workqueue\n");
@@ -585,6 +586,7 @@ destroy_wq:
 detach_genpd:
 	apple_isp_detach_genpd(isp);
 free_isp:
+	kfree(isp->sensor_configs);
 	/* Nothing else can reach it before the video device is registered. */
 	kfree(isp);
 	return err;

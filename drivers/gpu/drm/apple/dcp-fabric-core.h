@@ -64,6 +64,8 @@ struct dcp_fabric_policy {
 	bool dual_stream;
 	/* routes follow the CRTC a modeset pairs them with */
 	bool follow;
+	/* a hybrid pipeline is not kept back for a fixed display */
+	bool hybrid_first;
 };
 
 enum dcp_fabric_wiring {

@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J616s tether console; the host owns ATC0 during the debug session. */
+#include "t6040-j616s.dts"
+
+/ {
+	aliases {
+		serial0 = &serial0;
+	};
+};
+
+&serial0 {
+	status = "okay";
+};
+
+&ps_uart_p {
+	status = "okay";
+};
+
+&ps_uart0 {
+	status = "okay";
+};
+
+&dcuart {
+	status = "okay";
+};
+
+&hpm0 {
+	status = "disabled";
+};
+
+&atcphy0 {
+	status = "disabled";
+};
+
+&atcphy0_mbox {
+	status = "disabled";
+};
+
+&usb_drd0 {
+	status = "disabled";
+};
+
+&usb_drd0_dart_0 {
+	status = "disabled";
+};
+
+&usb_drd0_dart_1 {
+	status = "disabled";
+};

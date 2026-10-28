@@ -13,7 +13,8 @@ import os
 import subprocess
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[2] / 'drivers/gpu/drm/asahi/g17'
+ROOT = Path(os.environ.get('G17_ROOT',
+                           Path(__file__).resolve().parents[2] / 'drivers/gpu/drm/asahi/g17'))
 
 
 def item(source, signature):
@@ -64,19 +65,27 @@ def check_guards():
     ordered(detach, '.park();', 'parked.release_consumed(context.scheduler_va());')
     runtime = (ROOT / 'runtime.rs').read_text()
     # A compute queue does not change owner while its scheduler is released.
-    ordered(item(runtime, 'pub(super) fn rebind_compute('), '.filter(|queue| queue.reusable())',
+    ordered(item(runtime, 'fn bind_reusable('), '.filter(|queue| queue.reusable())',
             'teardown.releasing(bound)', 'continue;', 'queue.bind_owner(owner, context.clone())?;')
     ordered(item(runtime, 'pub(super) fn bind_rearmed('), 'teardown.releasing(bound)', 'return Err(EAGAIN);',
             'queue.bind_owner(')
-    ordered(item(runtime, 'fn publish_compute('), '.pending_switch_from()', 'queues.teardown.releasing(previous)',
+    ordered(item(runtime, 'fn publish_compute_raw('), '.pending_switch_from()', 'queues.teardown.releasing(previous)',
             'return Err(EAGAIN);', 'queue.publish(')
     # A busy pair (for example one whose scheduler release is still being consumed)
     # kicks the event worker, which observes the release and parks the pair.
-    ordered(item(submit, 'fn wait_render_busy('), 'WORK_RING_WAIT_NS', 'return Err(ETIMEDOUT);',
-            'self.shared.queue_events();', 'fsleep(')
-    for name, path in [('take_pair', 'runtime/render.rs'), ('take_render_observation', 'runtime/render/observe.rs')]:
-        body = item((ROOT / path).read_text(), f'fn {name}(')
-        ordered(body, 'entry.borrowed_switch = pair.switch_in_flight();', 'entry.pair.take()')
+    ordered(item(submit, 'fn wait_render_busy('), 'WORK_RING_WAIT_NS',
+            'self.shared.queue_events();', 'self.wait_domain(')
+    ordered(item(submit, 'fn wait_domain('), 'if remaining == 0', 'return Err(ETIMEDOUT);', 'domain.block(')
+    borrowed = item((ROOT / 'runtime/render.rs').read_text(), 'fn take_pair(')
+    ordered(borrowed, 'entry.borrowed_switch = pair.switch_in_flight();',
+            'entry.pair.take()')
+    # The current event collector observes and retires the pair under one
+    # device-mutex hold; it no longer borrows it through a second take path.
+    observed = item((ROOT / 'runtime/render/observe.rs').read_text(),
+                    'fn observe_renders(')
+    ordered(observed, 'let mut state = self.state.lock();',
+            'firmware.next_render_observation(cursor)?', '.observe_front()',
+            'pair.retire_observed(')
     print('PASS guard placement: rebind decision, rebind commit, first publication, switch record, borrows, parked scheduler, compute owner changes, busy wait')
 
 
@@ -110,7 +119,10 @@ impl Context {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase { Deferred, Draining, Released(u32) }
-struct Entry { context: Arc<Context>, phase: Phase, armed: u64, announce_pending: bool }
+struct Entry {
+    context: Arc<Context>, phase: Phase, armed: u64, announce_pending: bool,
+    render_kill: Option<()>, kill_wait: Option<(u64, bool)>, kill_refused: bool,
+}
 struct Pending { entries: Vec<Entry> }
 impl Pending {
 PENDING
@@ -120,6 +132,8 @@ struct Active { ticket: Ticket }
 struct Packet { context: Arc<Context> }
 struct Pair { executed: u64, switch: Option<(u64, u64)>, replay: Vec<()>, active: Vec<Active>, idle: bool }
 impl Pair {
+    // This ordering fixture models no faulted/executed unstamped pair.
+    fn executed_for_kill(&self, _: &Arc<Context>) -> bool { false }
 SWITCH
     /// Host stand-in for a successful publication of `ordinal` (stand-in, not production).
     fn publish(&mut self, packet: &Packet, ordinal: u64) {

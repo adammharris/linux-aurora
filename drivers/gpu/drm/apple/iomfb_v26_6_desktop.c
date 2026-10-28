@@ -81,12 +81,118 @@ static bool trampoline_passthrough_dict_v26_6(struct apple_dcp *dcp, int tag,
 	struct dcp_dict_passthrough_resp_v26_6 *resp = out;
 
 	trace_iomfb_callback(dcp, tag, "dcpep_cb_passthrough_dict");
+	dcp_trace_panel_property(dcp, tag, (const char *)req->key,
+				 strnlen((const char *)req->key, sizeof(req->key)),
+				 req->value_null ? NULL : req->value, sizeof(req->value));
 
-	if (!req->value_null)
+	if (!req->value_null) {
+		dcp_panel_edid_receive(dcp, req->value, sizeof(req->value));
 		memcpy(resp->value, req->value, sizeof(resp->value));
+	}
 
 	resp->ret = false;
 	memset(resp->padding, 0, sizeof(resp->padding));
+
+	return true;
+}
+
+/* The firmware can publish panel identity through dictionary setters too. */
+static bool trampoline_panel_dictionary_v26_6(struct apple_dcp *dcp, int tag,
+					      void *out, void *in)
+{
+	/* Service dictionary setters prefix the same record with a handle. */
+	const struct dcp_dict_passthrough_req_v26_6 *req = tag == 413 ? in + 4 : in;
+	const char *key = (const char *)req->key;
+	struct dcp_display_metadata metadata;
+	struct dcp_parse_ctx ctx;
+	int ret;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	dcp_trace_panel_property(dcp, tag, key, strnlen(key, sizeof(req->key)),
+				 req->value_null ? NULL : req->value, sizeof(req->value));
+	if (!dcp_has_panel(dcp) || req->value_null ||
+	    !memchr(key, 0, sizeof(req->key)))
+		goto done;
+	/* A real EDID may be a blob or nested in a property dictionary. */
+	dcp_panel_edid_receive(dcp, req->value, sizeof(req->value));
+	if (strcmp(key, "DisplayAttributes") && strcmp(key, "ProductAttributes"))
+		goto done;
+	ret = parse(req->value, sizeof(req->value), &ctx);
+	if (ret)
+		goto done;
+	if (!strcmp(key, "ProductAttributes"))
+		ret = parse_panel_product_metadata(&ctx, &metadata);
+	else
+		ret = parse_panel_metadata(&ctx, &metadata);
+	if (!ret)
+		dcp_panel_metadata_replace(dcp, &metadata);
+done:
+	/* Preserve the existing setter acknowledgment for unrelated properties. */
+	*(u8 *)out = true;
+	return true;
+}
+
+static bool iomfb_check_callback_exact_v26_6_desktop(int tag, u32 in_len, u32 out_len)
+{
+	switch (tag) {
+	case 201:
+		return in_len == 12 && out_len == 16;
+	case 202:
+		return in_len == 24 && !out_len;
+	case 451:
+		return in_len == 20 && out_len == 28;
+	case 452:
+		return in_len == 24 && out_len == 20;
+	case 454:
+		return in_len == 4 && out_len == 4;
+	case 413:
+		return in_len == 4168 && (out_len == 1 || out_len == 4);
+	case 552:
+	case 561:
+		return in_len == 4164 && (out_len == 1 || out_len == 4);
+	default:
+		return true;
+	}
+}
+
+/*
+ * unmap_piodma (D202): the buffer id, the id again, the DVA (unaligned) and a
+ * trailing word. The older firmware sends the DVA after a virtual address.
+ */
+struct dcp_unmap_buf_req_v26_6 {
+	__le64 buffer;
+	__le32 id;
+	__le64 dva;
+	__le32 unk;
+} __packed;
+static_assert(sizeof(struct dcp_unmap_buf_req_v26_6) == 24);
+
+static bool trampoline_unmap_piodma_v26_6(struct apple_dcp *dcp, int tag,
+					  void *out, void *in)
+{
+	const struct dcp_unmap_buf_req_v26_6 *wire = in;
+	struct dcp_unmap_buf_resp request = {
+		.buffer = get_unaligned_le64(&wire->buffer),
+		.dva = get_unaligned_le64(&wire->dva),
+	};
+
+	trace_iomfb_callback(dcp, tag, "dcpep_cb_unmap_piodma");
+	dcpep_unmap_piodma(dcp, &request);
+
+	return true;
+}
+
+/*
+ * release_mem_desc (D454): the firmware sends the 32-bit descriptor id and
+ * wants a 32-bit result, where the older firmware took a byte.
+ */
+static bool trampoline_release_mem_desc_v26_6(struct apple_dcp *dcp, int tag,
+					      void *out, void *in)
+{
+	u32 id = get_unaligned_le32(in);
+
+	trace_iomfb_callback(dcp, tag, "dcpep_cb_release_mem_desc");
+	put_unaligned_le32(dcpep_cb_release_mem_desc(dcp, &id), out);
 
 	return true;
 }
@@ -111,6 +217,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[114] = trampoline_passthrough_dict_v26_6,
 	/* set_tiling_state: the value followed by success */
 	[115] = trampoline_get_tiling_state,
+	[116] = trampoline_set_tiling_state_v26_6,
 	[121] = dcpep_cb_boot_1, /* start_hardware_boot */
 	[122] = trampoline_false, /* is_dark_boot / is_waking_from_hibernate */
 	[123] = trampoline_false,
@@ -120,6 +227,8 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[129] = trampoline_prop_end,
 	[134] = trampoline_zero,
 	[201] = trampoline_map_piodma,
+	/* a mode change retires its piodma buffers, then their descriptors */
+	[202] = trampoline_unmap_piodma_v26_6,
 	[206] = iomfbep_cb_match_pmu_service_2,
 	[207] = iomfbep_cb_match_backlight_service,
 	[208] = trampoline_nop, /* update_backlight_factor_prop */
@@ -130,12 +239,14 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[406] = trampoline_nop, /* set_fx_prop: a property notification */
 	[408] = trampoline_get_frequency,
 	[411] = trampoline_map_reg,
-	[413] = trampoline_true, /* sr_set_property_dict */
+	[413] = trampoline_panel_dictionary_v26_6, /* sr_set_property_dict */
 	[414] = trampoline_sr_set_property_int,
 	[415] = trampoline_true, /* sr_set_property_bool */
 	[451] = trampoline_allocate_buffer,
-	[552] = trampoline_true, /* set_property_dict_0 */
-	[561] = trampoline_true, /* set_property_dict */
+	[452] = trampoline_map_physical,
+	[454] = trampoline_release_mem_desc_v26_6,
+	[552] = trampoline_panel_dictionary_v26_6,
+	[561] = trampoline_panel_dictionary_v26_6,
 	[563] = trampoline_true, /* set_property_int */
 	[565] = trampoline_true, /* set_property_bool */
 	[567] = trampoline_true, /* set_property_str */
@@ -145,6 +256,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[576] = trampoline_nop,
 	[581] = trampoline_nop,
 	[582] = trampoline_true, /* create_default_fb_surface */
+	[588] = trampoline_nop, /* resize_default_fb_surface_gated */
 	[590] = trampoline_swap_complete,
 	[592] = trampoline_swap_complete_intent_gated,
 	[593] = trampoline_abort_swap_ap_gated,
@@ -154,6 +266,104 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[598] = trampoline_nop,
 	[599] = trampoline_nop,
 };
+
+/*
+ * What each handler above reads from the request and writes to the reply.
+ * The firmware may send longer records; a shorter one is refused.
+ */
+struct dcp_cb_min_v26_6_desktop {
+	u32 in_len;
+	u32 out_len;
+	bool valid;
+};
+
+#define CB_MIN(in, out) { .in_len = (in), .out_len = (out), .valid = true }
+
+static const struct dcp_cb_min_v26_6_desktop cb_min[IOMFB_MAX_CB] = {
+	[0] = CB_MIN(0, sizeof(u8)),
+	[1] = CB_MIN(0, sizeof(u8)),
+	[2] = CB_MIN(0, 0),
+	[3] = CB_MIN(0, sizeof(struct dcp_rt_bandwidth)),
+	[6] = CB_MIN(sizeof(struct dcp_set_frame_sync_props_req_v26_6_desktop),
+		     sizeof(struct dcp_set_frame_sync_props_resp_v26_6_desktop)),
+	[100] = CB_MIN(0, 0),
+	[101] = CB_MIN(0, sizeof(u32)),
+	[102] = CB_MIN(0, 0),
+	[104] = CB_MIN(0, 0),
+	[107] = CB_MIN(0, 0),
+	[108] = CB_MIN(0, sizeof(u8)),
+	[109] = CB_MIN(0, sizeof(u8)),
+	[110] = CB_MIN(0, sizeof(u8)),
+	[111] = CB_MIN(0, sizeof(u8)),
+	[112] = CB_MIN(0, sizeof(u8)),
+	[113] = CB_MIN(0, sizeof(u8)),
+	[114] = CB_MIN(sizeof(struct dcp_dict_passthrough_req_v26_6),
+		       sizeof(struct dcp_dict_passthrough_resp_v26_6)),
+	[115] = CB_MIN(sizeof(struct dcpep_get_tiling_state_req),
+		       sizeof(struct dcpep_get_tiling_state_resp)),
+	[116] = CB_MIN(sizeof(struct dcpep_get_tiling_state_req), sizeof(u32)),
+	[121] = CB_MIN(0, 0),
+	[122] = CB_MIN(0, sizeof(u8)),
+	[123] = CB_MIN(0, sizeof(u8)),
+	[125] = CB_MIN(sizeof(struct dcp_read_edt_data_req),
+		       sizeof(dcp_read_edt_data_resp_t)),
+	[127] = CB_MIN(sizeof(u32), sizeof(u8)),
+	[128] = CB_MIN(sizeof(struct dcp_set_dcpav_prop_chunk_req), sizeof(u8)),
+	[129] = CB_MIN(sizeof(struct dcp_set_dcpav_prop_end_req), sizeof(u8)),
+	[134] = CB_MIN(0, sizeof(u32)),
+	[201] = CB_MIN(sizeof(struct dcp_map_buf_req),
+		       sizeof(struct DCP_FW_NAME(dcp_map_buf_resp))),
+	[202] = CB_MIN(sizeof(struct dcp_unmap_buf_req_v26_6), 0),
+	[206] = CB_MIN(0, sizeof(u8)),
+	[207] = CB_MIN(0, sizeof(u8)),
+	[208] = CB_MIN(0, 0),
+	[209] = CB_MIN(0, sizeof(u64)),
+	[300] = CB_MIN(sizeof(struct iomfb_property), 0),
+	[400] = CB_MIN(0, 0),
+	[401] = CB_MIN(sizeof(struct dcp_get_uint_prop_req),
+		       sizeof(struct dcp_get_uint_prop_resp)),
+	[406] = CB_MIN(0, 0),
+	[408] = CB_MIN(0, sizeof(u64)),
+	[411] = CB_MIN(sizeof(struct DCP_FW_NAME(dcp_map_reg_req)),
+		       sizeof(struct DCP_FW_NAME(dcp_map_reg_resp))),
+	[413] = CB_MIN(0, sizeof(u8)),
+	[414] = CB_MIN(sizeof(struct iomfb_sr_set_property_int_req), sizeof(u8)),
+	[415] = CB_MIN(0, sizeof(u8)),
+	[451] = CB_MIN(sizeof(struct dcp_allocate_buffer_req),
+		       sizeof(struct dcp_allocate_buffer_resp)),
+	[452] = CB_MIN(sizeof(struct dcp_map_physical_req),
+		       sizeof(struct dcp_map_physical_resp)),
+	[454] = CB_MIN(sizeof(u32), sizeof(u32)),
+	[552] = CB_MIN(0, sizeof(u8)),
+	[561] = CB_MIN(0, sizeof(u8)),
+	[563] = CB_MIN(0, sizeof(u8)),
+	[565] = CB_MIN(0, sizeof(u8)),
+	[567] = CB_MIN(0, sizeof(u8)),
+	[572] = CB_MIN(0, sizeof(u32)),
+	[575] = CB_MIN(sizeof(struct dcp_hotplug_req_v26_6),
+		       sizeof(struct dcp_hotplug_resp_v26_6)),
+	[576] = CB_MIN(0, 0),
+	[581] = CB_MIN(0, 0),
+	[582] = CB_MIN(0, sizeof(u8)),
+	[588] = CB_MIN(0, 0),
+	[590] = CB_MIN(sizeof(struct DCP_FW_NAME(dc_swap_complete_resp)), 0),
+	[592] = CB_MIN(sizeof(dcp_swap_intent_t), 0),
+	[593] = CB_MIN(sizeof(u32), 0),
+	[594] = CB_MIN(sizeof(u8), 0),
+	[595] = CB_MIN(0, 0),
+	[598] = CB_MIN(0, 0),
+	[599] = CB_MIN(0, 0),
+};
+
+#undef CB_MIN
+
+bool iomfb_check_callback_v26_6_desktop(int tag, u32 in_len, u32 out_len)
+{
+	if (tag < 0 || tag >= IOMFB_MAX_CB || !cb_min[tag].valid)
+		return false;
+	return in_len >= cb_min[tag].in_len && out_len >= cb_min[tag].out_len &&
+	       iomfb_check_callback_exact_v26_6_desktop(tag, in_len, out_len);
+}
 
 void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp)
 {

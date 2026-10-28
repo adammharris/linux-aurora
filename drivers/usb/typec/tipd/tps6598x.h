@@ -371,6 +371,7 @@ struct tps6598x {
 	const struct tipd_data *data;
 
 	struct tipd_debugfs *debugfs;
+	struct typec_altmode *partner_altmode_dp;
 };
 
 /* TPS_REG_USB4_STATUS */

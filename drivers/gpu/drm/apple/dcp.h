@@ -101,6 +101,7 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 			 const struct drm_display_mode *mode,
 			 struct drm_display_mode *adjusted_mode);
 void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation);
+void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_np);
 void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 				     struct drm_connector *connector);
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
@@ -142,5 +143,30 @@ int apple_j613_25g83_coldplug(void);
 unsigned int apple_j613_25g83_clock_hz(void);
 /* A J613, or a J615 whose boot loader carries the experimental opt-in. */
 bool apple_t8122_25g83_board(void);
+
+void dcp_typec_hybrid_first_dt(void);
+void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp);
+void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms);
+void dcp_hdmi_yield_link(struct apple_dcp *dcp);
+void dcp_link_recovery_schedule(struct apple_dcp *dcp);
+
+/* Desktop 26.6 dual-pipe peer (dcp-peer-v26_6.inc, included from dcp.c) */
+struct dptx_port;
+int dcp_peer_hints_26_6(struct apple_dcp *dcp, struct dptx_port *port,
+			const void *data, size_t size,
+			void *reply, size_t reply_size);
+bool dcp_peer_tiling_state_26_6(struct apple_dcp *dcp, bool write,
+				u32 event, u32 param, u32 *value);
+void dcp_peer_display_ids(struct apple_dcp *dcp, u32 own, u32 related);
+struct dcp_swap_submit_req_v26_6_desktop;
+int dcp_peer_drm_modeset_26_6(struct apple_dcp *dcp, u32 hdisplay,
+			      u32 timing, u32 color, u32 min_vrr);
+void dcp_peer_swap_submit_26_6(struct apple_dcp *dcp,
+			       struct dcp_swap_submit_req_v26_6_desktop *req,
+			       u32 swap_id);
+bool dcp_peer_swap_complete_26_6(struct apple_dcp *dcp, u32 swap_id);
+int dcp_peer_stop_26_6(struct apple_dcp *dcp);
+void dcp_peer_release_26_6(struct apple_dcp *dcp);
+void dcp_peer_bound_26_6(struct apple_dcp *dcp);
 
 #endif

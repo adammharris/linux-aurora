@@ -26,9 +26,12 @@ import quiesce
 import transaction
 import accounting
 import idle
+import desktop
+import j616s
 import rate
 import boot
 import m4
+import display
 
 
 def parking_unit(root):
@@ -40,7 +43,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[6])
     parser.add_argument('--output', type=Path, help='retain generated C, commands and results here')
-    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle', 'boot', 'quiesce', 'm4'), default='all')
+    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle', 'boot', 'quiesce', 'm4', 'display'), default='all')
     args = parser.parse_args()
     root = args.source.resolve()
     output = args.output or Path(tempfile.mkdtemp(prefix='apple-dcp-selftest-'))
@@ -51,6 +54,23 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('lifecycle', 'desktop-modeset-unmap', desktop.modeset_unmap, ((),), ()),
+        ('lifecycle', 'desktop-unknown-modeset-recovery', desktop.modeset_unknown, ((),), ()),
+        ('display', 'panel-backlight-ramp', display.backlight, ((),), ()),
+        ('display', 'panel-takeover-registration', desktop.brightness_takeover, ((),), ()),
+        ('display', 'panel-brightness-commit', display.brightness_commit, ((),), ()),
+        ('display', 'panel-brightness-takeover', display.takeover, ((),), ()),
+        ('display', 'panel-mode-catalog', display.modes, ((),), ()),
+        ('display', 'desktop-brightness-notifications', desktop.brightness_notifications, ((),), ()),
+        ('display', 'j616s-panel-identity', lambda r: j616s.identity(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
+        ('display', 'desktop-adt-identity', desktop.adt_identity, ((),), ()),
+        ('display', 'desktop-identity-trace-budget', desktop.identity_trace_budget, ((),), ()),
+        ('display', 'desktop-identity-keys', desktop.identity_keys, ((),), ('-Wno-unused-function',)),
+        ('display', 'desktop-panel-identity', lambda r: desktop.panel_identity(r, output), ((),), ()),
+        ('display', 'desktop-powerlog-framing', desktop.powerlog_framing, ((),), ()),
+        ('display', 'desktop-brightness-keys-reports', desktop.keys_and_reports, ((),), ()),
+        ('display', 'panel-refresh-range', display.refresh, ((),), ()),
+        ('display', 'panel-adaptive-watchdog', display.watchdog, ((),), ()),
         ('m4', 'm4-wire-golden', lambda r: m4.golden_check(r, output), (), ()),
         ('m4', 'm4-protocol', m4.protocol, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('m4', 'm4-common-plane', m4.plane, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),

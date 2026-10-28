@@ -222,6 +222,7 @@ static void relink_test_exit(void *data)
 	wait_for_completion_timeout(&t->userspace_done, 10 * HZ);
 	disable_delayed_work_sync(&t->dcp.announce_wq);
 	disable_work_sync(&t->con.hotplug_wq);
+	apple_connector_backlight_early_unregister(&t->con);
 	drm_atomic_helper_shutdown(&t->drm);
 	drm_framebuffer_put(&t->fb);
 }
@@ -408,6 +409,7 @@ static struct relink_test *relink_test_init(struct kunit *test)
 	spin_lock_init(&dcp->mode_state.lock);
 	INIT_DELAYED_WORK(&dcp->announce_wq, dcp_announce_work);
 	INIT_WORK(&dcp->vblank_wq, relink_test_noop);
+	apple_connector_backlight_init(&t->con);
 	INIT_WORK(&t->con.hotplug_wq, dcp_hotplug);
 	dcp->test_point = relink_test_point;
 	dcp->typec_cable_connected = true;

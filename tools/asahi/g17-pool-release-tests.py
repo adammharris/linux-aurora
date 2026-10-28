@@ -31,7 +31,7 @@ def fixture():
     predicate = '.any(|queue| queue.retirement_polling() || queue.pool_release_pending())'
     assert events.count(predicate) == 1
     methods = '\n'.join(item(runtime, name) for name in [
-        'fn compute_admission_error(', 'pub(super) fn reserve_compute(']).replace('pub(super) ', '')
+        'fn compute_admission_error(', 'pub(super) fn reserve_compute(']).replace('pub(super) ', '').replace('queue: ComputeSlot::new()?', 'queue: None')
     pending = item(compute, 'pub(crate) fn pool_release_pending(') + '\n' + \
         item(compute, 'pub(crate) fn release_settling(')
     return r'''
@@ -72,10 +72,12 @@ RELEASE_PENDING
 struct Id { qid: u8 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ComputeReservation { slot: usize, id: Id, owner: u64 }
-struct ComputeEntry { reservation: ComputeReservation, queue: Option<Box<compute::Queue>> }
+type ComputeSlot = Option<Box<compute::Queue>>;
+struct ComputeEntry { reservation: ComputeReservation, queue: ComputeSlot }
+struct Admission; impl Admission {fn queues(&self)->u32{4}}
 struct QueueIds { free: bool, fail: Option<Error> }
 impl QueueIds {
-    fn reserve(&mut self, _: u64, _: DataMaster, preferred: Option<u8>) -> Result<Id> {
+    fn reserve_for(&mut self, _: u64, _: DataMaster, preferred: Option<u8>, _: usize) -> Result<Id> {
         if let Some(error) = self.fail { return Err(error); }
         if !self.free { return Err(ENOSPC); }
         self.free = false;
@@ -93,8 +95,11 @@ struct Registry {
     compute: Vec<Option<ComputeEntry>>,
     identities: Identities,
     qids: QueueIds,
+    admission: Admission,
 }
 impl Registry {
+    // Physical-QID capacity notification does not change this pool-release fixture.
+    fn note_build_room(&self) {}
 METHODS
     fn poll(&self) -> bool {
         self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())PREDICATE
@@ -109,7 +114,7 @@ fn state(phase: PoolPhase, free: bool) -> Registry {
         }));
     }
     entries.push(None);
-    Registry { compute: entries, identities: Identities { next: 100 }, qids: QueueIds { free, fail: None } }
+    Registry { compute: entries, identities: Identities { next: 100 }, qids: QueueIds { free, fail: None }, admission: Admission }
 }
 fn main() {
     // Captured failure: four idle released queues, full physical namespace,

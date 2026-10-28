@@ -2,9 +2,9 @@
 # Copyright 2026 Ryan Murray
 """Actual PM/HCD/mux/probe boundaries using the shared PHY extraction fixture."""
 from pathlib import Path
-import os, re, subprocess
+import os, re, shlex, shutil, subprocess
 import phy
-from common import block, tipd_pm_header, atc_function
+from common import block, tipd_pm_header, atc_function, ATC_RPM
 
 def ownership(root, usb_unreachable=False):
     ns=phy.parking(root)
@@ -171,6 +171,8 @@ static void usb_mark_last_busy(struct usb_device *u) {
  assert(root_locked&&!pm_phy->lock);
  if(u==&link_device)assert(link_locked);else assert(u==&roots[3]&&!link_locked);
 }
+/* Only an idle-power-off PHY takes a hold of its own; the fixture PHY never does. */
+static void __attribute__((unused)) pm_runtime_get_noresume(struct device *d) { (void)d; assert(!"PHY runtime PM hold"); }
 static void pm_runtime_put_autosuspend(struct device *d) {
  assert(root_locked&&!pm_phy->lock);
  if(d==&link_device.dev){assert(link_locked&&link_pm_refs==1);link_pm_refs--;}
@@ -421,6 +423,8 @@ int main(void)
        ('atcphy_park_retry_delay','atcphy_park_retry','atcphy_park_due','atcphy_mux_change'))
      helpers+=ns['function'](s,'atcphy_mux_update')+'\n'
      # Lane fixtures provide the target mapping and locked body; use the real callback here.
+     # The mux callback powers an idle-power-off PHY first; this PHY is not one.
+     helpers+=''.join(atc_function(s,name) for name in ATC_RPM)
      marker=re.search(r'^static int atcphy_mux_set\(',s,re.M).group()
      helpers+=ns['block'](s,marker)+'\n'
     else:
@@ -509,6 +513,8 @@ static void *fwnode_typec_mux_get(struct fwnode_handle *f) { (void)f;muxes++;ret
 static struct fwnode_handle *fwnode_find_reference(struct fwnode_handle *f,const char *s,int n) {
  (void)f;(void)s;(void)n;connector.refs++;return &connector;
 }
+static bool fwnode_property_present(struct fwnode_handle *f,const char *s) { (void)f;(void)s;return true; }
+static struct fwnode_handle *fwnode_handle_get(struct fwnode_handle *f) { assert(!"connector is a displayport reference");return f; }
 static void __attribute__((unused)) fwnode_handle_put(struct fwnode_handle *f) {
  if(f){assert(f->refs>0);f->refs--;}
 }
@@ -547,7 +553,7 @@ static void balanced(void) {
 int main(void) {
  (void)cd321x_pm_notifications;
  struct cd321x c;
- struct cd321x_pm_state budget;
+ struct cd321x_pm_state budget={0};
  cd321x_pm_init(&budget);assert(cd321x_pm_ready(&budget));
  assert(cd321x_display_taken(-ENOSPC,true)&&!cd321x_display_taken(-EBUSY,true)&&!cd321x_display_taken(0,true)&&cd321x_display_taken(-EBUSY,false)&&!cd321x_display_taken(-ENOSPC,false)&&!cd321x_display_taken(0,false));
  for(unsigned int i=0;i<CD321X_RESUME_ATTEMPTS;i++){
@@ -681,7 +687,8 @@ def kconfig(root, output):
                       'config PHY_APPLE_ATC\n\ttristate "PHY"\n\t' + dependency + '\n')
     compiler = Path(os.environ.get('KCONFIG_CONF', root / 'scripts/kconfig/conf'))
     if not compiler.is_file():
-        subprocess.run(['make', '-C', str(root), 'O=' + str(directory / 'producer'),
+        make = shlex.split(os.environ.get('MAKE', shutil.which('gmake') or 'make'))
+        subprocess.run(make + ['-C', str(root), 'O=' + str(directory / 'producer'),
                         'ARCH=arm64', 'LLVM=1', 'allnoconfig'], check=True)
         compiler = directory / 'producer/scripts/kconfig/conf'
     for usb, phy_setting in [('n', 'y'), ('y', 'y'), ('m', 'y'), ('m', 'm')]:

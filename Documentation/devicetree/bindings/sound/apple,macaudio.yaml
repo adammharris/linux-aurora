@@ -36,6 +36,15 @@ properties:
       Model name for presentation to users
     $ref: /schemas/types.yaml#/definitions/string
 
+  speaker-id-gpios:
+    minItems: 1
+    maxItems: 8
+    description:
+      Inputs encoding the fitted speaker assembly variant, least significant
+      bit first. The machine driver exposes their logical levels through the
+      read-only Speaker Variant ID control. GPIO polarity flags define each
+      bit's logical level.
+
 patternProperties:
   "^dai-link(@[0-9a-f]+)?$":
     description: |

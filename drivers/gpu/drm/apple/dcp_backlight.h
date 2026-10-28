@@ -22,10 +22,14 @@ struct dcp_backlight_state {
 	u32 fade_from;
 	u32 actual;
 	u32 sent_nits;
+	/* Firmware observations confirm output; they never become user requests. */
+	u32 reported;
 	u64 sequence;
 	u8 retries;
 	bool ready;
 	bool controlled;
+	/* An unchanged registration default cannot take over an unknown level. */
+	bool preserve_inherited;
 	bool dpms_off;
 	bool core_blank;
 	bool suspended;
@@ -41,6 +45,7 @@ struct dcp_backlight_state {
 	 * without a loader report is not known until a present carries a level.
 	 */
 	bool level_known;
+	bool report_valid;
 };
 
 struct dcp_backlight_present {
@@ -86,8 +91,10 @@ static inline int dcp_bl_init(struct dcp_backlight_state *state, u32 maximum,
 		.target = nits,
 		.level = nits,
 		.actual = nits,
+		.reported = nits,
 		.ready = true,
 		.level_known = inherited_valid,
+		.report_valid = inherited_valid,
 	};
 	return 0;
 }
@@ -105,6 +112,30 @@ static inline bool dcp_bl_seed(struct dcp_backlight_state *state, u32 nits)
 	state->actual = nits;
 	state->level_known = true;
 	return true;
+}
+
+/*
+ * A report can establish takeover once. After Linux has a level or target,
+ * keep the observation separate from target, fade progress and completion.
+ * In particular, delayed reports cannot restart a fade or request a resend.
+ */
+static inline bool dcp_bl_report(struct dcp_backlight_state *state, u32 nits)
+{
+	if (!state->ready || nits > state->maximum)
+		return false;
+	state->reported = nits;
+	state->report_valid = true;
+	if (state->controlled || state->level_known)
+		return false;
+	return dcp_bl_seed(state, nits);
+}
+
+/* Report a usable target until a hint or completed present gives the level. */
+static inline int dcp_bl_actual(const struct dcp_backlight_state *state)
+{
+	if (!state->ready)
+		return -ENODATA;
+	return state->level_known ? state->actual : state->target;
 }
 
 static inline bool dcp_bl_lit(const struct dcp_backlight_state *state)
@@ -139,6 +170,20 @@ static inline int dcp_bl_request(struct dcp_backlight_state *state, u32 nits,
 		return -ENODATA;
 	if (nits > state->maximum)
 		return -ERANGE;
+	/* Save/restore clients may echo the reporting default without a change. */
+	if (state->preserve_inherited && !state->controlled && !state->level_known &&
+	    state->target == nits) {
+		state->core_blank = core_blank;
+		state->suspended = suspended;
+		return 0;
+	}
+	/* Core blank/suspend notifications do not establish a panel level. */
+	if (!state->controlled && !state->level_known && state->target == nits &&
+	    (state->core_blank != core_blank || state->suspended != suspended)) {
+		state->core_blank = core_blank;
+		state->suspended = suspended;
+		return 0;
+	}
 	state->controlled = true;
 	state->retries = 0;
 	/*
@@ -150,7 +195,8 @@ static inline int dcp_bl_request(struct dcp_backlight_state *state, u32 nits,
 		state->target = nits;
 		state->core_blank = core_blank;
 		state->suspended = suspended;
-		if (state->fade && state->level_known && was_lit &&
+		/* With no hint, the reporting target is the first fade's origin. */
+		if (state->fade && (state->level_known || state->preserve_inherited) && was_lit &&
 		    dcp_bl_lit(state) && state->level != nits) {
 			state->fade_from = state->level;
 			state->fading = true;
@@ -272,7 +318,56 @@ static inline unsigned int dcp_bl_retry_delay(const struct dcp_backlight_state *
 	return 100U << (state->retries - 1);
 }
 
+/* A desktop present can complete before its submit reply arrives. */
+struct dcp_backlight_swap {
+	struct dcp_backlight_present present;
+	u32 id;
+	bool pending;
+	bool accepted;
+	bool completed;
+};
+
+static inline int dcp_bl_swap_prepare(struct dcp_backlight_state *state,
+				      struct dcp_backlight_swap *swap,
+				      u32 id, bool have_surface)
+{
+	struct dcp_backlight_present present;
+	int ret = dcp_bl_prepare(state, have_surface, &present);
+
+	if (ret)
+		return ret;
+	*swap = (struct dcp_backlight_swap) {
+		.present = present,
+		.id = id,
+		.pending = true,
+	};
+	return 0;
+}
+
+static inline bool dcp_bl_swap_finish(struct dcp_backlight_state *state,
+				      struct dcp_backlight_swap *swap,
+				      u32 id, bool reply, bool accepted)
+{
+	if (!swap->pending || swap->id != id)
+		return false;
+	if (reply)
+		swap->accepted = accepted;
+	else
+		swap->completed = true;
+	if ((!reply || accepted) && !(swap->accepted && swap->completed))
+		return false;
+	swap->pending = false;
+	return dcp_bl_complete(state, swap->present.sequence,
+			      swap->accepted && swap->completed);
+}
+
 struct apple_dcp;
+
+void dcp_backlight_desktop_power(struct apple_dcp *dcp, bool on);
+bool dcp_backlight_desktop_prepare(struct apple_dcp *dcp, u32 id,
+				   bool have_surface, u32 *nits);
+void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
+				  bool reply, bool accepted);
 
 /*
  * kick only queues work; it must not submit a top-level RPC from the caller.

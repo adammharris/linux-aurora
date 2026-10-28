@@ -2062,6 +2062,7 @@ F:	Documentation/gpu/apple-dcp-*.rst
 F:	drivers/gpu/drm/apple/
 F:	drivers/gpu/drm/apple/dcp-fabric*
 F:	tools/testing/selftests/drivers/gpu/apple-afkv2/
+F:	tools/testing/selftests/drivers/gpu/apple-dcp/
 
 APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>
@@ -2745,6 +2746,7 @@ F:	Documentation/devicetree/bindings/usb/apple,dwc3.yaml
 F:	Documentation/devicetree/bindings/usb/apple,sn201202x.yaml
 F:	Documentation/devicetree/bindings/watchdog/apple,wdt.yaml
 F:	Documentation/hwmon/macsmc-hwmon.rst
+F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
 F:	drivers/bluetooth/hci_bcm4377.c
 F:	drivers/clk/clk-apple-nco.c

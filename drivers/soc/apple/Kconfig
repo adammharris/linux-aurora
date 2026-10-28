@@ -269,8 +269,10 @@ config APPLE_T6041_DISPLAY_GATE
 	  boot loader has handed the running display coprocessor over. This
 	  option enables those nodes before devices are created, only when
 	  the boot loader has published a complete T6041 handoff for the
-	  26.6.2 display firmware. Without it, or with nomodeset, it does
-	  nothing.
+	  26.6.2 display firmware. It also powers up the J616s external
+	  display chain (HDMI, Type-C DisplayPort) once the boot loader has
+	  given the external display processors their firmware memory.
+	  Without these, or with nomodeset, it does nothing.
 
 	  Say 'y' if you want the native display on M4 Pro MacBook Pros.
 

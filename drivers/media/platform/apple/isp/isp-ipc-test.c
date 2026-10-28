@@ -144,7 +144,69 @@ static void isp_test_sm_free_log_bt(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, t->isp->bt_surf);
 }
 
+static void isp_test_command_ring_wrap(struct kunit *test)
+{
+	struct isp_sm_test *t = isp_sm_test_alloc(test);
+	struct isp_channel *chan = t->chan;
+	struct isp_message *slots;
+
+	chan->num = 8;
+	chan->virt = kunit_kcalloc(test, chan->num, sizeof(*slots), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, chan->virt);
+	slots = chan->virt;
+	chan->req.arg0 = 0x5000000;
+	isp_get_current_format(t->isp)->pixelformat = V4L2_PIX_FMT_P010;
+	for (unsigned int i = 0; i < 100000; i++) {
+		unsigned int cursor = chan->cursor;
+
+		/* Re-publication must clear the old ACK before waiting on a wrap. */
+		slots[cursor].arg0 = chan->req.arg0;
+		KUNIT_ASSERT_FALSE(test, chan_tx_done(t->isp, chan));
+		KUNIT_ASSERT_EQ(test, chan->cursor, cursor);
+		slots[cursor].arg0 |= ISP_IPC_FLAG_ACK;
+		KUNIT_ASSERT_TRUE(test, chan_tx_done(t->isp, chan));
+		KUNIT_ASSERT_EQ(test, chan->cursor, (cursor + 1) % chan->num);
+	}
+	KUNIT_EXPECT_EQ(test, chan->cursor, 0);
+}
+
+static void isp_test_late_ack_keeps_cursor(struct kunit *test)
+{
+	struct isp_sm_test *t = isp_sm_test_alloc(test);
+	struct isp_message response = { .arg0 = 0x5000001 };
+
+	isp_get_current_format(t->isp)->pixelformat = V4L2_PIX_FMT_P010;
+	t->chan->virt = &response;
+	t->chan->num = 8;
+	t->chan->req.arg0 = 0x5000000;
+	t->chan->deadline_active = true;
+	t->chan->deadline = jiffies;
+	KUNIT_EXPECT_FALSE(test, chan_tx_done(t->isp, t->chan));
+	KUNIT_EXPECT_EQ(test, t->chan->cursor, 0);
+	t->chan->deadline = jiffies + HZ;
+	KUNIT_EXPECT_TRUE(test, chan_tx_done(t->isp, t->chan));
+	KUNIT_EXPECT_EQ(test, t->chan->cursor, 1);
+}
+
+static void isp_test_message_payload_copy(struct kunit *test)
+{
+	struct isp_sm_test *t = isp_sm_test_alloc(test);
+	struct isp_message response = {
+		.arg0 = 0x5000001, .arg1 = 1, .arg2 = 2, .arg3 = 3,
+		.arg4 = 4, .arg5 = 5, .arg6 = 6, .arg7 = 7,
+	};
+	struct isp_message copied = {};
+
+	isp_get_current_format(t->isp)->pixelformat = V4L2_PIX_FMT_P010;
+	t->chan->virt = &response;
+	chan_read_msg_index(t->isp, t->chan, &copied, 0);
+	KUNIT_EXPECT_MEMEQ(test, &copied, &response, sizeof(response));
+}
+
 static struct kunit_case isp_ipc_test_cases[] = {
+	KUNIT_CASE(isp_test_message_payload_copy),
+	KUNIT_CASE(isp_test_late_ack_keeps_cursor),
+	KUNIT_CASE(isp_test_command_ring_wrap),
 	KUNIT_CASE(isp_test_sm_free_releases),
 	KUNIT_CASE(isp_test_sm_free_alias),
 	KUNIT_CASE(isp_test_sm_free_unknown),

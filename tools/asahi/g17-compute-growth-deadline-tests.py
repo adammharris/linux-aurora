@@ -50,7 +50,8 @@ impl Gate{fn enter_until(&self,a:&Admission<'_>)->Result<Lease>{a.check()?;Ok(Le
 impl Lease{fn is_current(&self)->bool{true}}
 struct State(Mutex<Option<Box<Firmware>>>);
 impl State{fn lock(&self)->MutexGuard<'_,Option<Box<Firmware>>>{self.0.lock().unwrap()}}
-struct Shared{preparations:Gate,state:State,crashed:AtomicBool}
+struct Available;impl Available{fn observe(&self)->u64{now_ns()}fn notify(&self){}}
+struct Shared{preparations:Gate,state:State,crashed:AtomicBool,progress:Available,channels:Available}
 impl Shared{fn drm(&self)->Result<()>{Ok(())}fn queue_events(&self){}}
 struct Context;impl Context{fn vm(&self)->&(){&()}}
 struct Backend{shared:Shared,context:Context,owner:u64}
@@ -85,12 +86,17 @@ struct Firmware{queues:Registry,uat:(),init:(),primary:Primary}
 impl Firmware{fn scan_compute(&mut self,_:Option<()>,_:&mut DeferredBatch)->Result{Ok(())}}
 struct DeferredBatch;impl DeferredBatch{fn publication()->Result<Self>{Ok(Self)}fn finish(&mut self){}}
 impl Backend{
+ fn wait_release(&self,_:&Available,_:u64,admission:&Admission<'_>)->Result{
+  let _=admission.slice_ms()?;
+  kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+  admission.check()
+ }
 ''' + methods + r'''
 }
 fn main(){
  for fresh in [false,true]{for cancel in [false,true]{
   NOW.store(0,Ordering::SeqCst);ABORTED.store(false,Ordering::SeqCst);RESERVED.store(true,Ordering::SeqCst);
-  let b=Backend{owner:1,context:Context,shared:Shared{preparations:Gate,crashed:AtomicBool::new(false),state:State(Mutex::new(Some(Box::new(Firmware{uat:(),init:(),primary:Primary,queues:Registry{compute:vec![Some(Entry{reservation:ComputeReservation,queue:Some(Box::new(Queue{fresh}))})]}}))))}};
+  let b=Backend{owner:1,context:Context,shared:Shared{preparations:Gate,progress:Available,channels:Available,crashed:AtomicBool::new(false),state:State(Mutex::new(Some(Box::new(Firmware{uat:(),init:(),primary:Primary,queues:Registry{compute:vec![Some(Entry{reservation:ComputeReservation,queue:Some(Box::new(Queue{fresh}))})]}}))))}};
   let check=||{if cancel&&now_ns()>=10_000_000{Err(ECANCELED)}else{Ok(())}};
   let admission=Admission::new(20_000_000,&check);
   assert_eq!(b.grow_compute(42,&admission),Err(if cancel{ECANCELED}else{EBUSY}),"growth must propagate cancel/deadline");
@@ -106,7 +112,7 @@ fn main(){
 def main():
     source = fixture()
     mutants = [('fixed', source, ''),
-               ('omit-growth-check', source.replace('                admission.check()?;\n                let firmware', '                let firmware'), 'growth admission exceeded'),
+               ('ignore-shared-deadline', source.replace('if now_ns() >= self.deadline', 'if false').replace('if remaining == 0 { return Err(EBUSY); }', ''), 'growth admission exceeded'),
                ('keep-growth-alias', source.replace('                drop(alias.take());', ''), 'growth aliases must precede')]
     with tempfile.TemporaryDirectory(prefix='g17-compute-growth-') as tmp:
         for name, code, expected in mutants:

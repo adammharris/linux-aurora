@@ -33,7 +33,9 @@ properties:
               - apple,t8112-dcpext
               - apple,t6000-dcpext
               - apple,t6020-dcpext
+              - apple,t6041-dcpext
           - const: apple,dcpext
+      - const: apple,t6041-dcpext
       - items:
           - const: apple,t8140-dcpext
           - const: apple,dcp
@@ -213,6 +215,23 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Display coprocessor index on multi-DCP systems.
 
+  apple,typec-hybrid-first:
+    type: boolean
+    description:
+      A hybrid pipeline (a fixed output plus Type-C routes) is planned for a
+      Type-C port before the other pipelines, while its fixed output has no
+      sink, instead of being kept back for that output. Set where this
+      pipeline is the only one that can be the primary of a display wider than
+      one pipe.
+
+  apple,dcp-endpoint:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The display endpoint this coprocessor is to its firmware (its display
+      index), by which two external pipes name each other when a display
+      wider than one pipe is driven by two of them. 0 is the internal
+      display.
+
   apple,dptx-phy:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: DisplayPort transmitter PHY selector.
@@ -275,6 +294,8 @@ properties:
 
   '#size-cells':
     const: 2
+
+  ranges: true
 
   piodma:
     type: object
@@ -372,10 +393,19 @@ allOf:
             pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
       not:
-        properties:
-          compatible:
-            contains:
-              const: apple,t8132-dcp
+        anyOf:
+          - properties:
+              compatible:
+                contains:
+                  const: apple,t8132-dcp
+          - properties:
+              compatible:
+                contains:
+                  const: apple,t6041-dcpext
+              status:
+                const: disabled
+            required:
+              - status
     then:
       required:
         - apple,bw-scratch

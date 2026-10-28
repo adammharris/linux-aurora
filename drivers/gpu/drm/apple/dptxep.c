@@ -490,11 +490,12 @@ static int dptxport_call_get_link_rate(struct apple_epic_service *service,
 static int dptxport_compact_xbar_link(struct apple_epic_service *service, bool up)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
+	struct mux_control *xbar = READ_ONCE(dcp->xbar);
 	int ret;
 
-	if (!READ_ONCE(service->ep->compact) || !dcp->xbar)
+	if (!READ_ONCE(service->ep->compact) || !xbar)
 		return 0;
-	ret = dcp_dpxbar_link(dcp->xbar, up);
+	ret = dcp_dpxbar_link(xbar, up);
 	dev_dbg(dcp->dev, "DPTXPort: crossbar link %s: %d\n", up ? "up" : "down", ret);
 	return ret;
 }
@@ -693,6 +694,27 @@ static int dptxport_call_set_tiled_display_hint(struct apple_epic_service *servi
 	return 0;
 }
 
+/*
+ * Desktop 26.6 display allocation: the 160-byte SET_TILED_DISPLAY_HINTS
+ * record carries the sink's size and pixel rates and takes the main and
+ * peer endpoint IDs back (dcp_peer_hints_26_6()).  A sink wider than one
+ * pipe gets the idle pipe above this one as its peer.
+ */
+static bool dptxport_dual_pipe_alloc(struct apple_epic_service *service,
+				     const void *data, size_t data_size,
+				     void *reply, size_t reply_size)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct dptx_port *dptx = service->cookie;
+
+	if (data_size != 160 || reply_size < 160 ||
+	    dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP)
+		return false;
+
+	return dcp_peer_hints_26_6(dcp, dptx, data, data_size,
+				   reply, reply_size) == 0;
+}
+
 static int
 dptxport_call_activate(struct apple_epic_service *service,
 		       const void *data, size_t data_size,
@@ -878,6 +900,9 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
 		int ret;
 
+		if (dptxport_dual_pipe_alloc(service, data, data_size, reply,
+					     reply_size))
+			return 0;
 		memcpy(reply, data, min(reply_size, data_size));
 		ret = dptxport_call_set_tiled_display_hint(service, data,
 							   data_size, reply,

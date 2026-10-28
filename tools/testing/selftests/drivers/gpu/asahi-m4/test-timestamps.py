@@ -24,6 +24,7 @@ shared = (backend / 'timestamp.rs').read_text()
 poll = (backend / 'g16/poll.rs').read_text()
 cache_policy = function((backend / 'gem.rs').read_text(), 'pub(crate) fn is_writeback(')
 store = function(mmu, 'pub(crate) fn write(&self, value: u64)')
+vmap_store = function(mmu, 'pub(crate) fn write(&self, offset: usize, value: u64)')
 write = function(shared, 'fn write(&self, ticks: u64, frequency_hz: u64)')
 checked_offset = function(shared, 'fn checked_offset(')
 publish = function(shared, 'pub(crate) fn publish(&self, ticks: [u64; 4], frequency_hz: u64)')
@@ -50,7 +51,12 @@ struct Map{backing:Arc<Backing>,addr:*mut core::ffi::c_void}
 unsafe impl Send for Map {} unsafe impl Sync for Map {}
 struct View(*mut u8);impl View{fn as_mut_ptr(&self)->*mut u8{self.0}}
 impl Map{fn get(&self)->View{View(self.backing.words.as_ptr().cast_mut().cast())}fn owner(&self)->&Backing{&self.backing}}
-struct TimestampMapping{mapping:Map,offset:usize}
+struct TimestampVmap(Map);
+impl TimestampVmap {
+    fn size(&self)->usize{core::mem::size_of_val(&self.0.backing.words)}
+    __VMAP_STORE__
+}
+struct TimestampMapping{mapping:TimestampVmap,offset:usize}
 impl TimestampMapping { __STORE__ }
 __CHECKED_OFFSET__
 struct Destination{cpu:TimestampMapping}
@@ -63,7 +69,7 @@ impl Destinations {
 fn backing()->Arc<Backing>{backing_with_flags(0)}
 fn backing_with_flags(flags:u32)->Arc<Backing>{Arc::new(Backing{flags,words:[const{AtomicU64::new(u64::MAX)};4],timestamp_lock:std::sync::Mutex::new(())})}
 fn destination(memory:&Arc<Backing>,offset:usize)->Destination{
-    Destination{cpu:TimestampMapping{mapping:Map{backing:memory.clone(),addr:memory.words.as_ptr().cast_mut().cast()},offset}}
+    Destination{cpu:TimestampMapping{mapping:TimestampVmap(Map{backing:memory.clone(),addr:memory.words.as_ptr().cast_mut().cast()}),offset}}
 }
 fn outputs(memory:&Arc<Backing>)->Destinations{
     Destinations(core::array::from_fn(|i|Some(destination(memory,i*8))))
@@ -191,7 +197,7 @@ fn resources()->Resources{Resources{
     assert_eq!(firmware().publish_timestamps(&flight,&claims),Err(EINVAL));
     assert_eq!(memory.words[0].load(Ordering::Relaxed),u64::MAX);
 }
-'''.replace('__CHECKED_OFFSET__', checked_offset).replace('__STORE__', store).replace('__CACHE_POLICY__', cache_policy).replace('__WRITE__', write).replace('__PUBLISH__', publish).replace('__RETIRE__', retire.replace('fn publish_timestamps', 'pub(crate) fn publish_timestamps'))
+'''.replace('__CHECKED_OFFSET__', checked_offset).replace('__STORE__', store).replace('__VMAP_STORE__', vmap_store.replace('.timestamp_lock.lock()', '.timestamp_lock.lock().unwrap()')).replace('__CACHE_POLICY__', cache_policy).replace('__WRITE__', write).replace('__PUBLISH__', publish).replace('__RETIRE__', retire.replace('fn publish_timestamps', 'pub(crate) fn publish_timestamps'))
 path = out / 'timestamps-host.rs'
 path.write_text(source)
 subprocess.run(rustc() + ['--edition=2021', '--test', str(path), '-o', str(out / 'timestamps-host')], check=True)

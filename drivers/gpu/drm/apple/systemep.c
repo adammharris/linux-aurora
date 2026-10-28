@@ -75,7 +75,7 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 	struct apple_dcp *dcp = service->ep->dcp;
 	int ret;
 
-	/* Later reports must not overwrite a latched hint or Linux's target. */
+	/* Keep the existing filtering on active non-desktop backends. */
 	if (dcp_backlight_active(dcp))
 		return 0;
 
@@ -100,8 +100,9 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 
 	dev_dbg(dcp->dev, "systemep: mNits event: Nits: %u.%03u, iDAC: %u\n",
 		mnits.millinits / 1000, mnits.millinits % 1000, mnits.idac);
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+	if ((dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	     dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
+	    dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		if (!dcp_has_panel(dcp))
 			return 0;
 		ret = dcp_backlight_takeover(dcp, mnits.millinits);
