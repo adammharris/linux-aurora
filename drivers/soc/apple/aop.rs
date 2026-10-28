@@ -72,7 +72,10 @@ use kernel::{
         Mutex,
         MutexGuard, //
     },
-    time::msecs_to_jiffies,
+    time::{
+        msecs_to_jiffies,
+        Jiffies, //
+    },
     types::{
         ForeignOwnable,
         ScopeGuard, //
@@ -126,7 +129,8 @@ const QE_MAGIC2: u32 = from_fourcc(b" POA");
 /// Bound on the wait for the reply to an EPIC call. The firmware can stop
 /// answering, and a caller must not be left in D state forever.
 const EPIC_CALL_TIMEOUT_MS: u32 = 5000;
-/// Bound on the wait for an endpoint's shutdown acknowledgment.
+/// Bound on the wait for the shutdown acknowledgments of all endpoints
+/// together, so that a firmware that stopped answering costs one timeout.
 const AFK_SHUTDOWN_TIMEOUT_MS: u32 = 5000;
 
 // The T8140 AOP boots through a second mailbox, its "setup port", besides the
@@ -360,16 +364,23 @@ impl<T: Unpin> FutureValue<T> {
     /// abandoned because the calling task has a signal pending, or its reply
     /// would arrive for a call that no longer exists.
     fn wait_timeout(&self, timeout_ms: u32) -> Option<T> {
+        self.wait_jiffies(msecs_to_jiffies(timeout_ms)).0
+    }
+    /// Like `wait_timeout`, but takes the budget in jiffies and also returns
+    /// what is left of it, so that several waits can share one deadline.
+    fn wait_jiffies(&self, mut left: Jiffies) -> (Option<T>, Jiffies) {
         let mut ret_guard = self.val.lock();
-        let mut left = msecs_to_jiffies(timeout_ms);
         while ret_guard.is_none() {
             match self.completion.wait_timeout(&mut ret_guard, left) {
-                CondVarTimeoutResult::Timeout => break,
+                CondVarTimeoutResult::Timeout => {
+                    left = 0;
+                    break;
+                }
                 CondVarTimeoutResult::Woken { jiffies }
                 | CondVarTimeoutResult::Signal { jiffies } => left = jiffies,
             }
         }
-        ret_guard.take()
+        (ret_guard.take(), left)
     }
     fn reset(&self) {
         *self.val.lock() = None;
@@ -1382,7 +1393,9 @@ impl AopData {
     fn wake(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
-        rtk.as_mut().wake()
+        rtk.as_mut().wake().inspect_err(|e| {
+            dev_err!(self.dev, "RTKit wake failed ({:?})", e);
+        })
     }
     /// Starts the AFK handshake on every advertised endpoint. An endpoint
     /// the match data does not require may fail to start; it is skipped.
@@ -1396,23 +1409,50 @@ impl AopData {
             }
             let required =
                 self.required_endpoints.is_empty() || self.required_endpoints.contains(&rtk_ep_num);
-            let started = rtk.as_mut().start_endpoint(rtk_ep_num).and_then(|()| {
-                let mut ep_guard = self.endpoints[ep].lock();
-                ep_guard.start(rtk.as_mut())?;
-                ep_guard.started = true;
-                Ok(())
-            });
+            let started = rtk
+                .as_mut()
+                .start_endpoint(rtk_ep_num)
+                .map_err(|e| (e, "RTKit endpoint start"))
+                .and_then(|()| {
+                    let mut ep_guard = self.endpoints[ep].lock();
+                    let mut init = ep_guard.start(rtk.as_mut());
+                    if init == Err(ETIMEDOUT) {
+                        // The mailbox stayed full for the whole send timeout,
+                        // so the request was never written. The firmware can
+                        // still be busy finishing its own boot: send it once
+                        // more, which checks the mailbox again first.
+                        dev_warn!(
+                            self.dev,
+                            "Endpoint {:#04x}: AFK init not sent (mailbox full); retrying",
+                            rtk_ep_num
+                        );
+                        init = ep_guard.start(rtk.as_mut());
+                    }
+                    init.map_err(|e| (e, "AFK init"))?;
+                    ep_guard.started = true;
+                    Ok(())
+                });
             match started {
                 Ok(()) => {}
-                Err(e) if !required => {
+                Err((e, step)) if !required => {
                     dev_warn!(
                         self.dev,
-                        "Endpoint {:#04x} did not start ({:?}); skipping it",
+                        "Endpoint {:#04x} did not start ({}: {:?}); skipping it",
                         rtk_ep_num,
+                        step,
                         e
                     );
                 }
-                Err(e) => return Err(e),
+                Err((e, step)) => {
+                    dev_err!(
+                        self.dev,
+                        "Endpoint {:#04x} did not start ({}: {:?})",
+                        rtk_ep_num,
+                        step,
+                        e
+                    );
+                    return Err(e);
+                }
             }
         }
         Ok(())
@@ -1477,37 +1517,66 @@ impl AopData {
         }
     }
 
-    /// Shuts down every started endpoint, waiting a bounded time for each
-    /// acknowledgment. Returns the first error but still tries the rest.
+    /// Shuts down every started endpoint. All the shutdown requests go out
+    /// first, then the acknowledgments are collected against one deadline:
+    /// a firmware that stopped answering costs one timeout, not one per
+    /// endpoint. Returns the first error but still tries the rest.
     fn stop(&self) -> Result<()> {
         let mut ret = Ok(());
+        let mut sent = 0u32;
+        let mut mailbox_stuck = false;
         for ep in 0..AFK_ENDPOINT_COUNT as usize {
-            {
-                let mut guard = self.rtkit.lock();
-                let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
-                let mut ep_guard = self.endpoints[ep].lock();
-                if !ep_guard.started {
-                    continue;
-                }
-                // Whatever happens below, the endpoint is not started again.
-                ep_guard.started = false;
-                self.ep_shutdown[ep].reset();
-                if let Err(e) = ep_guard.stop(rtk.as_mut()) {
-                    ret = ret.and(Err(e));
-                    continue;
-                }
+            let mut guard = self.rtkit.lock();
+            let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+            let mut ep_guard = self.endpoints[ep].lock();
+            if !ep_guard.started {
+                continue;
             }
-            if self.ep_shutdown[ep]
-                .wait_timeout(AFK_SHUTDOWN_TIMEOUT_MS)
-                .is_none()
-            {
-                dev_warn!(
-                    self.dev,
-                    "Endpoint {:#04x} did not acknowledge its shutdown",
-                    AFK_ENDPOINT_START + ep as u8
-                );
+            // Whatever happens below, the endpoint is not started again.
+            ep_guard.started = false;
+            self.ep_shutdown[ep].reset();
+            // Once a request found the mailbox full for the whole send
+            // timeout, the firmware is not reading it; do not wait again for
+            // every remaining endpoint.
+            if mailbox_stuck {
                 ret = ret.and(Err(ETIMEDOUT));
+                continue;
             }
+            match ep_guard.stop(rtk.as_mut()) {
+                Ok(()) => sent |= 1 << ep,
+                Err(e) => {
+                    dev_warn!(
+                        self.dev,
+                        "Endpoint {:#04x}: shutdown not sent ({:?})",
+                        AFK_ENDPOINT_START + ep as u8,
+                        e
+                    );
+                    mailbox_stuck = e == ETIMEDOUT;
+                    ret = ret.and(Err(e));
+                }
+            }
+        }
+        let mut left = msecs_to_jiffies(AFK_SHUTDOWN_TIMEOUT_MS);
+        let mut missing = 0u32;
+        for ep in 0..AFK_ENDPOINT_COUNT as usize {
+            if sent & (1 << ep) == 0 {
+                continue;
+            }
+            let (acked, rest) = self.ep_shutdown[ep].wait_jiffies(left);
+            left = rest;
+            if acked.is_none() {
+                missing |= 1 << ep;
+            }
+        }
+        if missing != 0 {
+            dev_warn!(
+                self.dev,
+                "Endpoints did not acknowledge their shutdown within {} ms (mask {:#x}, bit 0 = endpoint {:#04x})",
+                AFK_SHUTDOWN_TIMEOUT_MS,
+                missing,
+                AFK_ENDPOINT_START
+            );
+            ret = ret.and(Err(ETIMEDOUT));
         }
         ret
     }
@@ -1576,8 +1645,8 @@ impl AopData {
         if res.end < res.start {
             return Err(EINVAL);
         }
-        let phys = res.start as u64;
-        let size = (res.end - res.start) as u64 + 1;
+        let phys = res.start;
+        let size = res.end - res.start + 1;
 
         let mut len: c_int = 0;
         // SAFETY: `region` is a valid node and the name is NUL-terminated.
@@ -1712,8 +1781,7 @@ impl AopData {
             while off < size {
                 // SAFETY: `domain` is the device's domain, live while it is
                 // bound.
-                let back =
-                    unsafe { bindings::iommu_iova_to_phys(domain, (iova + off) as _) } as u64;
+                let back = unsafe { bindings::iommu_iova_to_phys(domain, iova + off) };
                 if back != phys + off {
                     dev_err!(
                         dev,
