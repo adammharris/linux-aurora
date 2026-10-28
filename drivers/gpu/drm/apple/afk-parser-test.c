@@ -89,7 +89,22 @@ static void afk_reply_index_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pending->retcode, 7U);
 }
 
+static void afk_serialized_report_test(struct kunit *test)
+{
+	u8 dictionary[8] = {};
+	unsigned int length;
+
+	put_unaligned_le32(0xd3, dictionary);
+	put_unaligned_le32(1U << 24, dictionary + 4);
+	for (length = 0; length < sizeof(dictionary); length++)
+		KUNIT_EXPECT_FALSE(test, afk_compact_report_dictionary(dictionary, length));
+	KUNIT_EXPECT_TRUE(test, afk_compact_report_dictionary(dictionary, sizeof(dictionary)));
+	put_unaligned_le32(0, dictionary);
+	KUNIT_EXPECT_FALSE(test, afk_compact_report_dictionary(dictionary, sizeof(dictionary)));
+}
+
 static struct kunit_case afk_parser_cases[] = {
+	KUNIT_CASE(afk_serialized_report_test),
 	KUNIT_CASE(afk_compact_header_test),
 	KUNIT_CASE(afk_short_epic_test),
 	KUNIT_CASE(afk_short_reply_test),

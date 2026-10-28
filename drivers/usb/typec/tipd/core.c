@@ -290,6 +290,11 @@ static int tps6598x_connect(struct tps6598x *tps, u32 status)
 
 static void tps6598x_drop_partner(struct tps6598x *tps, u32 status)
 {
+	if (tps->partner_altmode_dp) {
+		typec_altmode_update_active(tps->partner_altmode_dp, false);
+		typec_unregister_altmode(tps->partner_altmode_dp);
+		tps->partner_altmode_dp = NULL;
+	}
 	if (!IS_ERR(tps->partner))
 		typec_unregister_partner(tps->partner);
 	tps->partner = NULL;
@@ -1171,6 +1176,11 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* Process partner disconnection or change */
 	if (!new_connected || partner_changed) {
+		if (tps->partner_altmode_dp) {
+			typec_altmode_update_active(tps->partner_altmode_dp, false);
+			typec_unregister_altmode(tps->partner_altmode_dp);
+			tps->partner_altmode_dp = NULL;
+		}
 		if (!IS_ERR(tps->partner))
 			typec_unregister_partner(tps->partner);
 		tps->partner = NULL;
@@ -1244,6 +1254,29 @@ static void cd321x_update_work(struct work_struct *work)
 		if (desc.identity)
 			typec_partner_set_identity(tps->partner);
 	}
+
+	/* The CD321x firmware owns VDM discovery and Enter Mode. Publish the
+	 * discovered DP mode only after it reports an entered DP connection;
+	 * keep Linux's DP Alt Mode driver from issuing a second Enter Mode.
+	 */
+	if (dp_connected && !tps->partner_altmode_dp) {
+		struct typec_altmode_desc desc = {
+			.svid = USB_TYPEC_DP_SID,
+			.mode = USB_TYPEC_DP_MODE,
+			.vdo = le32_to_cpu(st.dp_sid_status.mode_data),
+			.mode_selection = true,
+		};
+
+		tps->partner_altmode_dp = typec_partner_register_altmode(tps->partner,
+								   &desc);
+		if (IS_ERR(tps->partner_altmode_dp)) {
+			ret = PTR_ERR(tps->partner_altmode_dp);
+			tps->partner_altmode_dp = NULL;
+			goto retry;
+		}
+	}
+	if (tps->partner_altmode_dp)
+		typec_altmode_update_active(tps->partner_altmode_dp, dp_connected);
 
 	/* Update the TypeC MUX/PHY state */
 	if (dp_route_was_active && dp_connected && !was_disconnected && !dp_mode_changed &&
@@ -1997,7 +2030,8 @@ static int cd321x_register_port_altmodes(struct cd321x *cd321x)
 	memset(&desc, 0, sizeof(desc));
 	desc.svid = USB_TYPEC_DP_SID;
 	desc.mode = USB_TYPEC_DP_MODE;
-	desc.vdo = DP_CONF_SET_PIN_ASSIGN(BIT(DP_PIN_ASSIGN_C) | BIT(DP_PIN_ASSIGN_D));
+	desc.vdo = DP_CONF_SET_PIN_ASSIGN(BIT(DP_PIN_ASSIGN_C) |
+					   BIT(DP_PIN_ASSIGN_D) | BIT(DP_PIN_ASSIGN_E));
 	desc.vdo |= DP_CAP_DFP_D;
 	amode = typec_port_register_altmode(cd321x->tps.port, &desc);
 	if (IS_ERR(amode))
@@ -2111,6 +2145,7 @@ EXPORT_SYMBOL_IF_KUNIT(cd321x_init_work);
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
+	struct fwnode_handle *connector_fwnode;
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	int ret;
 
@@ -2130,9 +2165,12 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		goto err_unregister_altmodes;
 	}
 
-	cd321x->connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
-	if (IS_ERR(cd321x->connector_fwnode))
-		cd321x->connector_fwnode = NULL;
+	if (fwnode_property_present(fwnode, "displayport"))
+		connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
+	else
+		connector_fwnode = fwnode_handle_get(fwnode);
+	if (!IS_ERR_OR_NULL(connector_fwnode))
+		cd321x->connector_fwnode = connector_fwnode;
 
 	cd321x->tbt_switch = cd321x_tbt_switch_get(tps->dev, fwnode);
 	if (IS_ERR(cd321x->tbt_switch)) {

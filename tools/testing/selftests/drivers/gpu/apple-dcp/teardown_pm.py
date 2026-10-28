@@ -94,7 +94,8 @@ static struct xhci_hcd xhci_context;
 #define hcd_to_xhci(h) (&xhci_context)
 struct dwc3 { bool sys_wakeup; struct platform_device *xhci; };
 enum { DWC3_APPLE_PROBE_PENDING, DWC3_APPLE_NO_CABLE, DWC3_APPLE_HOST, DWC3_APPLE_DEVICE };
-struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; };
+/* pre_core_rpm is T8132 only: runtime PM before the first core probe; never set here. */
+struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool pre_core_rpm; };
 static struct dwc3_apple apple_context;
 #define to_dwc3_apple(d) container_of(d,struct dwc3_apple,dwc)
 static bool inside_host_remove;

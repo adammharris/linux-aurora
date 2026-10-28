@@ -89,6 +89,9 @@ fn main(){
   reset(mode);let pool=new_pool(false,2);
   assert!(matches!(pool.acquire_render(1,None,2_000_000_000,||Ok(())),Err(EIO)));
   assert!(NOW.load(Ordering::SeqCst)<=1_010_000_000,"quarantine budget extended");
+  reset(mode);let pool=new_pool(false,2);pool.state.lock().spared=2;
+  assert!(matches!(pool.acquire_render(1,None,2_000_000_000,||Ok(())),Err(EBUSY)));
+  assert!(NOW.load(Ordering::SeqCst)<=1_010_000_000,"spared quarantine budget extended");
  }
  reset(2);let pool=new_pool(true,0);
  assert!(matches!(pool.acquire_render(1,Some(Request(&())),2_000_000_000,||Ok(())),Err(ERESTARTSYS)));

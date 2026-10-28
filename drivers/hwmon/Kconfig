@@ -1252,10 +1252,13 @@ config SENSORS_MACSMC_HWMON_KUNIT_TEST
 	depends on SENSORS_MACSMC_HWMON && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
-	  Unit tests for the channel numbering of the Apple SMC hwmon driver.
+	  Unit tests for the channel numbering and the manual fan control of
+	  the Apple SMC hwmon driver.
 	  Thermal zones refer to temperature channels by index, so a sensor
 	  that cannot be set up must keep its channel; the tests check that.
-	  No SMC is needed. Only useful for kernel developers.
+	  No SMC is needed: the fan tests model its fan keys and need
+	  MFD_MACSMC_KUNIT_TEST for its read and write stubs. Only useful for
+	  kernel developers.
 
 config SENSORS_MAX1111
 	tristate "Maxim MAX1111 Serial 8-bit ADC chip and compatibles"

@@ -11,6 +11,10 @@
 #include "dcp-metadata-epoch.h"
 
 struct apple_dcp;
+int parse_panel_edid_data(const void *blob, size_t len, const u8 **edid, size_t *size);
+typedef void (*dcp_identity_key_fn)(void *data, const char *key, u32 key_len,
+				    u32 type, u32 size, u32 depth);
+int parse_identity_keys(const void *blob, size_t len, dcp_identity_key_fn emit, void *data);
 struct apple_connector;
 struct apple_dcp_typec_route;
 
@@ -21,6 +25,14 @@ struct dcp_parse_ctx {
 	/* External H17P candidates require separate publication/lookup proof. */
 	bool automatic_1080p180_rgb8;
 	bool ambiguous_180hz;
+	/* Desktop 26.6 uses zero placeholders for an unreported VRR range. */
+	bool zero_vrr_range_fallback;
+	/*
+	 * A desktop 26.x external processor: read the sink timing keys that
+	 * describe the preferred timing for the firmware-derived EDID, without
+	 * the H17P external color policy.
+	 */
+	bool metadata_timing;
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/*
 	 * T6030 external processor audio elements (DCP firmware 14.7, external
@@ -120,10 +132,14 @@ struct dcp_display_mode {
 	struct dcp_color_mode sdr;
 	struct dcp_color_mode best;
 	bool vrr;
+	/* ProMotion fixed timings still need presentation deadlines. */
+	bool needs_timestamps;
 	/* IsPreferred, outside the external SDR path */
 	bool preferred;
 	bool metadata_timing_valid;
 	bool automatic_rgb8_quirk;
+	/* The sync polarity flags of the timing, if it reports them */
+	u32 metadata_sync_flags;
 	/*
 	 * The best virtual color element of the timing, which the desktop
 	 * 26.x firmware selects first to bootstrap its generic pipe (valid if
@@ -192,6 +208,9 @@ int replace_modes(struct dcp_parse_ctx *handle,
 		  struct dcp_display_mode **modes, unsigned int *count,
 		  int width_mm, int height_mm, unsigned int notch_height,
 		  bool internal);
+int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out);
+int parse_panel_product_metadata(struct dcp_parse_ctx *handle,
+				 struct dcp_display_metadata *out);
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			     int *height_mm, bool *backlight_control);
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,

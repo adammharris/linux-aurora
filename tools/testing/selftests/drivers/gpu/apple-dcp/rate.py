@@ -48,6 +48,8 @@ def parser_fixture(root):
     metadata = block(metadata, 'struct dcp_display_metadata {') + ';\n'
     header = (base / 'parser.h').read_text()
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
+    refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')
+    header = refresh + '\n' + header
     # Header helpers stay header-like: unused here, as in any includer.
     header = header.replace('static inline ', 'static inline __attribute__((unused)) ')
     edid_header = (root / 'include/drm/drm_edid.h').read_text()
@@ -142,6 +144,15 @@ typedef u32 __le32;
 #define mul_u32_u32(a, b) ((u64)(u32)(a) * (u32)(b))
 #define DIV_ROUND_CLOSEST_ULL(n, d) (((n) + (d) / 2) / (d))
 #define DIV_ROUND_CLOSEST(n, d) (((n) + (d) / 2) / (d))
+#ifndef min
+#define min(a,b) ((a)<(b)?(a):(b))
+#endif
+#ifndef max
+#define max(a,b) ((a)>(b)?(a):(b))
+#endif
+#define max_t(t,a,b) max((t)(a),(t)(b))
+#define div_u64(n,d) ((n)/(d))
+#define DIV_ROUND_UP_ULL(n,d) (((u64)(n)+(d)-1)/(d))
 #define trace_iomfb_color_mode(...) ((void)0)
 #define trace_iomfb_parse_mode_fail(...) ((void)0)
 #define trace_iomfb_parse_mode_success(...) ((void)0)
@@ -360,7 +371,10 @@ def policy(root):
     callback_types = '\n'.join(block(dptx, marker)+' __packed;' for marker in ('struct dptxport_apcall_link_rate {', 'struct dptxport_apcall_set_active_lane_count {'))
     callback = block(dptx, 'static int dptxport_call_link_config(')
     dcp = (base/'dcp.c').read_text()
-    connection = '\n'.join(block(dcp, marker) for marker in (
+    # The modelled DCP is the H17P external one, never a desktop 26.x processor.
+    connection = 'static bool dcp_sink_metadata(struct apple_dcp *d) { (void)d; return false; }\n' + \
+        'static void dcp_desktop_metadata_new_sink(struct apple_dcp *d) { (void)d; assert(0); }\n' + \
+        '\n'.join(block(dcp, marker) for marker in (
         'void dcp_firmware_metadata_connection(', 'static void dcp_firmware_metadata_present_locked(',
         'static void dcp_announce_kick(', 'void dcp_firmware_metadata_announced(',
         'void dcp_firmware_metadata_hotplug('))
@@ -636,6 +650,12 @@ static int drm_edid_connector_update(struct drm_connector *c,const struct drm_ed
 }
 static const struct drm_edid *dcp_firmware_edid(struct apple_dcp *d,u64 *generation) { (void)d; (void)generation; return ERR_PTR(-ENODATA); }
 static bool dcp_firmware_metadata_current(struct apple_dcp *d,u64 generation) { (void)d; (void)generation; return false; }
+static const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *d,const struct dcp_display_mode *m,unsigned n,u64 *generation) { (void)d;(void)m;(void)n;(void)generation;assert(!"panel identity in external fixture");return ERR_PTR(-ENODATA); }
+static bool dcp_panel_metadata_current(struct apple_dcp *d,u64 generation) { (void)d;(void)generation;assert(!"panel identity in external fixture");return false; }
+static void dcp_panel_metadata_replace(struct apple_dcp *d,const struct dcp_display_metadata *m) { (void)d;(void)m;assert(!"panel identity in external receipt"); }
+static void dcp_panel_edid_receive(struct apple_dcp *d,const void *p,size_t n) { (void)d;(void)p;(void)n;assert(!"panel EDID in external receipt"); }
+#define dcp_trace_panel_property(...) ((void)0)
+
 static struct drm_display_mode *drm_mode_duplicate(struct drm_device *dev,const struct drm_display_mode *m) {
     assert(dev->mode_config.mutex);struct drm_display_mode *copy=malloc(sizeof(*copy));assert(copy);*copy=*m;
     if(invalidate_during_duplicate) { invalidate_during_duplicate=false;dcp_180hz_invalidate(probing); }
@@ -677,8 +697,11 @@ static void disable_work_sync(struct work_struct *w) { (void)w; }
 #define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
 #define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
 #endif
-/* Nor the desktop 26.6 firmware, the one that withholds VRR modes. */
+/* Nor the desktop 26.6 firmware. */
 #define DCP_FIRMWARE_V_26_6_DESKTOP (DCP_FIRMWARE_H17P + 3)
+#define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
+static void dcp_update_connector_dimensions(struct apple_dcp *d,struct drm_connector *c)
+{ (void)c;assert(d->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP); }
 '''+firmware_lineage(root)+internal_inline(root,'dcp_fw_is_14_7')+r'''/* Off T6030 machines the direct crossbar output is not clocked separately. */
 static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,bool up) { (void)d;(void)up;return 0; }
 '''
@@ -700,7 +723,9 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
                     + ''.join(apple_function(root, name) for name in ('dcp_queue_hotplug', 'dcp_modes_for_connector',
                               'apple_connector_invalidate_edid', 'apple_connector_edid_set_live'))
                     + mode_helpers)
-    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+block(iomfb,'static bool dcp_mode_vrr_supported(')+'\n'+block(iomfb,'int dcp_get_modes(')+block(iomfb,re.search(r'^[^\n;(]*\blookup_mode\(',iomfb,re.M).start())
+    # The desktop 26.6 VRR filter is gone once that firmware takes adaptive sync.
+    vrr_filter = block(iomfb,'static bool dcp_mode_vrr_supported(')+'\n' if 'static bool dcp_mode_vrr_supported(' in iomfb else ''
+    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+vrr_filter+block(iomfb,'int dcp_get_modes(')+block(iomfb,'bool lookup_mode(')
     # Drive malformed replacements through the same chunk/end ingress as firmware.
     # The dictionary cache is a boundary substitute and takes ownership of the blob.
     receipt = r'''

@@ -103,7 +103,7 @@ def resources(ROOT):
       puts("PASS successful DCP finalizer is not repeated after a later provider failure");return 0;
      }
      if(argv[1][0]=='h')hw_failures=1;
-     if(argv[1][0]=='f') {display.fixed_connector_type=2;display.hdmi_hpd=(void *)1;gpio_level=1;display.xbar=&fixed_xbar;fixed_restore_failures=1;}
+     if(argv[1][0]=='f') {display.fixed_connector_type=2;display.hdmi_hpd=(void *)1;gpio_level=1;display.xbar=display.fixed_xbar=&fixed_xbar;fixed_restore_failures=1;}
      assert(typec_mux_set(&mux,&safe)==-EIO&&xbar.lock==1&&port.owner==&route&&port.safe_pending&&!port.safe_finish_ready);
      bool selected_after_error=route.selected;
      int ret=typec_mux_set(&mux,&safe);

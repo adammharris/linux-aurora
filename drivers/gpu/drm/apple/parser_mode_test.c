@@ -7,6 +7,7 @@
 #include <linux/bits.h>
 
 #include "parser.h"
+#include "dcp-refresh.h"
 
 struct dcp_mode_rank_case {
 	const char *desc;
@@ -40,7 +41,34 @@ static void dcp_mode_rank_test(struct kunit *test)
 			c->above);
 }
 
+static void dcp_refresh_range_test(struct kunit *test)
+{
+	u32 low = 0, high = 0;
+
+	KUNIT_EXPECT_TRUE(test, dcp_refresh_range(120U << 16, 0, 0,
+						  true, &low, &high));
+	KUNIT_EXPECT_EQ(test, low, 24U << 16);
+	KUNIT_EXPECT_EQ(test, high, 120U << 16);
+	KUNIT_EXPECT_FALSE(test, dcp_refresh_range(60U << 16, 0, 0,
+						   true, &low, &high));
+	KUNIT_EXPECT_FALSE(test, dcp_refresh_range(120U << 16, 0, 0,
+						   false, &low, &high));
+	KUNIT_EXPECT_FALSE(test, dcp_refresh_range(120U << 16, 0, 120U << 16,
+						   true, &low, &high));
+	KUNIT_EXPECT_FALSE(test, dcp_refresh_range(120U << 16, 24U << 16,
+						   144U << 16, true, &low, &high));
+	KUNIT_EXPECT_FALSE(test, dcp_refresh_range(120U << 16, 120U << 16,
+						   24U << 16, true, &low, &high));
+	KUNIT_EXPECT_TRUE(test, dcp_refresh_range(120U << 16, 48U << 16,
+						  120U << 16, true, &low, &high));
+	KUNIT_EXPECT_EQ(test, low, 48U << 16);
+	KUNIT_EXPECT_EQ(test, dcp_desktop_present_deadline(true, true), 120ULL);
+	KUNIT_EXPECT_EQ(test, dcp_desktop_present_deadline(false, true), 0ULL);
+	KUNIT_EXPECT_EQ(test, dcp_desktop_present_deadline(true, false), 0ULL);
+}
+
 static struct kunit_case dcp_mode_rank_test_cases[] = {
+	KUNIT_CASE(dcp_refresh_range_test),
 	KUNIT_CASE_PARAM(dcp_mode_rank_test, dcp_mode_rank_gen_params),
 	{}
 };

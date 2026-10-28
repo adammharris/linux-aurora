@@ -23,12 +23,15 @@
 #include <linux/bitfield.h>
 #include <linux/ctype.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/hwmon.h>
 #include <linux/math64.h>
 #include <linux/mfd/macsmc.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
@@ -189,10 +192,30 @@ struct macsmc_hwmon_sensors {
 	u32 count;
 };
 
+/* Fan mode key values */
+#define MACSMC_FAN_MODE_AUTO	0
+#define MACSMC_FAN_MODE_MANUAL	1
+/* The firmware's own fan policy; it refuses a manual mode request. */
+#define MACSMC_FAN_MODE_SYSTEM	3
+
+/* How long the firmware gets to leave or re-enter its system mode */
+#define MACSMC_FAN_MODE_TIMEOUT_MS	10000
+#define MACSMC_FAN_MODE_POLL_MS		100
+
 struct macsmc_hwmon_fans {
 	struct hwmon_channel_info channel_info;
 	struct macsmc_hwmon_fan *fans;
 	u32 count;
+	/* Serialises manual fan control and its unlock. */
+	struct mutex lock;
+	/*
+	 * Firmware that keeps its fans in system mode releases them to the
+	 * OS only while this key is 1. Zero if the SMC has no such key.
+	 */
+	smc_key unlock_key;
+	bool unlocked;
+	/* Fans in manual mode */
+	u32 manual;
 };
 
 struct macsmc_hwmon {
@@ -466,55 +489,197 @@ static int macsmc_hwmon_read_fan(struct macsmc_hwmon *hwmon, u32 attr, int chan,
 	}
 }
 
-static int macsmc_hwmon_write_fan(struct device *dev, u32 attr, int channel,
-				  long val)
+static int macsmc_hwmon_fan_read_mode(struct macsmc_hwmon *hwmon,
+				      struct macsmc_hwmon_fan *fan, u8 *mode)
 {
-	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
+	return apple_smc_read_u8(hwmon->smc, fan->mode.macsmc_key, mode);
+}
+
+/*
+ * Hand the fans back to the firmware once no fan is manual: clear the unlock
+ * key and wait for every fan to return to system mode. Called with the fan
+ * lock held.
+ */
+static int macsmc_hwmon_fans_relock(struct macsmc_hwmon *hwmon)
+{
+	unsigned long timeout;
+	u32 i;
+	u8 mode;
+	int ret;
+
+	ret = apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 0);
+	if (ret < 0) {
+		dev_err(hwmon->dev, "cannot hand the fans back to the SMC (%d)\n", ret);
+		return ret;
+	}
+	hwmon->fan.unlocked = false;
+
+	timeout = jiffies + msecs_to_jiffies(MACSMC_FAN_MODE_TIMEOUT_MS);
+	for (i = 0; i < hwmon->fan.count; i++) {
+		struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[i];
+
+		if (!fan->mode.macsmc_key)
+			continue;
+		for (;;) {
+			ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
+			if (ret)
+				return ret;
+			if (mode == MACSMC_FAN_MODE_SYSTEM)
+				break;
+			if (time_after(jiffies, timeout)) {
+				dev_warn(hwmon->dev, "%s stays in mode %u after release\n",
+					 fan->label, mode);
+				return -ETIMEDOUT;
+			}
+			msleep(MACSMC_FAN_MODE_POLL_MS);
+		}
+	}
+
+	return 0;
+}
+
+/* Return a fan to firmware control. Called with the fan lock held. */
+static int macsmc_hwmon_fan_auto(struct macsmc_hwmon *hwmon,
+				 struct macsmc_hwmon_fan *fan)
+{
+	int ret, relock;
+
+	if (!fan->manual)
+		return 0;
+
+	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_AUTO);
+	fan->manual = false;
+	hwmon->fan.manual--;
+
+	if (hwmon->fan.unlocked && !hwmon->fan.manual) {
+		relock = macsmc_hwmon_fans_relock(hwmon);
+		if (relock)
+			return relock;
+	}
+
+	return ret < 0 ? ret : 0;
+}
+
+/*
+ * Put a fan in manual mode. Firmware in system mode refuses that until the
+ * unlock key is set; it then leaves system mode and accepts the request.
+ * Called with the fan lock held.
+ */
+static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
+				   struct macsmc_hwmon_fan *fan)
+{
+	unsigned long timeout;
+	u8 mode;
+	int ret;
+
+	if (fan->manual)
+		return 0;
+
+	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_MANUAL);
+	if (ret < 0 && hwmon->fan.unlock_key && !hwmon->fan.unlocked &&
+	    !macsmc_hwmon_fan_read_mode(hwmon, fan, &mode) &&
+	    mode == MACSMC_FAN_MODE_SYSTEM) {
+		ret = apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 1);
+		if (ret < 0) {
+			/* The key may have been set anyway; clear it. */
+			apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 0);
+			return ret;
+		}
+		hwmon->fan.unlocked = true;
+
+		/* Ask again once the fan has left system mode. */
+		timeout = jiffies + msecs_to_jiffies(MACSMC_FAN_MODE_TIMEOUT_MS);
+		for (;;) {
+			ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
+			if (!ret && mode == MACSMC_FAN_MODE_SYSTEM)
+				ret = -EBUSY;
+			else if (!ret)
+				ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode,
+							     MACSMC_FAN_MODE_MANUAL);
+			if (ret >= 0 || time_after(jiffies, timeout))
+				break;
+			msleep(MACSMC_FAN_MODE_POLL_MS);
+		}
+		if (ret < 0) {
+			dev_err(hwmon->dev, "%s refused manual mode after unlock (%d)\n",
+				fan->label, ret);
+			if (!hwmon->fan.manual)
+				macsmc_hwmon_fans_relock(hwmon);
+			return ret;
+		}
+	}
+	if (ret < 0)
+		return ret;
+
+	fan->manual = true;
+	hwmon->fan.manual++;
+	return 0;
+}
+
+static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long val)
+{
+	struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[channel];
 	long min, max;
 	int ret;
 
-	if (!fan_control || hwmon->fan.fans[channel].mode.macsmc_key == 0)
+	if (!fan_control || fan->mode.macsmc_key == 0)
 		return -EOPNOTSUPP;
+	if (val < 0)
+		return -EINVAL;
+
+	guard(mutex)(&hwmon->fan.lock);
+
+	/* 0 hands the fan back to the firmware. */
+	if (!val)
+		return macsmc_hwmon_fan_auto(hwmon, fan);
 
 	/*
 	 * The SMC does no sanity checks on requested fan speeds, so we need to.
 	 */
-	ret = macsmc_hwmon_read_key(hwmon->smc, &hwmon->fan.fans[channel].min,
-				    1, &min);
+	ret = macsmc_hwmon_read_key(hwmon->smc, &fan->min, 1, &min);
 	if (ret)
 		return ret;
 
-	ret = macsmc_hwmon_read_key(hwmon->smc, &hwmon->fan.fans[channel].max,
-				    1, &max);
+	ret = macsmc_hwmon_read_key(hwmon->smc, &fan->max, 1, &max);
 	if (ret)
 		return ret;
 
-	if (val >= min && val <= max) {
-		if (!hwmon->fan.fans[channel].manual) {
-			/* Write 1 to mode key for manual control */
-			ret = macsmc_hwmon_write_key(hwmon->smc,
-						     &hwmon->fan.fans[channel].mode, 1);
-			if (ret < 0)
-				return ret;
+	if (min <= 0 || max < min)
+		return -EIO;
+	val = clamp(val, min, max);
 
-			hwmon->fan.fans[channel].manual = true;
-		}
-		return macsmc_hwmon_write_key(hwmon->smc,
-					      &hwmon->fan.fans[channel].set, val);
-	} else if (!val) {
-		if (hwmon->fan.fans[channel].manual) {
-			ret = macsmc_hwmon_write_key(hwmon->smc,
-						     &hwmon->fan.fans[channel].mode, 0);
-			if (ret < 0)
-				return ret;
+	ret = macsmc_hwmon_fan_manual(hwmon, fan);
+	if (ret)
+		return ret;
 
-			hwmon->fan.fans[channel].manual = false;
-		}
-	} else {
-		return -EINVAL;
+	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->set, val);
+	if (ret < 0) {
+		macsmc_hwmon_fan_auto(hwmon, fan);
+		return ret;
 	}
 
 	return 0;
+}
+
+static int macsmc_hwmon_write_fan(struct device *dev, u32 attr, int channel,
+				  long val)
+{
+	return macsmc_hwmon_set_fan(dev_get_drvdata(dev), channel, val);
+}
+
+/* Hand every manual fan back to the firmware. */
+static void macsmc_hwmon_fans_restore(struct macsmc_hwmon *hwmon)
+{
+	u32 i;
+
+	guard(mutex)(&hwmon->fan.lock);
+	for (i = 0; i < hwmon->fan.count; i++)
+		macsmc_hwmon_fan_auto(hwmon, &hwmon->fan.fans[i]);
+}
+
+static void macsmc_hwmon_fans_restore_action(void *data)
+{
+	macsmc_hwmon_fans_restore(data);
 }
 
 static int macsmc_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
@@ -1343,6 +1508,11 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 	hwmon->dev = &pdev->dev;
 	hwmon->smc = smc;
 	hwmon->register_thermal_zones = true;
+	platform_set_drvdata(pdev, hwmon);
+
+	ret = devm_mutex_init(&pdev->dev, &hwmon->fan.lock);
+	if (ret)
+		return ret;
 
 	ret = macsmc_hwmon_populate_sensors(hwmon, hwmon->dev->of_node);
 	if (ret) {
@@ -1371,6 +1541,21 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 	ret = macsmc_hwmon_create_infos(hwmon);
 	if (ret)
 		return ret;
+
+	if (hwmon->fan.count) {
+		struct apple_smc_key_info info;
+
+		if (!apple_smc_get_key_info(smc, SMC_KEY(Ftst), &info) &&
+		    info.type_code == __SMC_KEY('u', 'i', '8', ' ') &&
+		    (info.flags & APPLE_SMC_WRITABLE))
+			hwmon->fan.unlock_key = SMC_KEY(Ftst);
+
+		/* Runs after the hwmon device is gone, so no write races it. */
+		ret = devm_add_action_or_reset(&pdev->dev,
+					       macsmc_hwmon_fans_restore_action, hwmon);
+		if (ret)
+			return ret;
+	}
 
 	hwmon->chip_info.ops = &macsmc_hwmon_ops;
 	hwmon->chip_info.info =
@@ -1407,11 +1592,29 @@ static const struct of_device_id macsmc_hwmon_of_table[] = {
 };
 MODULE_DEVICE_TABLE(of, macsmc_hwmon_of_table);
 
+static void macsmc_hwmon_shutdown(struct platform_device *pdev)
+{
+	struct macsmc_hwmon *hwmon = platform_get_drvdata(pdev);
+
+	if (hwmon)
+		macsmc_hwmon_fans_restore(hwmon);
+}
+
+static int macsmc_hwmon_suspend(struct device *dev)
+{
+	macsmc_hwmon_fans_restore(dev_get_drvdata(dev));
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(macsmc_hwmon_pm_ops, macsmc_hwmon_suspend, NULL);
+
 static struct platform_driver macsmc_hwmon_driver = {
 	.probe = macsmc_hwmon_probe,
+	.shutdown = macsmc_hwmon_shutdown,
 	.driver = {
 		.name = "macsmc-hwmon",
 		.of_match_table = macsmc_hwmon_of_table,
+		.pm = pm_sleep_ptr(&macsmc_hwmon_pm_ops),
 	},
 };
 module_platform_driver(macsmc_hwmon_driver);

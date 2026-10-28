@@ -80,6 +80,10 @@ static int dcp_dptx_disconnect_oob(void *dev,u32 index) { (void)dev;assert(index
 static struct drm_device *dcp_typec_drm(void) { return NULL; }
 static void dcp_typec_plan(struct drm_device *d,struct apple_dcp_typec_port *p,unsigned n) { (void)d;(void)p;(void)n; }
 static bool dcp_typec_tunnel_held(struct apple_dcp *d) { (void)d;return false; }
+/* The desktop 26.6 (T6041) Type-C path is not under test: nothing here is on that firmware. */
+#define DCP_FIRMWARE_V_26_6_DESKTOP 100
+static void __attribute__((unused)) dcp_typec_route_phy_off(struct apple_dcp_typec_route *r)
+{ (void)r; /* never powered: the real one returns at once */ }
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *r) { deactivate_calls++;r->selected=false;return 0; }
 static void dcp_typec_port_attach(struct apple_dcp_typec_port *p) { (void)p; }
 static int gpiod_get_value_cansleep(void *p) { (void)p;return 0; }

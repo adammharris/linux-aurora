@@ -30,6 +30,8 @@
 
 /* used to limit the user space buffers to the buffer_pool_config */
 #define ISP_MAX_BUFFERS 16
+#define ISP_MAX_SENSOR_CONFIGS 64
+#define ISP_SENSOR_CONFIG_SIZE 0x120
 
 /* capture metadata buffers, for firmware that has that pool */
 #define ISP_CAPMETA_BUFFERS 8
@@ -116,6 +118,8 @@ struct isp_channel {
 	void *virt;
 	u32 doorbell;
 	u32 cursor;
+	unsigned long deadline;
+	bool deadline_active;
 	struct mutex lock;
 	struct isp_message req;
 	struct isp_message rsp;
@@ -139,6 +143,8 @@ struct isp_preset {
 	struct coord output_dim;
 	struct coord crop_offset;
 	struct coord crop_size;
+	/* Processed P010 geometry established by preview or a config reply. */
+	bool p010;
 };
 
 struct apple_isp_hw {
@@ -255,9 +261,18 @@ enum isp_sensor_id {
 	ISP_VD56G0_6222_01,
 };
 
+struct isp_sensor_config {
+	struct coord input_dim;
+	struct coord output_dim;
+	u32 sensor_clk;
+	bool usable;
+	u8 reply[ISP_SENSOR_CONFIG_SIZE];
+};
+
 struct isp_format {
 	enum isp_sensor_id id;
 	u32 version;
+	u32 pixelformat;
 	struct isp_preset *preset;
 	unsigned int num_planes;
 	u32 strides[VB2_MAX_PLANES];
@@ -274,6 +289,9 @@ struct apple_isp {
 	u32 cam_connections_scheme;
 	struct isp_preset *presets;
 	int num_presets;
+	/* Read-only sensor configuration replies, cached before video registration. */
+	unsigned int num_sensor_configs;
+	struct isp_sensor_config *sensor_configs;
 
 	int num_channels;
 	struct isp_format fmts[ISP_MAX_CHANNELS];
@@ -287,7 +305,6 @@ struct apple_isp {
 	struct vb2_queue vbq;
 	struct mutex video_lock;
 	unsigned int sequence;
-	bool multiplanar;
 	/* capture rate in frames per second, changes under video_lock */
 	unsigned int frame_rate;
 
@@ -358,16 +375,25 @@ struct apple_isp {
 	spinlock_t buf_lock;
 	struct list_head bufs_pending;
 	struct list_head bufs_submitted;
+	struct list_head bufs_returned;
+	u64 buffer_tag;
+	unsigned long meta_returned;
+	/* A timed-out command leaves slot ownership ambiguous until reboot. */
+	bool ipc_failed;
 };
 
 struct isp_chan_ops {
 	int (*handle)(struct apple_isp *isp, struct isp_channel *chan);
+	/* Called after the response slot and its doorbell are published. */
+	void (*complete)(struct apple_isp *isp);
 };
 
 struct isp_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head link;
 	struct isp_surf surfs[VB2_MAX_PLANES];
+	u64 tag;
+	enum vb2_buffer_state return_state;
 };
 
 #define to_isp_buffer(x) container_of((x), struct isp_buffer, vb)
@@ -394,5 +420,37 @@ enum {
 #define isp_num_capmeta(isp) \
 	((isp)->hw->capture_meta_size ? ISP_CAPMETA_BUFFERS : 0)
 #define isp_get_current_format(isp) (isp_get_format(isp, isp->current_ch))
+
+static inline bool isp_supports_p010(struct apple_isp *isp)
+{
+	return isp->hw->gen == ISP_GEN_T6040 &&
+	       isp_get_current_format(isp)->version == 0x958;
+}
+
+static inline bool isp_has_p010(struct apple_isp *isp)
+{
+	if (!isp_supports_p010(isp))
+		return false;
+	for (int i = 0; i < isp->num_presets; i++) {
+		if (isp->presets[i].p010)
+			return true;
+	}
+	return false;
+}
+
+static inline bool isp_is_p010(struct apple_isp *isp)
+{
+	return isp_get_current_format(isp)->pixelformat == V4L2_PIX_FMT_P010;
+}
+
+static inline unsigned int isp_num_rendered(struct apple_isp *isp)
+{
+	return isp_is_p010(isp) ? 2 : ISP_MAX_BUFFERS;
+}
+
+static inline unsigned int isp_num_meta(struct apple_isp *isp)
+{
+	return isp_is_p010(isp) ? 8 : ISP_MAX_BUFFERS;
+}
 
 #endif /* __ISP_DRV_H__ */

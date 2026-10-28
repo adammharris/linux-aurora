@@ -61,7 +61,8 @@ impl DerefMut for Guard<'_>{fn deref_mut(&mut self)->&mut Self::Target{&mut self
 impl Drop for Guard<'_>{fn drop(&mut self){LOCKED.store(false,Ordering::SeqCst);}}
 struct State(Mutex<Option<Box<Firmware>>>);
 impl State{fn lock(&self)->Guard<'_>{let g=self.0.lock().unwrap();assert!(!LOCKED.swap(true,Ordering::SeqCst));Guard(g)}}
-struct Shared{state:State}
+struct Available; impl Available {fn notify(&self){}}
+struct Shared{state:State,channels:Available}
 impl Shared{fn queue_events(&self){}}
 struct Backend{shared:Arc<Shared>}
 impl Backend {
@@ -76,7 +77,7 @@ impl Backend {
  }
 }
 fn main(){
- let b=Backend{shared:Arc::new(Shared{state:State(Mutex::new(Some(Box::new(Firmware{queues:Registry}))))})};
+ let b=Backend{shared:Arc::new(Shared{state:State(Mutex::new(Some(Box::new(Firmware{queues:Registry})))),channels:Available})};
  b.finish_uninstalled_compute(None).unwrap();
  for _ in 0..512 {
   MAPPED.store(true,Ordering::SeqCst);RESERVED.store(true,Ordering::SeqCst);

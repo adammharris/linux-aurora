@@ -14,6 +14,7 @@
 #endif
 
 #include "parser.h"
+#include "dcp-refresh.h"
 #include "trace.h"
 
 #define DCP_PARSE_HEADER 0xd3
@@ -723,7 +724,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	struct timing_color_restrictions limits = {};
 	struct dcp_color_mode unsafe_rgb8 = { .score = -1 };
 	bool have_horiz = false, have_vert = false, have_virtual = false;
-	bool duplicate_scope = false;
+	bool duplicate_scope = false, vrr_ambiguous = false, vrr_fallback;
+	unsigned int vrr_seen = 0;
 	s64 min_vrr = 0, max_vrr = 0;
 	u64 clock;
 	s64 id = -1;
@@ -732,6 +734,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	bool preferred = false, interlaced = false;
 	bool have_preferred = false, have_interlaced = false;
 	bool is_preferred = false;
+	bool timing_keys = external_sdr || handle->metadata_timing;
 	struct drm_display_mode *mode = &out->mode;
 
 	*out = (struct dcp_display_mode) {
@@ -773,16 +776,20 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		else if (!strcmp(key, "HorizontalAttributes")) {
 			duplicate_scope |= have_horiz;
 			have_horiz = true;
-			ret = parse_dimension(it.handle, &horiz, external_sdr);
+			ret = parse_dimension(it.handle, &horiz, timing_keys || internal);
 		} else if (!strcmp(key, "VerticalAttributes")) {
 			duplicate_scope |= have_vert;
 			have_vert = true;
-			ret = parse_dimension(it.handle, &vert, external_sdr);
-		} else if (!strcmp(key, "MinimumVariableRefreshRate"))
+			ret = parse_dimension(it.handle, &vert, timing_keys || internal);
+		} else if (!strcmp(key, "MinimumVariableRefreshRate")) {
+			vrr_ambiguous |= !!(vrr_seen & 1);
+			vrr_seen |= 1;
 			ret = parse_int_bound(it.handle, &min_vrr, 0, U32_MAX);
-		else if (!strcmp(key, "MaximumVariableRefreshRate"))
+		} else if (!strcmp(key, "MaximumVariableRefreshRate")) {
+			vrr_ambiguous |= !!(vrr_seen & 2);
+			vrr_seen |= 2;
 			ret = parse_int_bound(it.handle, &max_vrr, 0, U32_MAX);
-		else if (!strcmp(key, "ColorModes"))
+		} else if (!strcmp(key, "ColorModes"))
 			ret = parse_color_modes(it.handle, out, external_sdr, &limits,
 					handle->automatic_1080p180_rgb8 ?
 					&unsafe_rgb8 : NULL);
@@ -792,13 +799,16 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			duplicate_scope |= have_virtual;
 			have_virtual = true;
 			ret = parse_bool(it.handle, &is_virtual);
-		} else if (external_sdr && !strcmp(key, "IsPreferred")) {
+		} else if (timing_keys && !strcmp(key, "IsPreferred")) {
 			if (have_preferred)
 				ret = -EINVAL;
 			else
 				ret = parse_bool(it.handle, &preferred);
 			have_preferred = true;
-		} else if (external_sdr && !strcmp(key, "IsInterlaced")) {
+			/* Outside the external SDR path it also ranks the timing. */
+			if (!external_sdr)
+				is_preferred = preferred;
+		} else if (timing_keys && !strcmp(key, "IsInterlaced")) {
 			if (have_interlaced)
 				ret = -EINVAL;
 			else
@@ -870,26 +880,16 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		return -EINVAL;
 
 	/*
-	 * An internal ProMotion panel carries no EDID or DisplayID, so DCP
-	 * reports no adaptive-sync range for it. Assume the ProMotion floor of
-	 * 24 Hz up to whatever rate the mode itself advertises.
+	 * External H17P stays fixed. Desktop zero placeholders are also an
+	 * absent range; a partial or duplicate pair must not enable fallback.
 	 */
-	if (internal && vert.precise_sync_rate >> 16 == 120) {
-		out->min_vrr = 24 << 16;
-		out->max_vrr = vert.precise_sync_rate;
-		out->vrr = true;
-	}
-
-	/*
-	 * Refresh rates are reported by DCP as 16.16 fixed-point Hz.
-	 * External H17P skips adaptive-sync programming: keep the fixed timing
-	 * available, but do not advertise its sink VRR range as driver support.
-	 */
-	if (!external_sdr && min_vrr && max_vrr > min_vrr) {
-		out->min_vrr = min_vrr;
-		out->max_vrr = max_vrr;
-		out->vrr = true;
-	}
+	vrr_fallback = !vrr_seen || (vrr_seen == 3 && handle->zero_vrr_range_fallback);
+	if (!external_sdr && !vrr_ambiguous)
+		out->vrr = dcp_refresh_range(vert.precise_sync_rate, min_vrr,
+					     max_vrr, internal && vrr_fallback,
+					     &out->min_vrr, &out->max_vrr);
+	out->needs_timestamps = out->vrr ||
+		(internal && dcp_refresh_is_promotion(vert.precise_sync_rate));
 
 	clock = calculate_clock(&horiz, &vert);
 	if (!clock || clock > INT_MAX)
@@ -918,10 +918,16 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		.height_mm = height_mm,
 	};
 
-	if (external_sdr && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0)
-		mode->flags = (horiz.sync_polarity ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC) |
-			      (vert.sync_polarity ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC);
-	out->metadata_timing_valid = external_sdr && !out->automatic_rgb8_quirk &&
+	/* The internal panel also publishes its polarity with its modes (J616s series). */
+	if ((timing_keys || internal) && horiz.sync_polarity >= 0 &&
+	    vert.sync_polarity >= 0)
+		out->metadata_sync_flags =
+			(horiz.sync_polarity ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC) |
+			(vert.sync_polarity ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC);
+	/* The external SDR path and the internal panel publish it with their modes. */
+	if (external_sdr || internal)
+		mode->flags = out->metadata_sync_flags;
+	out->metadata_timing_valid = timing_keys && !out->automatic_rgb8_quirk &&
 		have_preferred && preferred &&
 		have_interlaced && !interlaced && horiz.pixel_repetition == 0 &&
 		vert.pixel_repetition == 0 && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0;
@@ -1322,7 +1328,38 @@ static int parse_metadata_chromaticity(struct dcp_parse_ctx *handle,
 	return seen == 7 ? 0 : -EINVAL;
 }
 
-static int parse_metadata_product(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out)
+/* Internal panel labels can be longer than an EDID descriptor. */
+static int parse_panel_label(struct dcp_parse_ctx *handle, char out[14])
+{
+	const struct dcp_parse_tag *tag = parse_tag_of_type(handle, DCP_TYPE_STRING);
+	const u8 *value;
+	unsigned int length;
+
+	if (IS_ERR(tag))
+		return PTR_ERR(tag);
+	if (tag->size > 255)
+		return -EINVAL;
+	value = parse_bytes(handle, tag->size);
+	if (IS_ERR(value))
+		return PTR_ERR(value);
+	for (unsigned int i = 0; i < tag->size; i++)
+		if (value[i] < 0x20 || value[i] > 0x7e)
+			return -EINVAL;
+	length = tag->size;
+	if (length > 13)
+		length = 13;
+	memcpy(out, value, length);
+	out[length] = 0;
+	/* A blank descriptor is absent to libdisplay-info; use the fallback. */
+	for (unsigned int i = 0; i < length; i++)
+		if (out[i] != ' ')
+			return 0;
+	out[0] = 0;
+	return 0;
+}
+
+static int parse_metadata_product(struct dcp_parse_ctx *handle,
+				  struct dcp_display_metadata *out, bool panel)
 {
 	struct iterator it;
 	unsigned int seen = 0;
@@ -1347,7 +1384,8 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle, struct dcp_displ
 			if (seen & 2)
 				return -EINVAL;
 			seen |= 2;
-			ret = parse_metadata_string(handle, out->name, sizeof(out->name));
+			ret = panel ? parse_panel_label(handle, out->name) :
+				parse_metadata_string(handle, out->name, sizeof(out->name));
 		} else if (!strcmp(key, "ProductID")) {
 			if (seen & 4)
 				return -EINVAL;
@@ -1357,12 +1395,14 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle, struct dcp_displ
 			if (seen & 8)
 				return -EINVAL;
 			seen |= 8;
-			ret = parse_metadata_number(handle, &out->week, 0, 53);
+			ret = panel ? skip(handle) :
+				parse_metadata_number(handle, &out->week, 0, 53);
 		} else if (!strcmp(key, "YearOfManufacture")) {
 			if (seen & 16)
 				return -EINVAL;
 			seen |= 16;
-			ret = parse_metadata_number(handle, &out->year, 1990, 2245);
+			ret = panel ? skip(handle) :
+				parse_metadata_number(handle, &out->year, 1990, 2245);
 		} else if (!strcmp(key, "SerialNumber")) {
 			if (seen & 64)
 				return -EINVAL;
@@ -1372,8 +1412,9 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle, struct dcp_displ
 			if (seen & 128)
 				return -EINVAL;
 			seen |= 128;
-			ret = parse_metadata_string(handle, out->serial_text,
-						    sizeof(out->serial_text));
+			ret = panel ? parse_panel_label(handle, out->serial_text) :
+				parse_metadata_string(handle, out->serial_text,
+						      sizeof(out->serial_text));
 		} else if (!strcmp(key, "LegacyManufacturerID")) {
 			if (seen & 32)
 				return -EINVAL;
@@ -1385,7 +1426,13 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle, struct dcp_displ
 		if (ret)
 			return ret;
 	}
-	if ((seen & 31) != 31 || strlen(out->manufacturer) != 3)
+	if (panel && !(seen & 1) && (seen & 32)) {
+		for (unsigned int i = 0; i < 3; i++)
+			out->manufacturer[i] = '@' + ((legacy >> (10 - 5 * i)) & 31);
+		seen |= 1;
+	}
+	if ((seen & (panel ? 5 : 31)) != (panel ? 5 : 31) ||
+	    strlen(out->manufacturer) != 3)
 		return -EINVAL;
 	for (unsigned int i = 0; i < 3; i++)
 		if (out->manufacturer[i] < 'A' || out->manufacturer[i] > 'Z')
@@ -1436,7 +1483,7 @@ int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_meta
 			if (seen & 16)
 				return -EINVAL;
 			seen |= 16;
-			ret = parse_metadata_product(handle, &parsed);
+			ret = parse_metadata_product(handle, &parsed, false);
 		} else {
 			ret = skip(handle);
 		}
@@ -1445,6 +1492,50 @@ int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_meta
 	}
 	if (seen != 31)
 		return -EINVAL;
+	*out = parsed;
+	return 0;
+}
+
+/* Identity does not depend on optional colorimetry or EDID-compatible timing. */
+int parse_panel_product_metadata(struct dcp_parse_ctx *handle,
+				 struct dcp_display_metadata *out)
+{
+	struct dcp_display_metadata parsed = {};
+	int ret = parse_metadata_product(handle, &parsed, true);
+
+	if (!ret)
+		*out = parsed;
+	return ret;
+}
+
+int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out)
+{
+	struct dcp_display_metadata parsed = {};
+	struct iterator it;
+	bool product = false;
+	int ret = iterator_begin(handle, &it, true);
+
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; it.idx++) {
+		char key[64];
+
+		ret = parse_metadata_string(handle, key, sizeof(key));
+		if (ret)
+			return ret;
+		if (!strcmp(key, "ProductAttributes")) {
+			if (product)
+				return -EINVAL;
+			product = true;
+			ret = parse_metadata_product(handle, &parsed, true);
+		} else {
+			ret = skip(handle);
+		}
+		if (ret)
+			return ret;
+	}
+	if (!product)
+		return -ENODATA;
 	*out = parsed;
 	return 0;
 }
@@ -1925,4 +2016,146 @@ int parse_system_log_mnits(struct dcp_parse_ctx *handle, struct dcp_system_ev_mn
 	entry->timestamp = timestamp;
 
 	return 0;
+}
+
+/* Inspect structure only. Never emit a firmware value or allocate from its size. */
+static int parse_identity_tree(struct dcp_parse_ctx *ctx, dcp_identity_key_fn emit,
+			       void *data, u32 depth, u32 *budget)
+{
+	const struct dcp_parse_tag *tag;
+	u32 count;
+
+	if (!*budget || depth > 4)
+		return -E2BIG;
+	--*budget;
+	tag = parse_tag(ctx);
+	if (IS_ERR(tag))
+		return PTR_ERR(tag);
+	if (tag->type != DCP_TYPE_DICTIONARY && tag->type != DCP_TYPE_ARRAY) {
+		/* Reuse the bounded scalar decoder from the original position. */
+		ctx->pos -= sizeof(*tag);
+		return skip(ctx);
+	}
+	count = tag->size;
+	if (count > *budget)
+		return -E2BIG;
+	for (u32 i = 0; i < count; i++) {
+		struct dcp_parse_ctx value;
+		const struct dcp_parse_tag *key_tag, *value_tag;
+		const char *key = "[]";
+		u32 length = 2;
+		int ret;
+
+		if (tag->type == DCP_TYPE_DICTIONARY) {
+			key_tag = parse_tag_of_type(ctx, DCP_TYPE_STRING);
+			if (IS_ERR(key_tag))
+				return PTR_ERR(key_tag);
+			length = key_tag->size;
+			key = parse_bytes(ctx, length);
+			if (IS_ERR(key))
+				return PTR_ERR(key);
+		}
+		value = *ctx;
+		value_tag = parse_tag(&value);
+		if (IS_ERR(value_tag))
+			return PTR_ERR(value_tag);
+		emit(data, key, length, value_tag->type, value_tag->size, depth);
+		ret = parse_identity_tree(ctx, emit, data, depth + 1, budget);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+int parse_identity_keys(const void *blob, size_t len, dcp_identity_key_fn emit, void *data)
+{
+	struct dcp_parse_ctx ctx, root;
+	const struct dcp_parse_tag *tag;
+	u32 budget = 64;
+	int ret = parse(blob, len, &ctx);
+
+	if (ret)
+		return ret;
+	root = ctx;
+	tag = parse_tag(&root);
+	if (IS_ERR(tag))
+		return PTR_ERR(tag);
+	emit(data, "<root>", 6, tag->type, tag->size, 0);
+	return parse_identity_tree(&ctx, emit, data, 0, &budget);
+}
+
+/* Look for named EDID blobs inside bounded property dictionaries. */
+static int parse_panel_edid_value(struct dcp_parse_ctx *ctx, u32 depth, u32 *budget,
+				  bool edid_key, const u8 **edid, size_t *size)
+{
+	const struct dcp_parse_tag *tag;
+	struct dcp_parse_ctx start = *ctx;
+
+	if (depth > 4 || !*budget)
+		return -E2BIG;
+	--*budget;
+	tag = parse_tag(ctx);
+	if (IS_ERR(tag))
+		return PTR_ERR(tag);
+	if (tag->type == DCP_TYPE_BLOB && edid_key) {
+		const u8 *data;
+
+		if (tag->size < 128 || tag->size > 4096 || tag->size % 128)
+			return -EINVAL;
+		data = parse_bytes(ctx, tag->size);
+		if (IS_ERR(data))
+			return PTR_ERR(data);
+		if (memcmp(data, "\x00\xff\xff\xff\xff\xff\xff\x00", 8) ||
+		    (1U + data[126]) * 128 != tag->size)
+			return -EINVAL;
+		*edid = data;
+		*size = tag->size;
+		return 0;
+	}
+	if (tag->type == DCP_TYPE_DICTIONARY) {
+		if (tag->size > *budget)
+			return -E2BIG;
+		for (u32 i = 0; i < tag->size; i++) {
+			const struct dcp_parse_tag *key_tag;
+			const char *key;
+			bool match;
+			int ret;
+
+			key_tag = parse_tag_of_type(ctx, DCP_TYPE_STRING);
+			if (IS_ERR(key_tag))
+				return PTR_ERR(key_tag);
+			key = parse_bytes(ctx, key_tag->size);
+			if (IS_ERR(key))
+				return PTR_ERR(key);
+			match = (key_tag->size == 4 && (!memcmp(key, "EDID", 4) ||
+				 !memcmp(key, "edid", 4))) ||
+				(key_tag->size == 13 && !memcmp(key, "IODisplayEDID", 13));
+			ret = parse_panel_edid_value(ctx, depth + 1, budget, match, edid, size);
+			if (ret != -ENOENT)
+				return ret;
+		}
+		return -ENOENT;
+	}
+	*ctx = start;
+	return skip(ctx) ?: -ENOENT;
+}
+
+/* A setter may deliver raw bytes, a blob, or a dictionary containing a blob. */
+int parse_panel_edid_data(const void *blob, size_t len, const u8 **edid, size_t *size)
+{
+	struct dcp_parse_ctx ctx;
+	const u8 *data = blob;
+	u32 bytes, budget = 64;
+	int ret;
+
+	if (len >= 128 && !memcmp(data, "\x00\xff\xff\xff\xff\xff\xff\x00", 8)) {
+		bytes = (1U + data[126]) * 128;
+		if (bytes > len || bytes > 4096)
+			return -EINVAL;
+		*edid = data;
+		*size = bytes;
+		return 0;
+	}
+	ret = parse(blob, len, &ctx);
+	return ret ?: parse_panel_edid_value(&ctx, 0, &budget, true, edid, size);
 }

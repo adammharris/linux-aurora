@@ -18,7 +18,12 @@ struct dcp_display_metadata {
 
 struct drm_edid;
 struct drm_display_mode;
+struct dcp_display_mode;
 const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *metadata,
 					 const struct drm_display_mode *mode);
+
+const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadata,
+				      const struct dcp_display_mode *modes, unsigned int count,
+				      u32 width_mm, u32 height_mm);
 
 #endif

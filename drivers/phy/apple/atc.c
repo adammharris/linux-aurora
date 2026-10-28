@@ -55,6 +55,9 @@
 #include "atc-t8122-dp.h"
 #include "atc-tunnel.h"
 
+/* Runtime-suspend delay, which covers the mux, orientation and reset calls of a plug */
+#define ATCPHY_AUTOSUSPEND_MS 2000
+
 #define AUSPLL_FSM_CTRL 0x1014
 
 #define AUSPLL_APB_CMD_OVERRIDE 0x2000
@@ -657,8 +660,13 @@ struct apple_atcphy;
  *                  it; the lock handshake that starts the next PIPE change is
  *                  only acknowledged while it runs
  * @restore_after_pd_off: The PHY's power domain may be switched off in system
- *                        sleep, which resets the block; bring the tracked
- *                        state back once the domain is on again
+ *                        sleep, or at runtime with @idle_power_off, which
+ *                        resets the block; bring the tracked state back once
+ *                        the domain is on again
+ * @idle_power_off: Let an idle PHY runtime-suspend, so that its power domain
+ *                  can also drop while the system runs, see atcphy_rpm_get().
+ *                  Only for PHYs without DisplayPort, whose phy ops and tunnel
+ *                  calls take no runtime PM reference
  */
 struct atcphy_hw {
 	void (*configure_post_tunable)(struct apple_atcphy *, enum atcphy_mode);
@@ -677,6 +685,7 @@ struct atcphy_hw {
 	bool park_pipe_unlocked;
 	bool park_dummy_phy;
 	bool restore_after_pd_off;
+	bool idle_power_off;
 };
 
 enum atcphy_t8132_bank {
@@ -759,6 +768,9 @@ enum atcphy_t8132_bank {
  * @pd_nb: Power domain notifier, registered with restore_after_pd_off
  * @pd_was_off: The power domain was switched off since the state was last
  *              brought back; set from the notifier, cleared under @lock
+ * @idle_rpm: An idle PHY runtime-suspends, see atcphy_rpm_get()
+ * @rpm_held: A runtime PM reference is held while busy, see atcphy_rpm_busy();
+ *            under @lock
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -840,6 +852,8 @@ struct apple_atcphy {
 
 	struct notifier_block pd_nb;
 	bool pd_was_off;
+	bool idle_rpm;
+	bool rpm_held;
 
 	bool tunnel_dual_stream;
 	bool tunnel_routes_present;
@@ -3946,6 +3960,73 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 static void _atcphy_dwc3_reset_assert(struct apple_atcphy *atcphy);
 
 /*
+ * On T8132 an idle PHY lets its power domain drop. That domain is the USB
+ * controller's, which also holds the PIPE handler: the PHY writes it to drive
+ * the controller's reset and to route the PIPE, also while the Type-C mux
+ * changes mode before the controller has resumed. So every operation that can
+ * reach the hardware powers the device first, and a reference stays held while
+ * the PHY runs anything, see atcphy_rpm_busy(). A running controller keeps the
+ * shared domain on by itself.
+ */
+static int atcphy_rpm_get(struct apple_atcphy *atcphy)
+{
+	if (!atcphy->idle_rpm)
+		return 0;
+	return pm_runtime_resume_and_get(atcphy->dev);
+}
+
+/*
+ * What a power-down would lose: a mode or a host, a PIPE away from its parked
+ * dummy backend or between backends, or on T8132 a common-power epoch, which
+ * only its own stop may end. Without these the PHY is in the baseline that
+ * atcphy_restore_after_pd_off() sets up again.
+ */
+static bool atcphy_rpm_busy(const struct apple_atcphy *atcphy)
+{
+	return atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->host_active ||
+	       atcphy->pipe_pending || atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY ||
+	       atcphy->t8132_common_owned;
+}
+
+/* Take or drop the reference held while busy; the device must be on. */
+static void atcphy_rpm_sync(struct apple_atcphy *atcphy)
+{
+	bool busy;
+
+	if (!atcphy->idle_rpm)
+		return;
+	guard(mutex)(&atcphy->lock);
+	busy = atcphy_rpm_busy(atcphy);
+	if (busy == atcphy->rpm_held)
+		return;
+	if (busy)
+		pm_runtime_get_noresume(atcphy->dev);
+	else
+		pm_runtime_put_noidle(atcphy->dev);
+	atcphy->rpm_held = busy;
+	dev_dbg(atcphy->dev, "%s the power domain\n", busy ? "holding" : "releasing");
+}
+
+static void atcphy_rpm_put(struct apple_atcphy *atcphy)
+{
+	if (!atcphy->idle_rpm)
+		return;
+	atcphy_rpm_sync(atcphy);
+	pm_runtime_put_autosuspend(atcphy->dev);
+}
+
+/* Drop the hold of an unbound PHY or a failed probe, before runtime PM is disabled. */
+static void atcphy_rpm_release(void *data)
+{
+	struct apple_atcphy *atcphy = data;
+
+	guard(mutex)(&atcphy->lock);
+	if (atcphy->rpm_held)
+		pm_runtime_put_noidle(atcphy->dev);
+	atcphy->rpm_held = false;
+}
+
+/*
  * A T8122 PHY loses its register state whenever its power domain is switched
  * off. In system sleep that happens to a domain that no running device holds:
  * a Type-C port whose USB controller has no role (no cable, or a cable without
@@ -3965,6 +4046,9 @@ static void _atcphy_dwc3_reset_assert(struct apple_atcphy *atcphy);
  * resume callback, whichever comes first, so the order in which the Type-C
  * controller, the USB controller and the display controller resume does not
  * matter.
+ *
+ * On T8132 the domain also switches off at runtime, once an idle PHY and its
+ * USB controller have both suspended, see atcphy_rpm_get().
  */
 static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 {
@@ -3990,20 +4074,29 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 		atcphy->host_active = false;
 		atcphy_usb2_power_off(atcphy);
 	}
-	ret = atcphy_power_off(atcphy);
-	if (ret)
-		dev_warn(atcphy->dev, "PHY did not power down after its domain was off: %d\n",
-			 ret);
+	/* As at probe, M4 acquires its common bank only on USB3 admission. */
+	if (!atcphy->hw->usb2_only) {
+		ret = atcphy_power_off(atcphy);
+		if (ret)
+			dev_warn(atcphy->dev,
+				 "PHY did not power down after its domain was off: %d\n", ret);
+	}
 	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
 
 	if (atcphy->dp_only) {
 		dev_dbg(atcphy->dev, "power domain was off, restoring mode %d\n", mode);
 	} else {
-		ret = atcphy_configure_pipehandler_dummy(atcphy, false);
-		if (ret)
-			dev_warn(atcphy->dev, "Failed to park the PIPE after its domain was off: %d\n",
-				 ret);
-		atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+		if (atcphy->hw->usb2_only) {
+			/* As at probe, with the dummy PIPE clock the USB2 controller needs */
+			atcphy_setup_pipehandler(atcphy);
+		} else {
+			ret = atcphy_configure_pipehandler_dummy(atcphy, false);
+			if (ret)
+				dev_warn(atcphy->dev,
+					 "Failed to park the PIPE after its domain was off: %d\n",
+					 ret);
+			atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+		}
 		dev_dbg(atcphy->dev,
 			"power domain was off, restoring mode %d: PIPE mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x\n",
 			mode, readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
@@ -4095,10 +4188,40 @@ static int atcphy_usb2_init(struct phy *phy)
 	return 0;
 }
 
+/*
+ * The phy core also powers the device for init and power_off; these wrappers
+ * also take or drop the hold for the state an operation leaves behind.
+ */
+static int atcphy_rpm_usb2_init(struct phy *phy)
+{
+	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	int ret;
+
+	ret = atcphy_rpm_get(atcphy);
+	if (ret)
+		return ret;
+	ret = atcphy_usb2_init(phy);
+	atcphy_rpm_put(atcphy);
+	return ret;
+}
+
+static int atcphy_rpm_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+{
+	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	int ret;
+
+	ret = atcphy_rpm_get(atcphy);
+	if (ret)
+		return ret;
+	ret = atcphy_usb2_set_mode(phy, mode, submode);
+	atcphy_rpm_put(atcphy);
+	return ret;
+}
+
 static const struct phy_ops apple_atc_usb2_phy_ops = {
 	.owner = THIS_MODULE,
-	.init = atcphy_usb2_init,
-	.set_mode = atcphy_usb2_set_mode,
+	.init = atcphy_rpm_usb2_init,
+	.set_mode = atcphy_rpm_usb2_set_mode,
 };
 
 static int atcphy_usb3_power_off(struct phy *phy)
@@ -4260,11 +4383,37 @@ static int atcphy_usb3_exit(struct phy *phy)
 	return 0;
 }
 
+static int atcphy_rpm_usb3_power_off(struct phy *phy)
+{
+	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	int ret;
+
+	ret = atcphy_rpm_get(atcphy);
+	if (ret)
+		return ret;
+	ret = atcphy_usb3_power_off(phy);
+	atcphy_rpm_put(atcphy);
+	return ret;
+}
+
+static int atcphy_rpm_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+{
+	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	int ret;
+
+	ret = atcphy_rpm_get(atcphy);
+	if (ret)
+		return ret;
+	ret = atcphy_usb3_set_mode(phy, mode, submode);
+	atcphy_rpm_put(atcphy);
+	return ret;
+}
+
 static const struct phy_ops apple_atc_usb3_phy_ops = {
 	.owner = THIS_MODULE,
 	.exit = atcphy_usb3_exit,
-	.power_off = atcphy_usb3_power_off,
-	.set_mode = atcphy_usb3_set_mode,
+	.power_off = atcphy_rpm_usb3_power_off,
+	.set_mode = atcphy_rpm_usb3_set_mode,
 };
 
 static int atcphy_dpphy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
@@ -4626,9 +4775,35 @@ static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsign
 	return 0;
 }
 
+static int atcphy_rpm_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
+{
+	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
+	int ret;
+
+	ret = atcphy_rpm_get(atcphy);
+	if (ret)
+		return ret;
+	ret = atcphy_dwc3_reset_assert(rcdev, id);
+	atcphy_rpm_put(atcphy);
+	return ret;
+}
+
+static int atcphy_rpm_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsigned long id)
+{
+	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
+	int ret;
+
+	ret = atcphy_rpm_get(atcphy);
+	if (ret)
+		return ret;
+	ret = atcphy_dwc3_reset_deassert(rcdev, id);
+	atcphy_rpm_put(atcphy);
+	return ret;
+}
+
 static const struct reset_control_ops atcphy_dwc3_reset_ops = {
-	.assert = atcphy_dwc3_reset_assert,
-	.deassert = atcphy_dwc3_reset_deassert,
+	.assert = atcphy_rpm_dwc3_reset_assert,
+	.deassert = atcphy_rpm_dwc3_reset_deassert,
 };
 
 static int atcphy_reset_xlate(struct reset_controller_dev *rcdev,
@@ -4976,11 +5151,17 @@ static void atcphy_usb3_port_work(struct work_struct *work)
 	struct atcphy_usb3_pm pm = {};
 	int ret;
 
+	ret = atcphy_rpm_get(atcphy);
+	if (ret) {
+		atcphy_usb3_port_retry(atcphy, false, ret);
+		return;
+	}
 	ret = atcphy_usb3_pm_get(atcphy, &pm);
 	if (!ret) {
 		ret = atcphy_usb3_port_restore(atcphy, &pm);
 		atcphy_usb3_pm_put(&pm);
 	}
+	atcphy_rpm_put(atcphy);
 	if (ret)
 		atcphy_usb3_port_retry(atcphy, false, ret);
 }
@@ -5350,7 +5531,15 @@ out:
 
 static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
 {
-	return atcphy_mux_update(typec_mux_get_drvdata(mux), state);
+	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
+	int ret;
+
+	ret = atcphy_rpm_get(atcphy);
+	if (ret)
+		return ret;
+	ret = atcphy_mux_update(atcphy, state);
+	atcphy_rpm_put(atcphy);
+	return ret;
 }
 
 static void atcphy_typec_mux_unregister(void *data)
@@ -5853,12 +6042,13 @@ static void atcphy_pd_notifier_remove(void *data)
 	dev_pm_genpd_remove_notifier(data);
 }
 
-static void atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
+/* Returns whether the PHY follows its power domain. */
+static bool atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 {
 	int ret;
 
 	if (!atcphy->hw->restore_after_pd_off)
-		return;
+		return false;
 
 	atcphy->pd_nb.notifier_call = atcphy_pd_notify;
 	ret = dev_pm_genpd_add_notifier(atcphy->dev, &atcphy->pd_nb);
@@ -5872,6 +6062,7 @@ static void atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 		dev_warn(atcphy->dev,
 			 "Cannot follow the PM domain (%d), PHY state is not restored after it was off\n",
 			 ret);
+	return !ret;
 }
 
 /* The T8103 PHY compatible is also a fallback on unqualified M1/M2 variants. */
@@ -5886,6 +6077,7 @@ static int atcphy_probe(struct platform_device *pdev)
 {
 	struct apple_atcphy *atcphy;
 	struct device *dev = &pdev->dev;
+	bool followed;
 	int ret;
 
 	atcphy = devm_kzalloc(&pdev->dev, sizeof(*atcphy), GFP_KERNEL);
@@ -5917,9 +6109,29 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	atcphy->fixed_usb2 = atcphy_usb2_behind_fixed_hub(atcphy);
 	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB2;
-	atcphy_probe_pd_notifier(atcphy);
+	followed = atcphy_probe_pd_notifier(atcphy);
 
-	return atcphy_probe_finalize(atcphy);
+	/*
+	 * Only a PHY that follows its domain may let it drop. Before the PHYs are
+	 * created, so that they follow runtime PM too.
+	 */
+	if (atcphy->hw->idle_power_off && followed) {
+		pm_runtime_set_autosuspend_delay(dev, ATCPHY_AUTOSUSPEND_MS);
+		pm_runtime_use_autosuspend(dev);
+		ret = devm_pm_runtime_set_active_enabled(dev);
+		if (ret)
+			return ret;
+		ret = devm_add_action_or_reset(dev, atcphy_rpm_release, atcphy);
+		if (ret)
+			return ret;
+		atcphy->idle_rpm = true;
+	}
+
+	ret = atcphy_probe_finalize(atcphy);
+	if (ret)
+		return ret;
+	atcphy_rpm_sync(atcphy);
+	return 0;
 }
 
 static int atcphy_suspend(struct device *dev)
@@ -5950,6 +6162,12 @@ static int atcphy_resume(struct device *dev)
 
 	guard(mutex)(&atcphy->lock);
 	atcphy->t8132_suspended = false;
+	/*
+	 * A suspended PHY holds nothing, and its domain may drop again once system
+	 * resume completes: leave the restore to its next operation.
+	 */
+	if (atcphy->idle_rpm && pm_runtime_status_suspended(dev))
+		return 0;
 	atcphy_restore_after_pd_off(atcphy);
 
 	return 0;
@@ -6009,6 +6227,8 @@ static const struct atcphy_hw atcphy_hw_t8132 = {
 	.usb2phy_sig_host = USB2PHY_SIG_HOST_T8132,
 	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
+	.restore_after_pd_off = true,
+	.idle_power_off = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8140 = {

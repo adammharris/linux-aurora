@@ -9,7 +9,7 @@
 //! here once. The driver reads addresses from the device tree, never scans for
 //! them, and never patches properties at runtime.
 //!
-//! Five bring-up targets are modelled:
+//! These bring-up targets are modelled:
 //!
 //! * `T8103` / J313 (MacBook Air, M1): the host boots the SEP with the boot
 //!   endpoint handshake over a 0x30000 shared-memory window.
@@ -24,6 +24,8 @@
 //!   a powered sensor, so the driver uses the warm registration path.
 //! * `T8122` / J613, J615 (MacBook Air, M3): the T8112 warm registration with
 //!   the T8140 SEP DART aperture above 4 GiB.
+//! * `T6040` / J616s (MacBook Pro 16", M4 Pro): iBoot boots sepOS, so the
+//!   driver uses the warm registration path; the sensor is the J700 part.
 
 // The boot handshake, identity source, sensor and DART fields are consumed by
 // the boot-endpoint, identity and sensor-transport paths.
@@ -426,6 +428,28 @@ pub(crate) const T8122: PlatformProfile = PlatformProfile {
     ..T8112
 };
 
+/// MacBook Pro 16" M4 Pro (J616s). The J616s ADT (26.6.2, 25G83) records a
+/// pre-booted SEP (`sepfw-load-at-boot`), an `iop-sep,ascwrap-v6` SEP whose
+/// DART aperture starts at the BIT(40) alias (`vm-base` 0x10000004000), and
+/// the Mesa sensor J700 carries (`sensor-id` 0x3356) on spi2 at
+/// `0x429108000`, 8 MHz, chip select 0. Its power is NUB GPIO 53 and its
+/// data-ready line AP GPIO 116. `/defaults` carries `cpx-encryption-mode = 2`.
+///
+/// A warm-registration platform like T8140, with T8140's authenticated
+/// sensor session: the enclave serves this sensor only after the nonce and
+/// the signed root key. Device-tree nodes remain authoritative for addresses.
+pub(crate) const T6040: PlatformProfile = PlatformProfile {
+    name: "T6040/J616s",
+    sensor: SensorProfile {
+        controller_base: 0x4_2910_8000,
+        ..T8140.sensor
+    },
+    // macOS shares this enclave and Linux has no records here yet: keep
+    // Linux to its own xART records from the first boot.
+    xart_guard: 1,
+    ..T8140
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -441,6 +465,8 @@ static_assert!(T8112.sensor.controller_base == T8103.sensor.controller_base);
 static_assert!(T8122.shmem_capacity == T8112.shmem_capacity);
 static_assert!(T8122.sensor.controller_base == 0x2a1108000);
 static_assert!(T8122.wide_dma_mask);
+static_assert!(T6040.sensor.controller_base == 0x429108000);
+static_assert!(T6040.sensor.expected_id == T8140.sensor.expected_id);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -587,6 +613,11 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     if machine_has(b"apple,t8122") && (machine_has(b"apple,j613") || machine_has(b"apple,j615")) {
         return Ok(&T8122);
     }
+    // Only the board whose ADT was read: J616s. The other T6040 Macs share
+    // the SoC but their sensor wiring is unchecked.
+    if machine_has(b"apple,t6040") && machine_has(b"apple,j616s") {
+        return Ok(&T6040);
+    }
     Err(ENODEV)
 }
 
@@ -637,6 +668,11 @@ mod tests {
         assert!(T8122.wide_dma_mask);
         assert!(T8122.shmem_capacity == T8112.shmem_capacity);
         assert!(T8122.sensor.controller_base == 0x2_a110_8000);
+        assert!(T6040.nonce_session);
+        assert!(T6040.wide_dma_mask);
+        assert!(T6040.bootstrap == Bootstrap::WarmRegister);
+        assert!(T6040.identity == IdentitySource::Chosen);
+        assert!(T6040.xart_guard == 1);
     }
 }
 
@@ -667,7 +703,7 @@ mod dart_window_tests {
 
     #[test]
     fn the_other_profiles_keep_the_bit40_window() {
-        for profile in [&T8103, &T6000, &T6020, &T8140, &T6020_SEPOS13, &T8122] {
+        for profile in [&T8103, &T6000, &T6020, &T8140, &T6020_SEPOS13, &T8122, &T6040] {
             assert_eq!(offset(profile.dart_window), 1 << 40);
             assert_eq!(range(profile.dart_window), (0, 1 << 32));
         }

@@ -190,7 +190,7 @@
 };
 
 &ps_atc0_common {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_spi2 {
@@ -279,7 +279,6 @@
 
 &ps_atc1_common {
 	status = "okay";
-	apple,inherited-on;
 };
 
 &ps_atc1_pcie {
@@ -376,6 +375,11 @@
 
 &ps_dispext1_cpu {
 	status = "disabled";
+};
+
+/* No camera driver yet; genpd powers the ISP down as an unused domain. */
+&ps_isp_sys {
+	status = "okay";
 };
 
 &ps_ans {
@@ -501,19 +505,21 @@
 };
 
 &ps_atc0_usb_aon {
-	status = "disabled";
+	status = "okay";
+	apple,inherited-on;
 };
 
 &ps_atc1_usb_aon {
-	status = "disabled";
+	status = "okay";
+	apple,inherited-on;
 };
 
 &ps_atc0_usb {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_atc1_usb {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_atc2_usb_aon {

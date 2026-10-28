@@ -232,7 +232,6 @@
 	      <0x4 0x0b050000 0x0 0x4000>;
 	reg-names = "usb2phy", "pipehandler", "core", "axi2af", "lioa",
 		    "fabric", "common-config";
-	power-domains = <&ps_atc1_common>;
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -325,6 +324,32 @@
 	hwmon {
 		compatible = "apple,smc-hwmon";
 
+		current-ID0R {
+			apple,key-id = "ID0R";
+			label = "AC Input Current";
+		};
+
+		/* Panel and backlight supply; tracks brightness, idles when blanked. */
+		current-Ib8f {
+			apple,key-id = "Ib8f";
+			label = "Display Supply Current";
+		};
+
+		power-PDTR {
+			apple,key-id = "PDTR";
+			label = "AC Input Power";
+		};
+
+		power-PMVC {
+			apple,key-id = "PMVC";
+			label = "3.8 V Rail Power";
+		};
+
+		power-PSTR {
+			apple,key-id = "PSTR";
+			label = "Total System Power";
+		};
+
 		temperature-TB0T {
 			apple,key-id = "TB0T";
 			label = "Battery Hotspot";
@@ -343,6 +368,16 @@
 		temperature-TW0P {
 			apple,key-id = "TW0P";
 			label = "WiFi/BT Module Temp";
+		};
+
+		voltage-SBAV {
+			apple,key-id = "SBAV";
+			label = "Battery Voltage";
+		};
+
+		voltage-VD0R {
+			apple,key-id = "VD0R";
+			label = "Charger Input Voltage";
 		};
 	};
 

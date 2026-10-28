@@ -40,13 +40,21 @@ def controls(ROOT):
      bool external_power_attempted,dptx_tunnel,tb_clock_ok,fixed_route_selected;
      int tb_lock; unsigned typec_generation,dptx_dfp_port,dptx_phy,fixed_dptx_phy,fixed_mux_index;
      void *tb_dpin_set_active,*tb_dpin_ctx,*phy,*fixed_phy;
-     struct mux_control *xbar;
+     struct mux_control *xbar,*fixed_xbar;
+     /* desktop 26.x hybrid hand-over and dual-pipe state; fw_compat is never desktop here */
+     bool peer_starved,typec_narrow,hdmi_yielded;
      struct apple_dcp_typec_route *active_typec_route,*typec_routes;
      struct connector *connector,*fixed_connector;int connector_type,fixed_connector_type;
      struct mux_control *direct_xbar_up; bool external_native, ext_dead; int fw_compat; unsigned long long tb_generation;
      int modes_lock; unsigned long long modes_generation; bool modes_admitted,modes_provisional;
      struct { int iomfb_method_profile; } hw;
     ''',1)
+    # The hybrid hand-over walks a port's routes; the only route is this port's.
+    actual=actual.replace('struct apple_dcp_typec_port { int link;', 'struct apple_dcp_typec_port { int link,routes; bool typec_yielded;',1)
+    actual=actual.replace('#define list_for_each_entry(p,h,m) for((void)(h),(p)=sole_port();(p);(p)=NULL)',
+        '#define list_for_each_entry(p,h,m) for((void)(h),(p)=_Generic((p),struct apple_dcp_typec_route *:sole_route(),default:sole_port());(p);(p)=NULL)',1)
+    actual=actual.replace('static struct apple_dcp_typec_port *sole_port(void) { return &port; }',
+        'static struct apple_dcp_typec_port *sole_port(void) { return &port; }\nstatic struct apple_dcp_typec_route * __attribute__((unused)) sole_route(void) { return &route; }',1)
     actual=actual.replace('bool applied_valid,safe_pending,dp_wanted,dp_hpd,hpd;', 'struct typec_altmode *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,dp_wanted,dp_hpd,hpd;',1)
     actual=actual.replace('void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel;', 'struct mux_control *xbar,*active_xbar; void *phy; unsigned dptx_phy,tunnel_dpin,mux_index;unsigned long long tunnel_generation;bool deactivate_xbar_done; int deactivate_error;bool xbar_up,selected,tunnel;',1)
     extra=r'''
@@ -70,6 +78,10 @@ def controls(ROOT):
 static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar_calls++;return xbar_error; }
     static int mux_control_select(struct mux_control *m,unsigned n) { (void)m;(void)n;return 0; }
     static void dpavservep_detach(struct apple_dcp *d) { (void)d; }
+    /* Desktop 26.6 dual-pipe peers: no scenario here is on that firmware. */
+    static void __attribute__((unused)) dcp_peer_release_26_6(struct apple_dcp *d) { (void)d;assert(!"desktop 26.6 peer release"); }
+    /* failed takes of the hybrid, reset when a Type-C display leaves DP */
+    static unsigned int __attribute__((unused)) dcp_hybrid_fails;
     static void dcp_firmware_metadata_connection(struct apple_dcp *d,unsigned n,bool c) { (void)d;(void)n;(void)c; }
     static bool dcp_typec_keep_order(void) { return false; }
     static struct apple_dcp_typec_route * __attribute__((unused)) dcp_typec_lowest_free(struct apple_dcp_typec_port *p) { (void)p;return &route; }
@@ -115,6 +127,11 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     '''+available
     # Route-follow: the fixed output, or a failed T6030 external processor, keeps the route busy.
     available+=apple_function(ROOT,'dcp_typec_route_busy')
+    # Hybrid-first policy: the real helper over the module parameter's and the
+    # device tree's defaults (-1: from the DT; no apple,typec-hybrid-first here).
+    hybrid_first=apple_function(ROOT,'dcp_typec_hybrid_first')
+    if hybrid_first:
+        available='static int typec_hybrid_first=-1;\n    static bool typec_hybrid_first_dt;\n    '+hybrid_first+available
     if available:
         actual=actual.replace('struct apple_dcp { int external_lock,external_error;','struct apple_dcp { int external_lock,external_error;\n     struct dcp_fabric_presence hdmi_presence; int hdmi_presence_lock; unsigned nr_typec_routes;',1)
         available='''#define atomic_read(p) (*(p))

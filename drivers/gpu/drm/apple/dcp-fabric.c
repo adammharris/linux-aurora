@@ -9,6 +9,7 @@
 #include <linux/mux/driver.h>
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
+#include <linux/phy/phy.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/usb/typec_altmode.h>
@@ -37,6 +38,53 @@ MODULE_PARM_DESC(tiled_split,
 
 static bool typec_follow_crtc = true;
 module_param(typec_follow_crtc, bool, 0444);
+
+/*
+ * The hybrid pipeline (dcpext0: fixed HDMI PHY + Type-C routes) normally
+ * comes last for a Type-C port, kept for an HDMI display.  On the J616s it
+ * is also the only pipe that can be the primary of a two-pipe display
+ * (firmware endpoint 1; the pipes merge upwards only): with this set a
+ * Type-C port takes it first, so a 7680 px sink on USB-C can pair with
+ * dcpext1 as its peer.  -1 follows the device tree; a write applies at
+ * once, handing the hybrid between an HDMI display and a Type-C display
+ * wider than one pipe (one monitor on two inputs: the desktop's choice of
+ * input, the monitor cannot tell which one it shows).
+ */
+static int typec_hybrid_first = -1;
+
+static void dcp_fabric_hybrid_policy_changed(void);
+
+static int dcp_typec_hybrid_first_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (!ret)
+		dcp_fabric_hybrid_policy_changed();
+	return ret;
+}
+
+static const struct kernel_param_ops dcp_typec_hybrid_first_ops = {
+	.set = dcp_typec_hybrid_first_set,
+	.get = param_get_int,
+};
+module_param_cb(typec_hybrid_first, &dcp_typec_hybrid_first_ops, &typec_hybrid_first, 0644);
+MODULE_PARM_DESC(typec_hybrid_first,
+		 "Hybrid (HDMI) pipeline: -1 from the device tree (default), 0 HDMI display first, 1 Type-C display first (dual-pipe primary)");
+
+/* Set by a pipeline whose device tree asks for it (apple,typec-hybrid-first). */
+static bool typec_hybrid_first_dt;
+
+void dcp_typec_hybrid_first_dt(void)
+{
+	WRITE_ONCE(typec_hybrid_first_dt, true);
+}
+
+static bool dcp_typec_hybrid_first(void)
+{
+	int policy = READ_ONCE(typec_hybrid_first);
+
+	return policy < 0 ? READ_ONCE(typec_hybrid_first_dt) : policy > 0;
+}
 MODULE_PARM_DESC(typec_follow_crtc,
 		 "Let direct DP-alt routes follow their selected CRTC (default: on)");
 
@@ -78,6 +126,12 @@ struct apple_dcp_typec_port {
 	struct apple_dcp_typec_route *secondary_target;
 	/* left out of the plan: its planned pipeline is held by a tunnel */
 	bool plan_dark;
+	/*
+	 * HDMI display first (typec_hybrid_first): the display on this port
+	 * has given both pipes to an HDMI display wider than one pipe and
+	 * waits, routed nowhere, until that one fits one pipe or leaves.
+	 */
+	bool typec_yielded;
 };
 
 /*
@@ -92,6 +146,12 @@ struct apple_dcp_typec_port {
 static DEFINE_MUTEX(dcp_typec_fabric_lock);
 
 static LIST_HEAD(dcp_typec_ports);
+/* hybrid-first hand-over (dcp_hybrid_work()), under dcp_typec_fabric_lock: */
+/* when the hybrid last changed hands, 0 if never */
+static unsigned long dcp_hybrid_moved;
+/* failed takes of the hybrid since the last success or Type-C DP exit */
+static unsigned int dcp_hybrid_fails;
+#define DCP_HYBRID_MAX_FAILS	2
 /* Current DTs wire the same stream capacity on every physical port. */
 static atomic_t dcp_dual_stream_routes = ATOMIC_INIT(0);
 
@@ -102,9 +162,6 @@ static bool dcp_hdmi_borrowed(void *ctx);
 
 bool dcp_is_typec_output(struct apple_dcp *dcp)
 {
-	/* Desktop 26.x keeps its own Type-C route, outside this fabric. */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
-		return false;
 	return dcp->active_typec_route ||
 	       dcp->fixed_connector_type == DRM_MODE_CONNECTOR_USB;
 }
@@ -145,6 +202,9 @@ static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *rout
 	struct apple_dcp *dcp = route->dcp;
 
 	if (dcp->fixed_connector_type == DRM_MODE_CONNECTOR_USB)
+		return false;
+	/* Its HDMI display gave the pipeline to a Type-C display. */
+	if (READ_ONCE(dcp->hdmi_yielded))
 		return false;
 	/*
 	 * The 14.7 firmware drives the internal panel on the IOMFB path.
@@ -195,7 +255,8 @@ static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
 		.fixed_busy = dcp_typec_route_busy(route),
 	};
 
-	struct dcp_fabric_policy policy = { .dual_stream = dcp_typec_ordered_dual_stream() };
+	struct dcp_fabric_policy policy = { .dual_stream = dcp_typec_ordered_dual_stream(),
+					    .hybrid_first = dcp_typec_hybrid_first() };
 
 	pipeline.presence = dcp_hdmi_presence(route->dcp);
 	return dcp_fabric_available(&pipeline, &policy);
@@ -306,6 +367,68 @@ static int dcp_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 	return ret;
 }
 
+/*
+ * Desktop 26.x firmware does not power the DP PHY of a Type-C route itself:
+ * the route does, once its crossbar points at the pipeline, and gives it
+ * back before the crossbar is released.
+ */
+static int dcp_typec_route_phy_on(struct apple_dcp_typec_route *route)
+{
+	int ret;
+
+	if (route->dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP ||
+	    route->phy_powered)
+		return 0;
+	ret = phy_init(route->phy);
+	if (!ret) {
+		ret = phy_power_on(route->phy);
+		if (ret)
+			phy_exit(route->phy);
+	}
+	if (ret) {
+		dev_warn(route->dcp->dev, "Type-C DP PHY init/power: %d\n", ret);
+		return ret;
+	}
+	route->phy_powered = true;
+	msleep(25);
+	return 0;
+}
+
+/*
+ * The PHY is powered when the display connects, not when the route is
+ * claimed: the port controller's mode switches run in connector order, and
+ * the PHY must have seen DP alt mode and the plug orientation first.
+ */
+int dcp_typec_phy_on(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+
+	/*
+	 * Ordered against dcp_typec_route_deactivate(), which powers the PHY
+	 * off and releases the crossbar under tb_lock: a connect racing the
+	 * release either powers the PHY first and has it taken down again, or
+	 * finds the route released and powers nothing. A desktop connect does
+	 * not take the fabric lock, so tb_lock is the common one.
+	 */
+	guard(mutex)(&dcp->tb_lock);
+	route = READ_ONCE(dcp->active_typec_route);
+	if (!route)
+		return 0;
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	    route->deactivate_xbar_done)
+		return -ENODEV;
+	return dcp_typec_route_phy_on(route);
+}
+
+static void dcp_typec_route_phy_off(struct apple_dcp_typec_route *route)
+{
+	if (!route->phy_powered)
+		return;
+	route->phy_powered = false;
+	phy_power_off(route->phy);
+	phy_exit(route->phy);
+}
+
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 				    struct mux_control *xbar)
 {
@@ -327,10 +450,24 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		return ret;
 
 	if (dcp->fixed_route_selected) {
-		ret = mux_control_deselect(dcp->xbar);
+		ret = mux_control_deselect(dcp->fixed_xbar);
 		dcp->fixed_route_selected = false;
 		if (ret)
 			return ret;
+	}
+
+	/*
+	 * A pipeline reserved as the peer of a display that has not paired
+	 * (an HDMI display on its monitor's unselected input, or a pair whose
+	 * cable went) takes this display: drop the reservation, or this
+	 * display could neither pair nor ask for the hybrid.  A running pair
+	 * keeps its peer (dcp_peer_release_26_6() refuses).
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		struct apple_dcp *owner = READ_ONCE(dcp->peer_owner);
+
+		if (owner)
+			dcp_peer_release_26_6(owner);
 	}
 
 	/*
@@ -347,19 +484,28 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		ret = dcp_dpxbar_tunnel_select_source(xbar, route->mux_index);
 		if (ret == -EOPNOTSUPP)
 			ret = 0;
-	} else {
-		ret = xbar == route->xbar ?
-			mux_control_select(xbar, route->mux_index) : 0;
+	} else if (xbar == route->xbar) {
+		/*
+		 * The control is only ever held by a route of this port, which
+		 * lets it go under the fabric lock held here: waiting for it
+		 * would wait for good, with the port controller's update work
+		 * and its interrupt stuck behind us.
+		 */
+		ret = mux_control_try_select(xbar, route->mux_index);
+		if (ret == -EBUSY)
+			dev_err(dcp->dev, "Type-C crossbar control still held, route not taken\n");
 	}
 	if (ret) {
-		if (dcp->xbar) {
+		if (dcp->fixed_xbar) {
 			int restore_ret;
 
-			restore_ret = mux_control_select(dcp->xbar,
+			restore_ret = mux_control_select(dcp->fixed_xbar,
 							 dcp->fixed_mux_index);
-			if (!restore_ret)
+			if (!restore_ret) {
 				dcp->fixed_route_selected = true;
-			else
+				if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+					WRITE_ONCE(dcp->xbar, dcp->fixed_xbar);
+			} else
 				dev_err(dcp->dev,
 					"failed to restore fixed display route: %d\n",
 					restore_ret);
@@ -370,6 +516,12 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	dcp_modes_begin_attachment(dcp);
 	apple_connector_edid_set_live(dcp->connector, false);
 	dcp->phy = route->phy;
+	/*
+	 * Desktop 26.x compact DPTX takes the crossbar link down and up around
+	 * a link configuration (dptxport_compact_xbar_link()) through dcp->xbar.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		WRITE_ONCE(dcp->xbar, route->xbar);
 	dcp->dptx_phy = route->dptx_phy;
 	dcp->connector_type = DRM_MODE_CONNECTOR_USB;
 	WRITE_ONCE(dcp->ext_backlight, false);
@@ -429,6 +581,12 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	bool ended_attachment;
 	int ret = 0;
 
+	WRITE_ONCE(dcp->peer_starved, false);
+	WRITE_ONCE(dcp->typec_narrow, false);
+	/* A peer reserved for this route's display is not needed any more. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		dcp_peer_release_26_6(dcp);
+
 	guard(mutex)(&dcp->external_lock);
 	if (dcp_is_external_h17p(dcp) &&
 	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
@@ -444,6 +602,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		if (route->deactivate_error)
 			return route->deactivate_error;
 		if (!route->deactivate_xbar_done) {
+			dcp_typec_route_phy_off(route);
 			if (!route->tunnel || route->xbar_up)
 				ret = mux_control_deselect(route->active_xbar ?: route->xbar);
 			else
@@ -530,12 +689,19 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		 * following DPTX call times out.  Park on a Type-C PHY instead,
 		 * for the same reason the USB-C-only case does below.
 		 */
-		if (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
+		/*
+		 * A yielded hybrid stays with the Type-C display through its
+		 * sink's HPD blinks; the HDMI display waits.
+		 */
+		if (dcp->hdmi_hpd && !READ_ONCE(dcp->hdmi_yielded) &&
+		    gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
 			dcp->phy = dcp->fixed_phy;
 			dcp->dptx_phy = dcp->fixed_dptx_phy;
 
-			if (dcp->xbar && !dcp->fixed_route_selected) {
-				ret = mux_control_select(dcp->xbar,
+			if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+				WRITE_ONCE(dcp->xbar, dcp->fixed_xbar);
+			if (dcp->fixed_xbar && !dcp->fixed_route_selected) {
+				ret = mux_control_select(dcp->fixed_xbar,
 							 dcp->fixed_mux_index);
 				if (ret)
 					return ret;
@@ -544,10 +710,20 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		} else {
 			dcp->phy = dcp->typec_routes[0].phy;
 			dcp->dptx_phy = dcp->typec_routes[0].dptx_phy;
+			/* The released route's control may go to another pipeline. */
+			if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+				WRITE_ONCE(dcp->xbar, NULL);
 		}
 	} else {
-		/* Keep DPTX endpoint discovery working before a cable is attached. */
-		dcp->phy = dcp->typec_routes[0].phy;
+		/*
+		 * Keep DPTX endpoint discovery working before a cable is
+		 * attached. Desktop 26.x powers the PHY with the route, so an
+		 * idle pipeline must not point at one.
+		 */
+		dcp->phy = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ?
+			   NULL : dcp->typec_routes[0].phy;
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+			WRITE_ONCE(dcp->xbar, NULL);
 		dcp->dptx_phy = dcp->typec_routes[0].dptx_phy;
 		dcp->connector_type = DRM_MODE_CONNECTOR_USB;
 	}
@@ -623,6 +799,7 @@ static bool dcp_typec_keep_order(void)
 
 static void dcp_typec_pipeline_freed(void);
 static int dcp_fixed_output_select(struct apple_dcp *dcp);
+static void dcp_typec_port_attach(struct apple_dcp_typec_port *port);
 
 static bool dcp_hdmi_settle_enabled(struct apple_dcp *dcp)
 {
@@ -636,7 +813,8 @@ static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp)
 	enum dcp_fabric_presence_state state;
 	unsigned long flags;
 
-	if (!dcp_hdmi_settle_enabled(dcp))
+	/* A yielded hybrid is free for Type-C, whatever HDMI shows. */
+	if (!dcp_hdmi_settle_enabled(dcp) || READ_ONCE(dcp->hdmi_yielded))
 		return DCP_FABRIC_ABSENT;
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
 	state = dcp->hdmi_presence.state;
@@ -653,6 +831,8 @@ static u64 dcp_hdmi_edge(struct apple_dcp *dcp)
 	if (!dcp_hdmi_settle_enabled(dcp))
 		return 0;
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
+	if (dcp->hdmi_presence.state != DCP_FABRIC_SETTLING)
+		dcp->hdmi_presence_prev = dcp->hdmi_presence.state;
 	generation = dcp_fabric_presence_edge(&dcp->hdmi_presence, jiffies,
 					      msecs_to_jiffies(DCP_HDMI_HOLD_MS));
 	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
@@ -689,14 +869,149 @@ static bool dcp_hdmi_sample(struct apple_dcp *dcp, u64 generation, int level)
 	accepted = dcp_fabric_presence_sample(&dcp->hdmi_presence, generation,
 					      level > 0, jiffies,
 					      msecs_to_jiffies(DCP_HDMI_HOLD_MS));
+	/*
+	 * The debounce guards against a glitch after an unplug.  A sample that
+	 * finds no sink where there was none before (start-up, and the sample
+	 * after system sleep) has nothing to debounce: the pipeline is free
+	 * now, not ten seconds later, when a Type-C port has already been
+	 * planned or moved onto another pipeline.
+	 */
+	if (accepted && level == 0 && dcp->hdmi_presence_prev == DCP_FABRIC_ABSENT) {
+		dcp->hdmi_presence.state = DCP_FABRIC_ABSENT;
+		dcp->hdmi_presence.deadline = 0;
+	}
 	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
 	dcp_hdmi_schedule(dcp);
 	return accepted;
 }
 
+/*
+ * A Type-C display wider than one pipe sits on a Type-C-only pipeline,
+ * which has no peer above it, because the hybrid was taken when it came
+ * (by an HDMI display, gone since).  Move it onto the free hybrid, as a
+ * replug does, so that it gets both pipes.
+ */
+static bool dcp_typec_move_starved_locked(void)
+{
+	struct apple_dcp_typec_port *port;
+	bool moved = false;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+
+	list_for_each_entry(port, &dcp_typec_ports, link) {
+		struct apple_dcp_typec_route *owner = port->owner, *to = NULL;
+		struct apple_dcp_typec_route *route;
+		struct apple_dcp *dcp;
+
+		if (!owner || owner->tunnel || !READ_ONCE(owner->dcp->peer_starved))
+			continue;
+		list_for_each_entry(route, &port->routes, port_link) {
+			if (route != owner && route->dcp->fixed_phy &&
+			    dcp_typec_route_available(route)) {
+				to = route;
+				break;
+			}
+		}
+		if (!to)
+			continue;
+
+		dcp = owner->dcp;
+		dev_info(dcp->dev, "display wider than one pipe moves to the free %s\n",
+			 dev_name(to->dcp->dev));
+		if (dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0))
+			continue;
+		port->preferred_route = to;
+		port->hpd = false;
+		if (dcp_typec_route_deactivate(owner))
+			continue;
+		port->owner = NULL;
+		if (dcp_typec_route_activate(to, to->xbar)) {
+			dev_warn(dcp->dev, "hybrid not taken, the display stays on its pipeline\n");
+			if (dcp_typec_route_activate(owner, owner->xbar))
+				continue;
+			to = owner;
+		}
+		port->owner = to;
+		dcp_typec_port_attach(port);
+		moved |= to != owner;
+	}
+	return moved;
+}
+
+/*
+ * The Type-C display on the hybrid fits one pipe again and an HDMI display
+ * waits: move the Type-C display onto a free Type-C-only pipeline, as a
+ * replug does, and connect the HDMI display.  The reclaim of the CRTC
+ * following machines does not apply on desktop 26.x.
+ */
+static bool dcp_typec_move_off_hybrid_locked(struct apple_dcp_typec_port *port,
+					     struct apple_dcp *hyb)
+{
+	struct apple_dcp_typec_route *owner = port->owner, *route, *to = NULL;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+	if (!owner || owner->dcp != hyb || owner->tunnel || port->safe_pending)
+		return false;
+	list_for_each_entry(route, &port->routes, port_link) {
+		if (route != owner && !route->dcp->fixed_phy && route->dcp->crtc &&
+		    dcp_typec_route_available(route)) {
+			to = route;
+			break;
+		}
+	}
+	if (!to)
+		return false;
+
+	dev_info(hyb->dev, "Type-C display moves to %s, HDMI display connects\n",
+		 dev_name(to->dcp->dev));
+	if (dcp_dptx_disconnect_oob(to_platform_device(hyb->dev), 0))
+		return false;
+	port->preferred_route = to;
+	port->hpd = false;
+	if (dcp_typec_route_deactivate(owner))
+		return false;
+	port->owner = NULL;
+	if (dcp_typec_route_activate(to, to->xbar)) {
+		dev_warn(hyb->dev, "Type-C display not moved, it stays on the hybrid\n");
+		if (dcp_typec_route_activate(owner, owner->xbar))
+			return false;
+		to = owner;
+	}
+	port->owner = to;
+	dcp_typec_port_attach(port);
+	if (to != owner && hyb->active && gpiod_get_value_cansleep(hyb->hdmi_hpd) > 0)
+		dcp_dptx_connect(hyb, 0);
+	return to != owner;
+}
+
 static void dcp_hdmi_capacity_available(void *ctx)
 {
 	dcp_typec_pipeline_freed();
+	dcp_typec_move_starved_locked();
+}
+
+/*
+ * Desktop 26.x: the HDMI display is gone (its converter's HPD fell and
+ * stayed low); its firmware reports no unplug.  Start the presence hold from
+ * here, as the edge handler of other machines does, also where presence was
+ * never tracked: when the hold expires, the desktop has let the HDMI CRTC go
+ * and the hybrid is free for a Type-C display again.
+ */
+void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	u64 generation;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	generation = dcp_hdmi_edge(dcp);
+	if (!generation)
+		return;
+	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
+	dcp->hdmi_presence_prev = DCP_FABRIC_PRESENT;
+	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
+	dcp_hdmi_sample(dcp, generation, gpiod_get_value_cansleep(dcp->hdmi_hpd));
+	/* A Type-C display that gave its pipes to this one takes them back. */
+	dcp_fabric_hybrid_kick(dcp, 0);
 }
 
 static void dcp_hdmi_settle_work(struct work_struct *work)
@@ -763,14 +1078,19 @@ static void dcp_hdmi_recheck_work(struct work_struct *work)
 	mod_delayed_work(system_freezable_wq, &dcp->hdmi_recheck_wq, 0);
 }
 
+static void dcp_hybrid_work(struct work_struct *work);
+
 void dcp_fabric_init(struct apple_dcp *dcp)
 {
 	spin_lock_init(&dcp->hdmi_presence_lock);
 	dcp->hdmi_presence.state = DCP_FABRIC_ABSENT;
+	dcp->hdmi_presence_prev = DCP_FABRIC_ABSENT;
 	INIT_DELAYED_WORK(&dcp->hdmi_settle_wq, dcp_hdmi_settle_work);
 	INIT_DELAYED_WORK(&dcp->hdmi_recheck_wq, dcp_hdmi_recheck_work);
+	INIT_DELAYED_WORK(&dcp->hybrid_wq, dcp_hybrid_work);
 	disable_delayed_work(&dcp->hdmi_settle_wq);
 	disable_delayed_work(&dcp->hdmi_recheck_wq);
+	disable_delayed_work(&dcp->hybrid_wq);
 }
 
 /* Caller enables the HPD IRQ first; a later edge invalidates this sample. */
@@ -831,10 +1151,10 @@ static void dcp_fixed_hdmi_reinit_locked(struct apple_dcp *dcp, const char *why)
 		if (ret)
 			dev_warn(dcp->dev, "HDMI: PHY not set up again: %d\n", ret);
 	}
-	if (dcp->xbar && dcp->fixed_route_selected && !dcp->active_typec_route) {
+	if (dcp->fixed_xbar && dcp->fixed_route_selected && !dcp->active_typec_route) {
 		scoped_guard(mutex, &dcp->tb_lock)
 			dcp->direct_xbar_up = NULL;
-		ret = mux_control_deselect(dcp->xbar);
+		ret = mux_control_deselect(dcp->fixed_xbar);
 		dcp->fixed_route_selected = false;
 		if (!ret)
 			ret = dcp_fixed_output_select(dcp);
@@ -876,7 +1196,7 @@ static void dcp_fabric_snapshot_port(struct apple_dcp_typec_port *port,
 		port->secondary_owner ? &port->secondary_owner->core : NULL;
 	port->core.preferred =
 		port->preferred_route ? &port->preferred_route->core : NULL;
-	port->core.wanted = port->dp_wanted;
+	port->core.wanted = port->dp_wanted && !port->typec_yielded;
 	port->core.hpd = port->dp_hpd;
 	port->core.candidate_crtcs[0] =
 		port->connector ? port->connector->candidate_crtcs : 0;
@@ -995,6 +1315,7 @@ dcp_typec_free_route(struct apple_dcp_typec_port *port)
 	struct dcp_fabric_policy policy = {
 		.dual_stream = dcp_typec_ordered_dual_stream(),
 		.follow = dcp_typec_port_follows(port),
+		.hybrid_first = dcp_typec_hybrid_first(),
 	};
 
 	dcp_fabric_snapshot_port(port, false);
@@ -1017,7 +1338,7 @@ static void dcp_typec_route_waiting(void)
 	list_for_each_entry(port, &dcp_typec_ports, link) {
 		struct dcp_fabric_port state = {
 			.owner[0] = port->owner ? &port->owner->core : NULL,
-			.wanted = port->dp_wanted,
+			.wanted = port->dp_wanted && !port->typec_yielded,
 			.hpd = port->dp_hpd,
 		};
 
@@ -1431,6 +1752,10 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	port->applied_conf = dp_conf;
 	/* Failed route acquisition must remain retryable on the next update. */
 	port->applied_valid = false;
+
+	/* did the pairing pass count this port's direct stream so far? */
+	was_counted = port->dp_wanted && port->dp_hpd;
+
 	/* Keep a direct route until DCP acknowledges release of its display. */
 	if (!hpd && port->owner && !port->owner->tunnel) {
 		struct apple_dcp *dcp = port->owner->dcp;
@@ -1442,15 +1767,50 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			if (ret && !dcp_is_external_h17p(dcp))
 				return ret;
 		}
+		/*
+		 * Desktop 26.x has one Type-C pipeline and powers the PHY with
+		 * the route. A sink that went away while the port stays in DP
+		 * alt mode (a dock whose monitor was unplugged) must give back
+		 * the pipeline, its crossbar and the PHY, or a display on
+		 * another port is refused as busy. The route is taken again
+		 * when HPD returns.
+		 */
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+			port->preferred_route = port->owner;
+			port->hpd = false;
+			/*
+			 * Not waiting for a pipeline either until HPD returns:
+			 * the pipeline just freed must not route this port again.
+			 */
+			port->dp_hpd = false;
+			ret = dcp_typec_route_deactivate(port->owner);
+			if (ret)
+				return ret;
+			port->owner = NULL;
+
+			/* The hybrid went back to a live HDMI display. */
+			if (dcp->hdmi_hpd && dcp->active && !READ_ONCE(dcp->hdmi_yielded) &&
+			    gpiod_get_value_cansleep(dcp->hdmi_hpd))
+				dcp_dptx_connect(dcp, 0);
+			dcp_typec_pipeline_freed();
+		}
 	}
 
-	/* did the pairing pass count this port's direct stream so far? */
-	was_counted = port->dp_wanted && port->dp_hpd;
-
 	if (!is_dp) {
+		struct apple_dcp_typec_route *r;
+
 		port->dp_wanted = false;
 		port->dp_hpd = false;
 		port->busy_noted = false;
+		/* The Type-C display is gone: a hybrid it took goes back to HDMI. */
+		dcp_hybrid_fails = 0;
+		port->typec_yielded = false;
+		list_for_each_entry(r, &port->routes, port_link) {
+			if (!READ_ONCE(r->dcp->hdmi_yielded))
+				continue;
+			dev_info(r->dcp->dev, "Type-C display gone: the hybrid goes back to HDMI\n");
+			WRITE_ONCE(r->dcp->hdmi_yielded, false);
+		}
 
 		/* a Thunderbolt/USB4 DP tunnel is torn down by its own path */
 		if (port->owner && port->owner->tunnel) {
@@ -1519,6 +1879,23 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			port->applied_valid = true;
 			return 0;
 		}
+	}
+
+	/*
+	 * Desktop 26.x has one Type-C pipeline: only a port with a sink (HPD)
+	 * takes it. A dock or cable in DP alt mode without a display behind it
+	 * would otherwise hold it against the port that has one.
+	 */
+	if (!port->owner && !hpd &&
+	    route->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		port->applied_valid = true;
+		return 0;
+	}
+
+	/* It gave its pipes to an HDMI display, see dcp_hybrid_work(). */
+	if (!port->owner && port->typec_yielded) {
+		port->applied_valid = true;
+		return 0;
 	}
 
 	if (!port->owner) {
@@ -1774,7 +2151,7 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	if (route && !route->tunnel && route->selected)
 		xbar = route->active_xbar ?: route->xbar;
 	else if (!route && dcp->fixed_route_selected)
-		xbar = dcp->xbar;
+		xbar = dcp->fixed_xbar;
 	/* A deselected output went idle, and its clocks with it. */
 	if (dcp->direct_xbar_up && dcp->direct_xbar_up != xbar)
 		dcp->direct_xbar_up = NULL;
@@ -1943,6 +2320,7 @@ static int dcp_tb_candidate(void *data)
 		struct dcp_fabric_policy policy = {
 			.dual_stream = dcp_typec_ordered_dual_stream(),
 			.follow = dcp_typec_port_follows(port),
+			.hybrid_first = dcp_typec_hybrid_first(),
 		};
 		struct dcp_fabric_route *chosen;
 		bool connector_present = dpin ? !!port->secondary_connector : !!port->connector;
@@ -2674,7 +3052,8 @@ static int dcp_typec_follow_decide(struct apple_dcp *dcp, struct drm_crtc *crtc,
 				   struct apple_connector *connector,
 				   struct dcp_typec_follow *follow)
 {
-	struct dcp_fabric_policy policy = { .dual_stream = dcp_typec_ordered_dual_stream() };
+	struct dcp_fabric_policy policy = { .dual_stream = dcp_typec_ordered_dual_stream(),
+					    .hybrid_first = dcp_typec_hybrid_first() };
 	struct apple_dcp_typec_route *from, *to, *holder, *back = NULL;
 	struct apple_dcp_typec_port *port, *other = NULL;
 	bool secondary, off = false;
@@ -3666,10 +4045,13 @@ static void dcp_fixed_restore_phy(void *ctx)
 static int dcp_fixed_select_mux(void *ctx)
 {
 	struct apple_dcp *dcp = ctx;
-	int ret = mux_control_select(dcp->xbar, dcp->fixed_mux_index);
+	int ret = mux_control_select(dcp->fixed_xbar, dcp->fixed_mux_index);
 
-	if (!ret)
+	if (!ret) {
 		dcp->fixed_route_selected = true;
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+			WRITE_ONCE(dcp->xbar, dcp->fixed_xbar);
+	}
 	return ret;
 }
 
@@ -3682,7 +4064,7 @@ static int dcp_fixed_output_select(struct apple_dcp *dcp)
 {
 	lockdep_assert_held(&dcp_typec_fabric_lock);
 	return dcp_fabric_run_fixed(!!dcp->fixed_phy, !!dcp->active_typec_route,
-				    dcp->xbar && !dcp->fixed_route_selected,
+				    dcp->fixed_xbar && !dcp->fixed_route_selected,
 				    &dcp_fixed_ops, dcp);
 }
 
@@ -3997,6 +4379,176 @@ static const struct dcp_fabric_hdmi_ops dcp_hdmi_ops = {
 	.observed = dcp_hdmi_observed,
 	.connect_fixed = dcp_hdmi_connect_fixed,
 };
+
+#define DCP_HYBRID_SETTLE_MS	3000
+#define DCP_HYBRID_COOLDOWN_MS	10000
+
+
+void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms)
+{
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP)
+		return;
+	mod_delayed_work(system_freezable_wq, &dcp->hybrid_wq, msecs_to_jiffies(delay_ms));
+}
+
+/* typec_hybrid_first was written: apply it now, past any cooldown. */
+static void dcp_fabric_hybrid_policy_changed(void)
+{
+	struct apple_dcp_typec_port *port;
+	struct apple_dcp_typec_route *route;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	dcp_hybrid_moved = 0;
+	dcp_hybrid_fails = 0;
+	list_for_each_entry(port, &dcp_typec_ports, link)
+		list_for_each_entry(route, &port->routes, port_link)
+			if (route->dcp->fixed_phy && route->dcp->hdmi_hpd)
+				dcp_fabric_hybrid_kick(route->dcp, 0);
+}
+
+static struct apple_dcp *dcp_typec_port_hybrid(struct apple_dcp_typec_port *port)
+{
+	struct apple_dcp_typec_route *route;
+
+	list_for_each_entry(route, &port->routes, port_link)
+		if (route->dcp->fixed_phy && route->dcp->hdmi_hpd)
+			return route->dcp;
+	return NULL;
+}
+
+/*
+ * Who drives the hybrid of a desktop 26.x machine when an HDMI display and
+ * a Type-C display wider than one pipe both want it (typically one monitor
+ * on two inputs; it cannot tell which input it shows, so typec_hybrid_first
+ * says, and the desktop may switch it):
+ *  - Type-C first: the Type-C display takes the hybrid and pairs, the HDMI
+ *    display waits; it gets the hybrid back while the Type-C display fits
+ *    one pipe (picture by picture) or is gone.
+ *  - HDMI first: an HDMI display keeps the hybrid; a Type-C display moves
+ *    off it, and takes it only while no HDMI display is there.
+ * A hand-over is an unplug and replug, so at most one per cooldown.
+ */
+static void dcp_hybrid_work(struct work_struct *work)
+{
+	struct apple_dcp *self = container_of(to_delayed_work(work), struct apple_dcp,
+					      hybrid_wq);
+	unsigned long cooldown = msecs_to_jiffies(DCP_HYBRID_COOLDOWN_MS);
+	bool typec_first = dcp_typec_hybrid_first();
+	struct apple_dcp_typec_port *port;
+	bool unyielded = false;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (dcp_hybrid_moved && time_before(jiffies, dcp_hybrid_moved + cooldown)) {
+		mod_delayed_work(system_freezable_wq, &self->hybrid_wq,
+				 dcp_hybrid_moved + cooldown - jiffies);
+		return;
+	}
+
+	/* A display that gave its pipes to HDMI takes one again when it may. */
+	list_for_each_entry(port, &dcp_typec_ports, link) {
+		struct apple_dcp *hyb = dcp_typec_port_hybrid(port);
+
+		if (!port->typec_yielded)
+			continue;
+		if (!typec_first && hyb && gpiod_get_value_cansleep(hyb->hdmi_hpd) > 0 &&
+		    hyb->connector && READ_ONCE(hyb->connector->connected) &&
+		    !READ_ONCE(hyb->typec_narrow))
+			continue;
+		dev_info(self->dev, "the display on %pOF takes a pipe again\n",
+			 port->connector_np);
+		port->typec_yielded = false;
+		unyielded = true;
+	}
+	if (unyielded) {
+		dcp_typec_route_waiting();
+		dcp_hybrid_moved = jiffies ?: 1;
+		return;
+	}
+
+	list_for_each_entry(port, &dcp_typec_ports, link) {
+		struct apple_dcp_typec_route *owner = port->owner, *route, *hybrid = NULL;
+		struct apple_dcp *hyb;
+		bool hdmi;
+
+		if (!owner || owner->tunnel)
+			continue;
+		list_for_each_entry(route, &port->routes, port_link) {
+			if (route->dcp->fixed_phy && route->dcp->hdmi_hpd) {
+				hybrid = route;
+				break;
+			}
+		}
+		if (!hybrid)
+			continue;
+		hyb = hybrid->dcp;
+		hdmi = gpiod_get_value_cansleep(hyb->hdmi_hpd) > 0;
+		if (!typec_first)
+			WRITE_ONCE(hyb->hdmi_yielded, false);
+
+		if (owner == hybrid) {
+			if (!hdmi || (typec_first && !READ_ONCE(hyb->typec_narrow)))
+				continue;
+			dev_info(hyb->dev, "%s: the hybrid goes back to the HDMI display\n",
+				 typec_first ? "Type-C display fits one pipe" : "HDMI display first");
+			WRITE_ONCE(hyb->hdmi_yielded, false);
+			if (dcp_typec_move_off_hybrid_locked(port, hyb))
+				dcp_hybrid_moved = jiffies ?: 1;
+			return;
+		}
+
+		/*
+		 * HDMI first, and the HDMI display is wider than one pipe: the
+		 * Type-C display on the other pipe gives it up and waits, and
+		 * the HDMI display asks for both pipes again.
+		 */
+		if (!typec_first && hdmi && READ_ONCE(hyb->peer_starved) &&
+		    hyb->connector && READ_ONCE(hyb->connector->connected)) {
+			struct apple_dcp *dcp = owner->dcp;
+
+			dev_info(hyb->dev, "the display on %pOF waits: the HDMI display takes both pipes\n",
+				 port->connector_np);
+			if (dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0))
+				continue;
+			port->hpd = false;
+			if (dcp_typec_route_deactivate(owner))
+				continue;
+			port->owner = NULL;
+			port->typec_yielded = true;
+			WRITE_ONCE(hyb->peer_starved, false);
+			if (!dcp_dptx_disconnect(hyb, 0))
+				dcp_dptx_connect(hyb, 0);
+			dcp_hybrid_moved = jiffies ?: 1;
+			return;
+		}
+
+		if (!READ_ONCE(owner->dcp->peer_starved) || hyb->active_typec_route ||
+		    dcp_typec_safe_held(hyb) || dcp_hybrid_fails >= DCP_HYBRID_MAX_FAILS ||
+		    (!typec_first && hdmi))
+			continue;
+		if (typec_first && !READ_ONCE(hyb->hdmi_yielded)) {
+			WRITE_ONCE(hyb->hdmi_yielded, true);
+			dev_info(hyb->dev, "hybrid yielded to the Type-C display on %pOF\n",
+				 port->connector_np);
+			/* Also a link the firmware keeps without a described display. */
+			if ((hyb->connector && READ_ONCE(hyb->connector->connected)) ||
+			    hyb->dptxport[0].connected) {
+				dev_info(hyb->dev, "HDMI display waits: the hybrid goes to a Type-C display wider than one pipe\n");
+				dcp_hdmi_yield_link(hyb);
+				/* The desktop turns the HDMI CRTC off first. */
+				mod_delayed_work(system_freezable_wq, &self->hybrid_wq,
+						 msecs_to_jiffies(DCP_HYBRID_SETTLE_MS));
+				return;
+			}
+		}
+		if (dcp_typec_move_starved_locked())
+			dcp_hybrid_fails = 0;
+		else if (++dcp_hybrid_fails >= DCP_HYBRID_MAX_FAILS)
+			dev_warn(hyb->dev, "hybrid not taken %u times, waiting for the next plug\n",
+				 dcp_hybrid_fails);
+		dcp_hybrid_moved = jiffies ?: 1;
+		return;
+	}
+}
 
 static void dcp_hdmi_update_locked(struct apple_dcp *dcp)
 {

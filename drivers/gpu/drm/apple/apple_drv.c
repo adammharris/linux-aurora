@@ -268,8 +268,11 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 		/* A cable generation can change while the CRTC stays active. */
 		dcp_external_recover(to_apple_crtc(crtc)->dcp);
 	}
-	if (crtc_state->active)
-		dcp_crtc_atomic_modeset(crtc, commit);
+	if (crtc_state->active) {
+		ret = dcp_crtc_atomic_modeset(crtc, commit);
+		if (ret)
+			dcp_drm_crtc_error(apple_crtc, crtc_state, ret);
+	}
 	dcp_typec_follow_done(locked);
 	return;
 

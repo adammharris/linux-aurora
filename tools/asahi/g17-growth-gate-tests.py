@@ -38,6 +38,7 @@ impl CondVar {
 struct Gate{state:AtomicU64,wait:Mutex,changed:CondVar}
 struct Lease{gate:Arc<Gate>,epoch:u64}
 impl Gate {
+ fn wake_waiters(&self) {}
 ''' + methods + '\n}\n' + item(gate,'impl Drop for Lease') + r'''
 struct Backend {gate:Arc<Gate>,ready:mpsc::Sender<()>,proceed:StdMutex<mpsc::Receiver<()>>}
 impl Backend {

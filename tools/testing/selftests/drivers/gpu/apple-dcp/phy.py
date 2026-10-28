@@ -4,7 +4,7 @@
 from pathlib import Path
 import re
 from common import (block, source_defines, atc_mux_without_pm, ATC_POST_TUNABLE,
-                    atc_function, ATC_SPLIT, ATC_T8103_LIVE)
+                    atc_function, ATC_SPLIT, ATC_T8103_LIVE, atc_restore_helpers)
 
 def parking(root):
 
@@ -51,6 +51,8 @@ struct apple_atcphy {
     bool usb3_port_off, park_owed;
     bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
     bool dp_only, pd_was_off, tunnel_clock_on;
+    /* T8132 idle runtime PM; these PHYs never power down while idle. */
+    bool idle_rpm, rpm_held;
     unsigned int tunnel_rate, tunnel_users;
     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122;
     enum atcphy_mode mode, typec_mode;
@@ -176,6 +178,7 @@ static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(
     for name in ('core_read32', 'atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
         parts.append(function(atc, name))
     parts.append(dp)
+    parts.append(atc_restore_helpers(atc))
     for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
                  'atcphy_enable_dp_aux', 'atcphy_disable_dp_aux', 'atcphy_power_off',
                  'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_set_orientation',

@@ -212,6 +212,8 @@ bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
 bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
 			       u32 out_len);
+/* Desktop 26.6: does the record hold what the tag's handler reads and writes? */
+bool iomfb_check_callback_v26_6_desktop(int tag, u32 in_len, u32 out_len);
 
 typedef bool (*iomfb_cb_handler)(struct apple_dcp *, int, void *, void *);
 

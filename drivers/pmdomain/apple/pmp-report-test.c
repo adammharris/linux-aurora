@@ -276,4 +276,5 @@ static struct kunit_suite apple_pmp_report_suite = {
 };
 
 kunit_test_suite(apple_pmp_report_suite);
+MODULE_DESCRIPTION("KUnit tests for Apple PMP report validation");
 MODULE_LICENSE("Dual MIT/GPL");

@@ -50,7 +50,7 @@ impl Changed{
  fn notify_all(&self){}
 }
 struct Shared{preparations:Gate,state:State,changed:Changed,crashed:AtomicBool}
-impl Shared{fn drm(&self)->Result<()>{Ok(())}}
+impl Shared{fn drm(&self)->Result<()>{Ok(())} fn note_changed(&self){self.changed.notify_all();}}
 struct Context;impl Context{fn vm(&self)->&(){&()}}
 struct Backend{shared:Shared,context:Context}
 struct Allocator<'a>{dev:&'a (),uat:&'a ()}

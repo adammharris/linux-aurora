@@ -85,6 +85,8 @@ struct dwc3_apple {
 	struct phy *usb2_phy, *usb3_phy;
 	bool fixed_hub, core_active, core_exit_pending, reset_pending, shutting_down;
 	bool rpm_held, host_only;
+	/* T8132 only: runtime PM before the first core probe; never set here. */
+	bool pre_core_rpm;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 };
 static unsigned int polls, fail_poll, reset_calls, reset_writes, core_writes;

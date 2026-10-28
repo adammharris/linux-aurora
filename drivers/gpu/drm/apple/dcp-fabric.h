@@ -39,6 +39,8 @@ struct apple_dcp_typec_route {
 	u32 dptx_phy;
 	u32 mux_index;
 	bool selected;
+	/* desktop 26.x: the DP PHY is initialised and powered for this route */
+	bool phy_powered;
 	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
 	unsigned int tunnel_dpin;
 	u64 tunnel_generation;
@@ -51,6 +53,7 @@ struct apple_dcp_typec_route {
 	int deactivate_error;
 };
 
+int dcp_typec_phy_on(struct apple_dcp *dcp);
 bool dcp_is_typec_output(struct apple_dcp *dcp);
 bool dcp_is_usb4_output(struct apple_dcp *dcp);
 bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *dcp);

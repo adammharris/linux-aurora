@@ -1008,6 +1008,149 @@ static void atcphy_test_usb2_init_after_safe(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_OFF);
 }
 
+/* An idle T8132 PHY may let its domain drop; anything it still runs holds it. */
+static void atcphy_test_t8132_rpm_busy(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc(test, false);
+
+	atcphy->hw = &atcphy_hw_t8132;
+	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	KUNIT_EXPECT_FALSE(test, atcphy_rpm_busy(atcphy));
+
+	atcphy->mode = APPLE_ATCPHY_MODE_USB2;
+	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
+	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
+
+	atcphy->host_active = true;
+	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
+	atcphy->host_active = false;
+
+	atcphy->pipe_pending = true;
+	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
+	atcphy->pipe_pending = false;
+
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
+	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+
+	/* A failed USB3 admission keeps its common-power epoch */
+	atcphy->t8132_common_owned = true;
+	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
+}
+
+/* The hold follows the busy state, with one reference at most. */
+static void atcphy_test_t8132_rpm_hold(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
+
+	atcphy->hw = &atcphy_hw_t8132;
+	atcphy->idle_rpm = true;
+	atcphy->mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy_rpm_sync(atcphy);
+	KUNIT_EXPECT_TRUE(test, atcphy->rpm_held);
+	KUNIT_EXPECT_EQ(test, atomic_read(&atcphy->dev->power.usage_count), 1);
+	atcphy_rpm_sync(atcphy);
+	KUNIT_EXPECT_EQ(test, atomic_read(&atcphy->dev->power.usage_count), 1);
+
+	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
+	atcphy_rpm_sync(atcphy);
+	KUNIT_EXPECT_FALSE(test, atcphy->rpm_held);
+	KUNIT_EXPECT_EQ(test, atomic_read(&atcphy->dev->power.usage_count), 0);
+
+	/* Unbind drops a hold that is still taken */
+	atcphy->mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy_rpm_sync(atcphy);
+	atcphy_rpm_release(atcphy);
+	KUNIT_EXPECT_FALSE(test, atcphy->rpm_held);
+	KUNIT_EXPECT_EQ(test, atomic_read(&atcphy->dev->power.usage_count), 0);
+}
+
+/* Record the mode a restore asks for, without touching MMIO. */
+static int atcphy_test_configure_record(struct apple_atcphy *atcphy, enum atcphy_mode mode)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct atcphy_test_configure *config = test->priv;
+
+	lockdep_assert_held(&atcphy->lock);
+	config->calls++;
+	if (mode != APPLE_ATCPHY_MODE_OFF)
+		config->lane_requests++;
+	atcphy->mode = mode;
+	return 0;
+}
+
+/* A T8132 PHY whose domain was off: zeroed memory stands in for the reset block. */
+static struct apple_atcphy *atcphy_test_alloc_t8132_pd_off(struct kunit *test,
+							   enum atcphy_mode mode)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
+	void *core = kunit_kzalloc(test, ATCPHY_MISC + 4, GFP_KERNEL);
+	void *pipehandler = kunit_kzalloc(test, PIPEHANDLER_T8132_USB2_CONFIG + 4, GFP_KERNEL);
+	void *usb2phy = kunit_kzalloc(test, USB2PHY_MISCTUNE + 4, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, core);
+	KUNIT_ASSERT_NOT_NULL(test, pipehandler);
+	KUNIT_ASSERT_NOT_NULL(test, usb2phy);
+	atcphy->regs.core = (__force void __iomem *)core;
+	atcphy->regs.pipehandler = (__force void __iomem *)pipehandler;
+	atcphy->regs.usb2phy = (__force void __iomem *)usb2phy;
+	atcphy->hw = &atcphy_hw_t8132;
+	atcphy->mode = mode;
+	atcphy->pd_was_off = true;
+
+	return atcphy;
+}
+
+/* The probe baseline comes back: controller in reset, USB2 off, dummy PIPE clock on. */
+static void atcphy_test_t8132_restore_idle(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_t8132_pd_off(test, APPLE_ATCPHY_MODE_OFF);
+	struct atcphy_test_configure config = {};
+	u32 aon;
+
+	test->priv = &config;
+	kunit_activate_static_stub(test, atcphy_configure, atcphy_test_configure_record);
+	scoped_guard(mutex, &atcphy->lock)
+		atcphy_restore_after_pd_off(atcphy);
+
+	KUNIT_EXPECT_FALSE(test, atcphy->pd_was_off);
+	KUNIT_EXPECT_EQ(test, config.calls, 0U);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_OFF);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+	aon = readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN);
+	KUNIT_EXPECT_FALSE(test, aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+	KUNIT_EXPECT_TRUE(test, aon & PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+	KUNIT_EXPECT_TRUE(test, readl(atcphy->regs.pipehandler + PIPEHANDLER_T8132_USB2_CONFIG) &
+			  PIPEHANDLER_T8132_USB2_CONFIG_EN);
+	KUNIT_EXPECT_TRUE(test, readl(atcphy->regs.usb2phy + USB2PHY_CTL) & USB2PHY_CTL_SIDDQ);
+	/* As at probe, the common block is left for a USB3 admission to acquire. */
+	KUNIT_EXPECT_EQ(test, readl(atcphy->regs.core + ATCPHY_POWER_CTRL), 0U);
+
+	/* Nothing to do once the state is back. */
+	scoped_guard(mutex, &atcphy->lock)
+		atcphy_restore_after_pd_off(atcphy);
+	KUNIT_EXPECT_EQ(test, config.calls, 0U);
+}
+
+/* After the baseline, the mode the Type-C mux selected is requested again. */
+static void atcphy_test_t8132_restore_mode(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_t8132_pd_off(test, APPLE_ATCPHY_MODE_USB2);
+	struct atcphy_test_configure config = {};
+
+	test->priv = &config;
+	kunit_activate_static_stub(test, atcphy_configure, atcphy_test_configure_record);
+	scoped_guard(mutex, &atcphy->lock)
+		atcphy_restore_after_pd_off(atcphy);
+
+	KUNIT_EXPECT_EQ(test, config.calls, 1U);
+	KUNIT_EXPECT_EQ(test, config.lane_requests, 1U);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB2);
+	KUNIT_EXPECT_FALSE(test, readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN) &
+			   PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+}
+
 static void atcphy_test_t8103_usb3_machine_scope(struct kunit *test)
 {
 	static const struct {
@@ -1084,3 +1227,18 @@ static struct kunit_suite atcphy_mux_test_suite = {
 };
 
 kunit_test_suite(atcphy_mux_test_suite);
+
+static struct kunit_case atcphy_t8132_pm_test_cases[] = {
+	KUNIT_CASE(atcphy_test_t8132_rpm_busy),
+	KUNIT_CASE(atcphy_test_t8132_rpm_hold),
+	KUNIT_CASE(atcphy_test_t8132_restore_idle),
+	KUNIT_CASE(atcphy_test_t8132_restore_mode),
+	{}
+};
+
+static struct kunit_suite atcphy_t8132_pm_test_suite = {
+	.name = "phy-apple-atc-t8132-pm",
+	.test_cases = atcphy_t8132_pm_test_cases,
+};
+
+kunit_test_suite(atcphy_t8132_pm_test_suite);

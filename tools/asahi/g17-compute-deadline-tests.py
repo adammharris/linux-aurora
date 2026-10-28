@@ -49,7 +49,7 @@ static NOW:AtomicU64=AtomicU64::new(0);static CALLS:AtomicUsize=AtomicUsize::new
 static MODE:AtomicUsize=AtomicUsize::new(0);static CANCEL:AtomicU64=AtomicU64::new(u64::MAX);
 static STATUS:AtomicU64=AtomicU64::new(u64::MAX);static CLOSED:AtomicBool=AtomicBool::new(false);
 fn now_ns()->u64{NOW.load(Ordering::SeqCst)}
-fn advance(ns:u64){NOW.fetch_add(ns,Ordering::SeqCst);}
+fn advance(ns:u64){NOW.fetch_add(ns,Ordering::SeqCst);assert!(now_ns()<=6_000_000_000,"admission budget exceeded");}
 mod kernel{pub mod time{
  pub fn msecs_to_jiffies(ms:u32)->u32{ms}
  pub struct Delta(pub u64);impl Delta{pub fn from_millis(ms:u64)->Self{Self(ms*1_000_000)}pub fn from_micros(us:i64)->Self{Self(us as u64*1_000)}}
@@ -76,20 +76,33 @@ struct Packet{command:Validated,completion:Completion}
 impl Packet{fn check_dependencies(&self)->Result{Ok(())}fn cancel_requested(&self)->bool{now_ns()>=CANCEL.load(Ordering::SeqCst)}fn is_published(&self)->bool{false}}
 struct DeferredBatch;impl DeferredBatch{fn publication()->Result<Self>{Ok(Self)}fn finish(&mut self){}}
 struct Recovery;impl Recovery{fn pending(&self)->bool{MODE.load(Ordering::SeqCst)==1}}
-struct Memory;impl Memory{fn recovery_state(_:&())->Result<u32>{Ok(0)}}
+struct Init;impl Init{fn compute_vm_cached(&self,_:&())->bool{true}}
+struct Context;impl Context{fn vm(&self)->&(){&()}}
+struct Memory;impl Memory{fn recovery_state(_:&Init)->Result<u32>{Ok(0)}}
 struct Queues;
 impl Queues{
+ fn compute_bound(&self,_:u64,_:&Context,_:usize)->Result<bool>{Ok(MODE.load(Ordering::SeqCst)!=0)}
  fn compute(&self,_:u64)->Option<()>{if MODE.load(Ordering::SeqCst)==0{None}else{Some(())}}
  fn render_prefix(&self,_:u64,_:&Arc<Packet>)->Result<Vec<()>>{Ok(vec![])}
- fn release_compute_witness(&self,_:&(),_:u64,_:&mut DeferredBatch)->Result<bool>{Ok(MODE.load(Ordering::SeqCst)==2)}
+ fn release_compute_witness(&self,_:&Init,_:&(),_:u64,_:&mut DeferredBatch)->Result<bool>{Ok(MODE.load(Ordering::SeqCst)==2)}
 }
-struct Firmware{recovery:Recovery,init:(),queues:Queues}
+struct Firmware{recovery:Recovery,init:Init,queues:Queues,port:()}
 impl Firmware{fn replay_compute(&mut self,_:&mut DeferredBatch)->Result{Ok(())}fn publish_compute(&mut self,_:u64,_:Arc<Packet>,_:&[()],_:&mut DeferredBatch)->Result{Err(EAGAIN)}}
 struct State(Mutex<Option<Box<Firmware>>>);impl State{fn lock(&self)->MutexGuard<'_,Option<Box<Firmware>>>{self.0.lock().unwrap()}}
-struct Shared{preparations:Arc<Gate>,state:State,crashed:AtomicBool,active_cores:u32}impl Shared{fn queue_events(&self){}}
-struct Backend{shared:Shared,owner:u64}
+struct Available;impl Available{fn observe(&self)->u64{now_ns()}}
+struct Shared{preparations:Arc<Gate>,state:State,crashed:AtomicBool,active_cores:u32,progress:Available}impl Shared{fn queue_events(&self){}}
+struct ComputeDemand;impl ComputeDemand{fn new(_:&Shared)->Self{Self}}
+struct Backend{shared:Shared,owner:u64,context:Context}
 fn required_blocks(_:u32,_:u16)->Result<usize>{Ok(1)}
 impl Backend{
+ fn compute_direct(&self,_:&Arc<Packet>,_:usize,_:&mut DeferredBatch)->Option<Result>{None}
+ fn sources_published(&self,_:&Arc<Packet>)->Result<bool>{Ok(true)}
+ fn remember_direct(&self,_:&Queues){}
+ fn wait_release(&self,_:&Available,_:u64,admission:&Admission<'_>)->Result{
+  let _=admission.slice_ms()?;
+  advance(1_000_000);
+  admission.check()
+ }
  fn admission_open(&self)->Result{Ok(())}
  // The real ensure_compute forwards the original context into this allocation
  // boundary. Each success loses its binding before the publication mutex.
@@ -99,7 +112,7 @@ impl Backend{
 ''' + ensure + '\n' + packet + r'''
 }
 fn main(){
- let b=Backend{owner:1,shared:Shared{active_cores:1,preparations:Arc::new(Gate{wait:Wait,changed:Changed}),state:State(Mutex::new(Some(Box::new(Firmware{recovery:Recovery,init:(),queues:Queues})))),crashed:AtomicBool::new(false)}};
+ let b=Backend{owner:1,context:Context,shared:Shared{active_cores:1,progress:Available,preparations:Arc::new(Gate{wait:Wait,changed:Changed}),state:State(Mutex::new(Some(Box::new(Firmware{recovery:Recovery,init:Init,queues:Queues,port:()})))),crashed:AtomicBool::new(false)}};
  let p=Arc::new(Packet{command:Validated::Compute{scratch:Scratch},completion:Completion});
  for mode in 0..4 {
   MODE.store(mode,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
@@ -144,8 +157,8 @@ def main():
     source = fixture()
     mutants = [
         ('fixed', source, ''),
-        ('renew-on-binding-loss', source.replace('let admission = Admission::new(deadline, &check);\n        loop {', 'loop {\n            let admission = Admission::new(now_ns().saturating_add(WORK_RING_WAIT_NS), &check);'), 'one admission budget'),
-        ('omit-nested-check', source.replace('            admission.check()?;\n            let pending', '            let pending'), 'nested unavailable-capacity'),
+        ('renew-on-binding-loss', source.replace('let admission = Admission::new(deadline, &check);\n        let progress = &self.shared.progress;\n        loop {', 'let progress = &self.shared.progress;\n        loop {\n            let admission = Admission::new(now_ns().saturating_add(WORK_RING_WAIT_NS), &check);'), 'admission budget exceeded'),
+        ('ignore-deadline', source.replace('if now_ns() >= self.deadline', 'if false'), 'admission budget exceeded'),
         ('omit-gate-check', source.replace('            admission.check()?;\n            match self.try_enter()', '            match self.try_enter()').replace('admission.slice_ms()?', '10'), 'gate wake storm'),
     ]
     # Bind the old unbounded mutant with the review's eventual cancellation.

@@ -23,7 +23,7 @@ type Result<T=()> = std::result::Result<T,i32>;
 const EIO:i32=-5;const EBUSY:i32=-16;const EINVAL:i32=-22;
 fn now_ns()->u64{123}
 struct Context {live:Arc<AtomicUsize>}
-impl Context {fn new(live:&Arc<AtomicUsize>)->Arc<Self>{live.fetch_add(1,Ordering::SeqCst);Arc::new(Self{live:live.clone()})}}
+impl Context {fn note_compute_binding(&self,_:bool){} fn new(live:&Arc<AtomicUsize>)->Arc<Self>{live.fetch_add(1,Ordering::SeqCst);Arc::new(Self{live:live.clone()})}}
 impl Drop for Context {fn drop(&mut self){self.live.fetch_sub(1,Ordering::SeqCst);}}
 struct Binding {context:Arc<Context>,pool_alias:Option<u64>,descriptors:Option<u64>}
 struct Previous {context:Arc<Context>,binding:Option<Binding>,publication:Option<(u64,u64)>}
@@ -31,17 +31,19 @@ struct Previous {context:Arc<Context>,binding:Option<Binding>,publication:Option
 struct Fifo {len:usize}
 struct Graph;
 impl Graph {fn set_owner(&mut self,_:&Context)->Result{Ok(())}}
+struct ReaderHint; impl ReaderHint {fn has_readers(&self,count:&AtomicU32)->bool{count.load(Ordering::Acquire)!=0}}
 struct Queue {
  owner:Option<u64>,installed:bool,growing:bool,growth_blocks:usize,free_list_generation:u64,
  pool_phase:PoolPhase,release_sent_ns:Option<u64>,pool:Pool,binding:Option<Binding>,previous:Option<Previous>,graph:Graph,
  active:Fifo,replays:Fifo,quarantined:bool,released:bool,retirement_ready:bool,
  retired_by_teardown:bool,released_at:u64,exit:Option<()>,needs_fresh_backing:bool,
+ source_hint:ReaderHint,source_readers:AtomicU32,
 }
 fn idle(live:&Arc<AtomicUsize>)->Queue{Queue{owner:Some(1),installed:true,growing:false,growth_blocks:0,
  free_list_generation:0,pool_phase:PoolPhase::Populated,release_sent_ns:None,pool:Pool{pages:Some(Pages(10)),fail:false},
  binding:Some(Binding{context:Context::new(live),pool_alias:Some(1),descriptors:Some(2)}),previous:None,graph:Graph,
  active:Fifo{len:0},replays:Fifo{len:0},quarantined:false,released:false,retirement_ready:true,
- retired_by_teardown:false,released_at:0,exit:None,needs_fresh_backing:false}}
+ retired_by_teardown:false,released_at:0,exit:None,needs_fresh_backing:false,source_hint:ReaderHint,source_readers:AtomicU32::new(0)}}
 impl Queue {
 ''' + item(source,'pub(crate) fn release_owner(') + item(source,'pub(crate) fn reusable(') + '\n}\n'
     methods = '\n'.join(item(source, sig) for sig in ['pub(crate) fn begin_growth(', 'pub(crate) fn finish_growth(', 'pub(crate) fn growth_token(', 'pub(crate) fn abort_growth(', 'pub(crate) fn observe_vacancy('])
@@ -156,7 +158,7 @@ fn main(){
 def main():
     source = fixture()
     runtime = (ROOT / 'runtime.rs').read_text()
-    assert 'growth = queue.growth_token();' in runtime and 'queue.abort_growth(token)?' in runtime
+    assert 'growth = queue.growth_token();' in runtime and 'queue.abort_growth(token)' in runtime
     cases = [('fixed', source),
              ('missing-abort-transfer', source.replace('self.growing = false;\n        self.growth_blocks = 0;\n        self.release_owner().map(Some)', 'self.release_owner().map(Some)')),
              ('ignore-consumption', source.replace('if !crate::g17::freelist::control_consumed(consumer, producer, cursor)? {', 'if false {')),
