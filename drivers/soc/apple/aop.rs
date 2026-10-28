@@ -1576,8 +1576,8 @@ impl AopData {
         if res.end < res.start {
             return Err(EINVAL);
         }
-        let phys = res.start as u64;
-        let size = (res.end - res.start) as u64 + 1;
+        let phys = res.start;
+        let size = res.end - res.start + 1;
 
         let mut len: c_int = 0;
         // SAFETY: `region` is a valid node and the name is NUL-terminated.
@@ -1712,8 +1712,7 @@ impl AopData {
             while off < size {
                 // SAFETY: `domain` is the device's domain, live while it is
                 // bound.
-                let back =
-                    unsafe { bindings::iommu_iova_to_phys(domain, (iova + off) as _) } as u64;
+                let back = unsafe { bindings::iommu_iova_to_phys(domain, iova + off) };
                 if back != phys + off {
                     dev_err!(
                         dev,
