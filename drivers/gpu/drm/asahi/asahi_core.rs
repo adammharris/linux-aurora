@@ -176,15 +176,15 @@ module! {
         },
         mem_limit_pct: u32 {
             default: 67,
-            description: "Device-wide GPU memory limit in percent of RAM (0 or >= 100: none)",
+            description: "G17: device-wide GPU memory limit in percent of RAM (0 or >= 100: none)",
         },
         client_mem_limit_pct: u32 {
             default: 50,
-            description: "Per-client GPU memory limit in percent of RAM (0: the device limit)",
+            description: "G17: per-client GPU memory limit in percent of RAM (0: the device limit)",
         },
         oom_attribution: u8 {
             default: 1,
-            description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
+            description: "G17: count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
         },
     },
 }

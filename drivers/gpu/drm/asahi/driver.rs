@@ -236,7 +236,6 @@ impl platform::Driver for AsahiPlatformDriver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         debug::update_debug_flags();
-        crate::memacct::LEDGER.configure();
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
@@ -394,6 +393,8 @@ impl AsahiPlatformDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         cfg: &'static g17::Config,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
+        // The GPU memory limits and RSS attribution apply only to G17 for now.
+        crate::memacct::LEDGER.configure();
         // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
         let resources = regs::Resources::new(pdev)?;
