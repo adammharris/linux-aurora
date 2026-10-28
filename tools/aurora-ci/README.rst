@@ -169,31 +169,42 @@ package that a later run would skip testing and attest.
 
 The one exception is the merge queue itself. A queued pull request has been
 approved after its last push, and a push takes it out of the queue, so a
-run at the head being merged (the queue commit's second parent) ran the
-reviewed code. The queue takes the packages and verification of such a run
-instead of building and booting again when the run is ``kernel-ci.yml`` or
-``kernel-ci-label.yml`` on a pull request event in this repository, passed
-at its first attempt and was never re-run, has exactly one live package
-and one live verification record for the build key, and its record names
-a merge commit with exactly the queue commit's tree (CI files and expected
-results included). The package job downloads that very artifact by its ID.
-A later queue entry also carries the entries ahead of it, so its tree
-normally differs and it builds; an equal tree is taken. The run is matched
-by its head, not by its pull request number. The queue still runs the
-checks and, when the branch has a baseline, compares the packages with it,
-but uploads no reusable package, metadata or verification record, so
-nothing from a pull request becomes evidence a later run trusts. Anything
-else, or evidence that cannot be read, leaves the usual lookup, which
-trusts only the branch and the queue.
+run of that pull request at the head being merged (the queue commit's
+second parent) ran the reviewed code, provided it ran on the merge GitHub
+makes with ``integration/aurora``: a run of the same head in another pull
+request, say one onto a branch with other workflows, runs that branch's
+workflows. So the queue takes the packages and verification of a run
+instead of building and booting again only when:
 
-What this trusts: the record is the pull request run's own word. Nothing
-shows which job of that run wrote it, or that it verified those exact
-package bytes, so code at the reviewed head that ran in that run could
-have written it. And for these pull requests any trusted build and test
-still needed happens after the merge: the push takes the usual path for the
-key (a branch or queue run's packages and verification, else a build, and
-KUnit and boot unless a branch or queue run already verified the key), so a
-failure there comes after the change has merged.
+- the run is ``kernel-ci.yml`` or ``kernel-ci-label.yml`` on a pull request
+  event in this repository, at that head, and passed at its first attempt
+  (never re-run);
+- GitHub recorded exactly one call of ``kernel-ci-jobs.yml`` for it, from the
+  run's own workflow file (ref ``refs/pull/<number>/merge`` of the pull request
+  the queue is merging, path ending in the commit it ran), and that commit's
+  tree is exactly the queue commit's tree, CI files and expected results
+  included;
+- the run has exactly one live package and one live verification record for
+  the build key, and the record names the key, the run and that commit.
+
+The package job downloads that very artifact by its ID. A later queue
+entry also carries the entries ahead of it, so its tree normally differs
+and it builds; an equal tree is taken. The queue still runs the checks and,
+when the branch has a baseline, compares the packages with it, but uploads
+no reusable package, metadata or verification record, so nothing from a
+pull request becomes evidence a later run trusts. Anything else, or
+evidence that cannot be read, leaves the usual lookup, which trusts only
+the branch and the queue.
+
+What this trusts: GitHub's record of which pull request and commit the run
+ran, and, within that run, the verification record, which is the run's own
+word. Nothing shows which job of the run wrote it, or that it verified
+those exact package bytes, so code at the reviewed head that ran in that
+run could have written it. And for these pull requests any trusted build
+and test still needed happens after the merge: the push takes the usual
+path for the key (a branch or queue run's packages and verification, else a
+build, and KUnit and boot unless a branch or queue run already verified
+the key), so a failure there comes after the change has merged.
 
 What keeps untrusted code off
 paid runners is GitHub's setting to

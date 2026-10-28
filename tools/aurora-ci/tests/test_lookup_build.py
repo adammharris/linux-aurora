@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
+import http.client
 import io
 import json
 import unittest
@@ -18,9 +19,9 @@ class FakeApi:
         self.asked.append(name)
         return self.artifacts.get(name, "")
 
-    def pull_request_evidence(self, key, head_sha, tree):
-        self.asked.append(("evidence", key, head_sha))
-        run, tested, package = self.evidence.get((key, head_sha), ("", None, ""))
+    def pull_request_evidence(self, key, number, head_sha, tree):
+        self.asked.append(("evidence", key, number, head_sha))
+        run, tested, package = self.evidence.get((key, number, head_sha), ("", None, ""))
         return (run, package) if tested == tree else ("", "")
 
 
@@ -78,9 +79,9 @@ class LookupTest(TempDirTestCase):
 
     def pull_request_api(self, tested_tree=None, artifacts=None):
         tree = git(self.kernel, "rev-parse", "HEAD^{tree}")
-        return FakeApi(artifacts, {(self.key(), "c0ffee"): ("21", tested_tree or tree, "77")})
+        return FakeApi(artifacts, {(self.key(), "7", "c0ffee"): ("21", tested_tree or tree, "77")})
 
-    def queue(self, api, force=False, pull_request="c0ffee"):
+    def queue(self, api, force=False, pull_request=("7", "c0ffee")):
         result = lookup.lookup(api, self.kernel, self.recipe, "", force=force, pull_request=pull_request)
         return result["package_run"], result["verified_run"], result["pull_request_run"], result["package_artifact"]
 
@@ -96,10 +97,10 @@ class LookupTest(TempDirTestCase):
         key = self.key()
         api = self.pull_request_api(artifacts={f"kernel-package-{key}": "11", f"kernel-verified-{key}": "12"})
         self.assertEqual(self.queue(api), ("11", "12", "", ""))
-        self.assertNotIn(("evidence", key, "c0ffee"), api.asked)
+        self.assertNotIn(("evidence", key, "7", "c0ffee"), api.asked)
 
     def test_no_pull_request_run_outside_the_merge_queue_or_when_forced(self):
-        for pull_request, force in (("", False), ("c0ffee", True)):
+        for pull_request, force in ((None, False), (("7", "c0ffee"), True)):
             with self.subTest(pull_request=pull_request, force=force):
                 api = self.pull_request_api()
                 self.assertEqual(self.queue(api, force, pull_request), ("", "", "", ""))
@@ -108,10 +109,11 @@ class LookupTest(TempDirTestCase):
     def test_unreadable_evidence_leaves_the_usual_lookup(self):
         key = self.key()
         for error in (OSError("HTTP 404"), ValueError("incomplete listing"), RuntimeError("encrypted"),
-                      NotImplementedError("compression"), zipfile.BadZipFile("bad")):
+                      NotImplementedError("compression"), zipfile.BadZipFile("bad"),
+                      http.client.IncompleteRead(b"{")):
             with self.subTest(error=error):
                 api = self.pull_request_api(artifacts={f"kernel-package-{key}": "11"})
-                api.pull_request_evidence = lambda key, head, tree, error=error: (_ for _ in ()).throw(error)
+                api.pull_request_evidence = lambda key, number, head, tree, error=error: (_ for _ in ()).throw(error)
                 self.assertEqual(self.queue(api), ("11", "", "", ""))
 
     def test_ci_changes_do_not_change_the_key(self):
@@ -119,6 +121,18 @@ class LookupTest(TempDirTestCase):
         commit_file(self.kernel, ".github/workflows/kernel-ci.yml", "on: push\n", "workflow")
         commit_file(self.kernel, "tools/aurora-ci/plan.py", "print()\n", "ci tool")
         self.assertEqual(self.key(), before)
+
+
+class QueuedPullRequestTest(unittest.TestCase):
+    def test_the_number_in_the_queue_ref(self):
+        base = "937b727ef9a3a9ff09489d597ef4b28f3b6fdbfa"
+        self.assertEqual(lookup.queued_pull_request(f"refs/heads/gh-readonly-queue/integration/aurora/pr-249-{base}"),
+                         "249")
+        for ref in ("", "refs/heads/integration/aurora", f"refs/heads/gh-readonly-queue/topic/pr-249-{base}",
+                    "refs/heads/gh-readonly-queue/integration/aurora/pr-249-short", "refs/pull/249/merge",
+                    f"refs/heads/gh-readonly-queue/integration/aurora/pr-x-{base}"):
+            with self.subTest(ref=ref):
+                self.assertEqual(lookup.queued_pull_request(ref), "")
 
 
 class PullRequestHeadTest(TempDirTestCase):
@@ -177,13 +191,24 @@ def artifact(run, created, head_repo=REPO, expired=False, name="kernel-package-x
 QUEUE = "gh-readonly-queue/integration/aurora/pr-7-0123456789abcdef0123456789abcdef01234567"
 
 
+MERGE = "b" * 40
+
+
+def call(number=7, sha=MERGE, path=None, ref=None):
+    """A referenced_workflows entry as GitHub records a call from the run's
+    own workflow file."""
+    return {"path": path or f"o/r/.github/workflows/kernel-ci-jobs.yml@{sha}",
+            "ref": ref or f"refs/pull/{number}/merge", "sha": sha}
+
+
 def run(event="push", path=".github/workflows/kernel-ci.yml", head_repo=REPO, branch=None, head_sha=HEAD,
-        repo=REPO, conclusion="success", attempt=1):
+        repo=REPO, conclusion="success", attempt=1, calls=None):
     if branch is None:
         branch = QUEUE if event == "merge_group" else "integration/aurora"
     return {"event": event, "path": path, "head_branch": branch, "head_sha": head_sha,
             "status": "completed", "conclusion": conclusion, "run_attempt": attempt,
-            "repository": {"id": repo}, "head_repository": {"id": head_repo}}
+            "repository": {"id": repo}, "head_repository": {"id": head_repo},
+            "referenced_workflows": [call()] if calls is None else calls}
 
 
 class ApiTest(TempDirTestCase):
@@ -253,7 +278,7 @@ class ApiTest(TempDirTestCase):
         """listings: run ID -> that run's own artifacts, when not the same
         as the repository-wide ones."""
         api = self.api(artifacts, runs)
-        records, trees, listings = records or {}, trees or {"b" * 40: "tree"}, listings or {}
+        records, trees, listings = records or {}, trees or {MERGE: "tree"}, listings or {}
         search = api.get
 
         def get(path, **query):
@@ -265,11 +290,11 @@ class ApiTest(TempDirTestCase):
             return search(path, **query)
         api.get = get
         api.artifact_file = lambda artifact_id, member: json.dumps(
-            records.get(artifact_id, {"key": "x", "github_run_id": artifact_id // 10, "github_sha": "b" * 40}))
-        api.commit_tree = lambda sha: trees[sha]
-        return api.pull_request_evidence("x", HEAD, "tree")
+            records.get(artifact_id, {"key": "x", "github_run_id": artifact_id // 10, "github_sha": MERGE}))
+        api.commit_tree = lambda sha: trees.get(sha, "another tree")
+        return api.pull_request_evidence("x", "7", HEAD, "tree")
 
-    def test_the_newest_eligible_pull_request_run_at_the_head_with_both_artifacts(self):
+    def test_the_newest_eligible_run_of_the_pull_request_with_both_artifacts(self):
         pull_request = run("pull_request", branch="topic", head_repo=2000)
         artifacts = (self.pair(3, "2026-10-19", head_repo=2000) + self.pair(4, "2026-10-20", head_repo=2000)
                      + self.pair(5, "2026-10-21", head_repo=2000)[:1])
@@ -279,14 +304,15 @@ class ApiTest(TempDirTestCase):
         self.assertEqual(self.evidence(self.pair(3, "2026-10-19"), {
             3: run("pull_request", ".github/workflows/kernel-ci-label.yml", branch="topic")}), ("3", "31"))
 
-    def test_an_older_run_of_this_tree_when_the_newest_tested_another(self):
-        pull_request = run("pull_request", branch="topic")
-        other = {"key": "x", "github_run_id": 4, "github_sha": "c" * 40}
-        self.assertEqual(self.evidence(self.pair(3, "2026-10-19") + self.pair(4, "2026-10-20"),
-                                       {3: pull_request, 4: pull_request}, {40: other},
-                                       {"b" * 40: "tree", "c" * 40: "another tree"}), ("3", "31"))
+    def test_an_older_run_of_this_tree_when_the_newest_ran_another(self):
+        other = "c" * 40
+        runs = {3: run("pull_request", branch="topic"),
+                4: run("pull_request", branch="topic", calls=[call(sha=other)])}
+        records = {40: {"key": "x", "github_run_id": 4, "github_sha": other}}
+        self.assertEqual(self.evidence(self.pair(3, "2026-10-19") + self.pair(4, "2026-10-20"), runs, records,
+                                       {MERGE: "tree", other: "another tree"}), ("3", "31"))
 
-    def test_only_an_eligible_pull_request_run_of_this_repository_at_the_head(self):
+    def test_only_an_eligible_run_of_the_queued_pull_request_at_the_head(self):
         other = "0" * 40
         pull_request = run("pull_request", branch="topic")
         cases = {
@@ -313,20 +339,40 @@ class ApiTest(TempDirTestCase):
             with self.subTest(name):
                 self.assertEqual(self.evidence(artifacts, {3: untrusted}, listings=listings), ("", ""))
 
-    def test_an_incomplete_listing_of_the_run_is_an_error(self):
-        api = self.api(self.pair(3, "2026-10-19"), {3: run("pull_request", branch="topic")})
-        api.get = lambda path, **query: {"total_count": 101, "artifacts": []}
-        with self.assertRaises(ValueError):
-            api.run_artifacts(3, "kernel-package-x")
+    def test_the_run_must_have_run_the_queued_pull_requests_merge_of_this_tree(self):
+        # The run's call of the jobs workflow, as GitHub recorded it, names
+        # the pull request and the commit it ran; nothing else will do.
+        cases = {
+            "another pull request of the same head (say, onto another branch)": [call(number=8)],
+            "a call to a pinned commit": [{"path": f"o/r/.github/workflows/kernel-ci-jobs.yml@{MERGE}",
+                                           "sha": MERGE}],
+            "a call to a branch": [call(path="o/r/.github/workflows/kernel-ci-jobs.yml@main", ref="refs/heads/main")],
+            "a call to the pull request's merge ref by name":
+                [call(path="o/r/.github/workflows/kernel-ci-jobs.yml@refs/pull/7/merge")],
+            "a call into another repository": [call(path=f"x/r/.github/workflows/kernel-ci-jobs.yml@{MERGE}")],
+            "another workflow file": [call(path=f"o/r/.github/workflows/other.yml@{MERGE}")],
+            "two calls (a nested one)": [call(), call(path=f"o/r/.github/workflows/nested.yml@{MERGE}")],
+            "no call": [],
+            "an abbreviated commit": [call(sha="b" * 12)],
+            "not a list": {"path": "x"},
+            "not an entry": ["o/r/.github/workflows/kernel-ci-jobs.yml"],
+        }
+        for name, calls in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.evidence(self.pair(3, "2026-10-19"),
+                                               {3: run("pull_request", branch="topic", calls=calls)}), ("", ""))
+        with self.subTest("a merge of another tree"):
+            self.assertEqual(self.evidence(self.pair(3, "2026-10-19"), {3: run("pull_request", branch="topic")},
+                                           trees={MERGE: "another tree"}), ("", ""))
 
-    def test_the_record_must_name_the_key_the_run_and_a_commit_of_this_tree(self):
+    def test_the_record_must_name_the_key_the_run_and_the_merge_it_ran(self):
         pull_request = run("pull_request", branch="topic")
-        for record in ({"key": "y", "github_run_id": 3, "github_sha": "b" * 40},
-                       {"key": "x", "github_run_id": 9, "github_sha": "b" * 40},
+        for record in ({"key": "y", "github_run_id": 3, "github_sha": MERGE},
+                       {"key": "x", "github_run_id": 9, "github_sha": MERGE},
+                       # A commit with the same tree is not the commit the run ran.
                        {"key": "x", "github_run_id": 3, "github_sha": "c" * 40},
-                       {"key": "x", "github_run_id": 3, "github_sha": "../" + "b" * 37},
                        {"key": "x", "github_run_id": 3, "github_sha": 7},
                        [], None, "verified"):
             with self.subTest(record=record):
                 self.assertEqual(self.evidence(self.pair(3, "2026-10-19"), {3: pull_request}, {30: record},
-                                               {"b" * 40: "tree", "c" * 40: "another tree"}), ("", ""))
+                                               {MERGE: "tree", "c" * 40: "tree"}), ("", ""))

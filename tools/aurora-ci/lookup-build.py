@@ -30,6 +30,7 @@ merged (see pull_request_run).
 
 import argparse
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -108,8 +109,17 @@ def trusted_branch(event, branch):
 # A pull request's own run is reviewed code only at the head being merged:
 # the merge queue takes only approved pull requests, the approval has to
 # follow the last push, and a push takes the pull request out of the queue.
-# Runs of earlier heads ran code nobody approved, so they never count.
+# Runs of earlier heads ran code nobody approved, so they never count. Nor
+# does a run of the same head in another pull request, which may target a
+# branch with other workflows: GitHub runs the workflows of the merge.
 PULL_REQUEST_WORKFLOWS = {".github/workflows/kernel-ci.yml", ".github/workflows/kernel-ci-label.yml"}
+JOBS_WORKFLOW = ".github/workflows/kernel-ci-jobs.yml"
+
+
+def queued_pull_request(ref):
+    """The number of the pull request a merge queue ref merges last, or ''."""
+    match = re.fullmatch(rf"refs/heads/{re.escape(QUEUE_PREFIX)}pr-([0-9]+)-[0-9a-f]{{40}}", ref)
+    return match.group(1) if match else ""
 
 
 def pull_request_head(repo, rev="HEAD"):
@@ -195,18 +205,35 @@ class Api:
                 return str(artifact["workflow_run"]["id"])
         return ""
 
-    def pull_request_run(self, run_id, head_sha):
-        """Whether a run is this repository's kernel CI for a pull request
-        whose head is head_sha, passed at its first attempt and was never
-        re-run, so its artifacts all come from that one attempt. The head
-        may come from a fork."""
+    def pull_request_merge(self, run_id, number, head_sha):
+        """The merge commit a run ran on, if the run is this repository's
+        kernel CI for pull request number at head head_sha (the head may
+        come from a fork), passed at its first attempt and was never re-run,
+        so its artifacts all come from that one attempt; else ''.
+
+        The commit is the one GitHub recorded for the run's call of the jobs
+        workflow. A call from the run's own workflow file is recorded with
+        the run's ref (refs/pull/<number>/merge) and the commit it ran, the
+        same commit as the calling file; a call to another repository or
+        ref keeps that ref in its path instead. A run with any other shape
+        does not count."""
         run = self.get(f"actions/runs/{run_id}")
-        return (run.get("event") == "pull_request"
+        if not (run.get("event") == "pull_request"
                 and run.get("path") in PULL_REQUEST_WORKFLOWS
                 and run.get("head_sha") == head_sha
                 and run.get("run_attempt") == 1
                 and run.get("status") == "completed" and run.get("conclusion") == "success"
-                and (run.get("repository") or {}).get("id") == self.repository_id)
+                and (run.get("repository") or {}).get("id") == self.repository_id):
+            return ""
+        calls = run.get("referenced_workflows")
+        if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
+            return ""
+        sha = calls[0].get("sha")
+        if (not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha)
+                or calls[0].get("ref") != f"refs/pull/{number}/merge"
+                or calls[0].get("path") != f"{self.repository}/{JOBS_WORKFLOW}@{sha}"):
+            return ""
+        return sha
 
     def run_artifacts(self, run_id, name):
         """Every artifact named name in a run, expired or not."""
@@ -216,13 +243,14 @@ class Api:
             raise ValueError(f"run {run_id}: incomplete listing of {name}")
         return artifacts
 
-    def pull_request_evidence(self, key, head_sha, tree):
-        """(run ID, package artifact ID) of the newest eligible pull request
-        run at head_sha (see pull_request_run) that uploaded one live
-        kernel-package-<key> and one live kernel-verified-<key> (a run that
-        reused another run's packages uploads none) and whose verification
-        record names key, the run, and a commit with this tree; else
-        ('', ''). The record is the run's own word: nothing here proves
+    def pull_request_evidence(self, key, number, head_sha, tree):
+        """(run ID, package artifact ID) of the newest run of pull request
+        number at head_sha (see pull_request_merge) whose merge commit has
+        this tree, which uploaded one live kernel-package-<key> and one live
+        kernel-verified-<key> (a run that reused another run's packages
+        uploads none), and whose verification record names key, the run and
+        that commit; else ('', ''). The run then ran exactly the reviewed
+        workflows; the record is still its own word: nothing here proves
         which job of the run wrote it, or which package bytes it verified."""
         verified_name, package_name = f"kernel-verified-{key}", f"kernel-package-{key}"
         data = self.get("actions/artifacts", name=verified_name, per_page=100)
@@ -231,17 +259,15 @@ class Api:
                       and a.get("workflow_run", {}).get("repository_id") == self.repository_id
                       and a.get("workflow_run", {}).get("head_sha") == head_sha}
         for run in sorted(candidates, key=candidates.get, reverse=True):
-            if not self.pull_request_run(int(run), head_sha):
+            merge = self.pull_request_merge(int(run), number, head_sha)
+            if not merge or self.commit_tree(merge) != tree:
                 continue
             verified, packages = self.run_artifacts(run, verified_name), self.run_artifacts(run, package_name)
             if len(verified) != 1 or len(packages) != 1 or verified[0].get("expired") or packages[0].get("expired"):
                 continue
             record = json.loads(self.artifact_file(verified[0]["id"], "verified.json"))
             if (isinstance(record, dict) and record.get("key") == key
-                    and str(record.get("github_run_id")) == run
-                    and isinstance(record.get("github_sha"), str)
-                    and re.fullmatch(r"[0-9a-f]{40}", record["github_sha"])
-                    and self.commit_tree(record["github_sha"]) == tree):
+                    and str(record.get("github_run_id")) == run and record.get("github_sha") == merge):
                 return run, str(packages[0]["id"])
         return "", ""
 
@@ -265,26 +291,26 @@ def read_member(data, member, limit):
     return content
 
 
-def pull_request_run(api, kernel, key, head_sha):
-    """The pull request run whose packages and verification stand in for the
-    merge queue's, or ''. Its record must name a merge commit with exactly
-    the queue commit's tree, CI and expected results included. The queue
-    then records no verification of its own, so none of this becomes
-    evidence a later run trusts. Anything missing, ambiguous or unreadable
-    leaves the usual lookup, which trusts the branch and the queue only.
-    Returns (run ID, package artifact ID) or ('', '')."""
+def pull_request_run(api, kernel, key, number, head_sha):
+    """The run of the queued pull request whose packages and verification
+    stand in for the merge queue's, or ''. It must have run on a merge
+    commit with exactly the queue commit's tree, CI and expected results
+    included. The queue then records no verification of its own, so none of
+    this becomes evidence a later run trusts. Anything missing, ambiguous or
+    unreadable leaves the usual lookup, which trusts the branch and the
+    queue only. Returns (run ID, package artifact ID) or ('', '')."""
     tree = git(kernel, "rev-parse", "HEAD^{tree}")
     try:
-        return api.pull_request_evidence(key, head_sha, tree)
+        return api.pull_request_evidence(key, number, head_sha, tree)
     except (OSError, EOFError, KeyError, TypeError, ValueError, RuntimeError, NotImplementedError,
-            zipfile.BadZipFile, zlib.error) as error:
+            http.client.HTTPException, zipfile.BadZipFile, zlib.error) as error:
         print(f"::warning title=Pull request results::not reused: {error}", file=sys.stderr)
     return "", ""
 
 
-def lookup(api, kernel, recipe_repo, base_sha, force, pull_request=""):
-    """pull_request: in the merge queue, the head of the pull request being
-    merged, whose own run may stand in for the queue's build and tests."""
+def lookup(api, kernel, recipe_repo, base_sha, force, pull_request=None):
+    """pull_request: in the merge queue, (number, head) of the pull request
+    being merged, whose own run may stand in for the queue's build and tests."""
     kernel_tree = kernel_id(kernel, "HEAD")
     recipe_commit = git(recipe_repo, "rev-parse", "HEAD")
     recipe_trees = {part: git(recipe_repo, "rev-parse", f"HEAD:{part}") for part in RECIPE_PARTS}
@@ -296,7 +322,7 @@ def lookup(api, kernel, recipe_repo, base_sha, force, pull_request=""):
         out["package_run"] = api.newest_artifact(f"kernel-package-{key}")
         out["verified_run"] = api.newest_artifact(f"kernel-verified-{key}")
         if pull_request and not out["verified_run"]:
-            run, package = pull_request_run(api, kernel, key, pull_request)
+            run, package = pull_request_run(api, kernel, key, *pull_request)
             if run:
                 out.update(package_run=run, verified_run=run, pull_request_run=run, package_artifact=package)
     if base_sha:
@@ -312,15 +338,17 @@ def main(argv=None):
     parser.add_argument("--recipe-repo", type=Path, required=True, help="omarchy-pkgs checkout")
     parser.add_argument("--base-sha", default="", help="commit whose build is the comparison baseline")
     parser.add_argument("--force", default="false", help="'true' ignores earlier builds and results")
-    parser.add_argument("--merge-queue", default="false",
-                        help="'true' when --kernel is a merge queue commit: accept the merged pull request's run")
+    parser.add_argument("--merge-queue-ref", default="",
+                        help="the merge queue ref --kernel was checked out from: accept the queued pull request's run")
     args = parser.parse_args(argv)
 
     api = Api(os.environ.get("GITHUB_API_URL", "https://api.github.com"),
               os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_TOKEN"],
               os.environ["GITHUB_REPOSITORY_ID"])
     try:
-        pull_request = pull_request_head(args.kernel) if args.merge_queue == "true" else ""
+        number = queued_pull_request(args.merge_queue_ref)
+        head = pull_request_head(args.kernel) if number else ""
+        pull_request = (number, head) if head else None
         result = lookup(api, args.kernel, args.recipe_repo, args.base_sha, args.force == "true", pull_request)
     except (subprocess.CalledProcessError, OSError, KeyError, ValueError) as error:
         print(f"::error title=Build lookup::{error}", file=sys.stderr)
@@ -339,7 +367,7 @@ def main(argv=None):
             reuse.append(f"verified by run {result['verified_run']}")
         if result["pull_request_run"]:
             reuse = [f"packages and verification from run {result['pull_request_run']} "
-                     f"of the pull request's head {pull_request[:12]}"]
+                     f"of pull request #{pull_request[0]} at {pull_request[1][:12]}"]
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
             out.write(f"Build key `{result['key']}` (kernel `{result['kernel_tree'][:12]}`, "
                       f"omarchy-pkgs `{result['recipe_commit'][:12]}`)"

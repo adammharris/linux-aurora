@@ -98,11 +98,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ steps.plan.outputs.base_sha }}
           FORCE: ${{ steps.plan.outputs.force }}
-          MERGE_QUEUE: ${{ github.event_name == 'merge_group' }}
+          MERGE_QUEUE_REF: ${{ github.event_name == 'merge_group' && github.ref || '' }}
         run: |
           python3 -I tools/aurora-ci/lookup-build.py --kernel . \
             --recipe-repo "$RUNNER_TEMP/omarchy-pkgs" --base-sha "$BASE_SHA" --force "$FORCE" \
-            --merge-queue "$MERGE_QUEUE"
+            --merge-queue-ref "$MERGE_QUEUE_REF"
 
   commits:
     name: commits
