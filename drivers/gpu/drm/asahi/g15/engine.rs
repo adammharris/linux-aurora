@@ -155,10 +155,10 @@ pub(crate) struct Flight {
     pub(crate) fs_start: u32,
     /// Channel producers (TA, FS, compute) after the prefix's records.
     pub(crate) rec: [u32; 3],
-    /// Compute member j's FW stamp target, and the FS target it waits on directly (0: none):
+    /// Compute member j's FW stamp target, and the FS target it waits on directly:
     /// its predecessors in the prefix (for the compute-hang check).
     pub(crate) cstamp: [u32; sizes::COMPUTE_SLOTS],
-    pub(crate) cwait: [u32; sizes::COMPUTE_SLOTS],
+    pub(crate) cwait: [Option<u32>; sizes::COMPUTE_SLOTS],
     /// Compute slots, pass slots and clustering buffers it holds.
     pub(crate) claims: Claims,
     /// The prefix rebuilds the render allocators (priming); nothing is published behind it.
@@ -189,7 +189,7 @@ impl Flight {
             fs_start: 0,
             rec: [0; 3],
             cstamp: [0; sizes::COMPUTE_SLOTS],
-            cwait: [0; sizes::COMPUTE_SLOTS],
+            cwait: [None; sizes::COMPUTE_SLOTS],
             claims: Claims::new(),
             rebuild: false,
             doomed: false,
@@ -385,9 +385,11 @@ pub(crate) struct Engine {
     pub(crate) rebuild_live: bool,
     /// A ready prefix waits only for a record's consumption: repoll sooner.
     pub(crate) chan_wait: bool,
+    /// A ready job waits for an ASID held by a completing failed job.
+    pub(crate) slot_wait: bool,
     /// Progress tracking of the oldest prefix.
     pub(crate) progress_flight: u64,
-    pub(crate) progress: [u32; 3],
+    pub(crate) progress: [Option<u32>; 3],
     pub(crate) stats: Stats,
     /// Phase timers (debug_flags bit 49).
     pub(crate) prof: Prof,
@@ -424,8 +426,9 @@ impl Engine {
             render_registered: false,
             rebuild_live: false,
             chan_wait: false,
+            slot_wait: false,
             progress_flight: 0,
-            progress: [0; 3],
+            progress: [None; 3],
             stats: Stats::default(),
             prof: Prof::default(),
             debugfs: None,
@@ -546,6 +549,7 @@ impl Firmware {
         let mut result = Ok(());
 
         self.engine.chan_wait = false;
+        self.engine.slot_wait = false;
         // Nothing is published while a hang request is armed.
         while self.recovery.failed().is_none()
             && !self.engine.frozen
@@ -592,7 +596,7 @@ impl Firmware {
                         dev_err!(
                             self.graph.dev.as_ref(),
                             "G15: publication of ctx {} failed after a queue WRITE ({:?})\n",
-                            job.vm.slot,
+                            job.slot(),
                             e
                         );
                         complete(done, &job, Err(EIO));
@@ -675,6 +679,15 @@ impl Firmware {
     /// yet (no free slot, or a channel record still unconsumed); EIO once a queue WRITE
     /// advanced; any other error means nothing was published.
     fn publish_prefix(&mut self, job: &Arc<Job>, done: &mut Completions) -> Result {
+        if let Err(error) = job.bind() {
+            if error == ENOSPC {
+                // A failed job can keep its binding until scheduler references drop after
+                // this pass. Leave healthy work pending and retry without the device lock.
+                self.engine.slot_wait = true;
+                return Err(EAGAIN);
+            }
+            return Err(error);
+        }
         let mut f = Flight::new(job.clone());
         let result = self.publish_prefix_into(job, &mut f);
         match result {
@@ -682,7 +695,11 @@ impl Firmware {
                 // Never published: its storage is free again, and horizon jobs taken into it
                 // fail with it.
                 self.slots.release(&mut f.claims);
+                if job.progress.next() == job.progress.sent() {
+                    job.release_binding();
+                }
                 for j2 in f.group.iter() {
+                    j2.release_binding();
                     complete(done, j2, Err(e));
                 }
             }
@@ -899,11 +916,22 @@ impl Firmware {
                     hz_stop = Some(1);
                     break;
                 }
-                for k in 0..n2 {
-                    match command(&j2, k).ok_or(EINVAL)? {
-                        Command::Compute(c) => self.prefix_compute(&j2, c, &mut pf, f, false)?,
-                        Command::Render(_) => return Err(EINVAL),
+                j2.bind()?;
+                let encoded = (|| {
+                    for k in 0..n2 {
+                        match command(&j2, k).ok_or(EINVAL)? {
+                            Command::Compute(c) => {
+                                self.prefix_compute(&j2, c, &mut pf, f, false)?
+                            }
+                            Command::Render(_) => return Err(EINVAL),
+                        }
                     }
+                    Ok(())
+                })();
+                if let Err(error) = encoded {
+                    // Not in the horizon yet and nothing of it reached the firmware.
+                    j2.release_binding();
+                    return Err(error);
                 }
                 computes += n2;
                 j2.progress.set_sent(n2);
@@ -1057,7 +1085,7 @@ impl Firmware {
             Queue,
             self.graph.dev,
             "G15: prefix ctx={} computes {} (n={} head {}) renders {} (draw {} ta/fs head {}/{}) behind {}: {:?}\n",
-            job.vm.slot,
+            job.slot(),
             computes,
             pf.n,
             pf.c_head,
@@ -1095,7 +1123,7 @@ impl Firmware {
     ) -> Result {
         let n = pf.n + 1;
         let t = encode::stamp(n);
-        let ctx = job.vm.slot;
+        let ctx = job.slot();
         let ts = &cmd.timestamps;
         let mut lap = Lap::start();
         // Nothing published yet on failure.
@@ -1191,11 +1219,7 @@ impl Firmware {
         }
         let j = pf.computes as usize;
         f.cstamp[j] = t;
-        f.cwait[j] = if pf.prev == Prev::Render {
-            pf.last_fs
-        } else {
-            0
-        };
+        f.cwait[j] = (pf.prev == Prev::Render).then_some(pf.last_fs);
         g.ring.w64(8 * pf.c_head as usize, s.work.va)?;
         pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;
         lap.lap(&mut self.engine.prof.write_ns);
@@ -1240,7 +1264,7 @@ impl Firmware {
         let k = f.claims.pass[pf.renders as usize] as usize;
         let n = pf.draw + 1;
         let usc = job.queue.usc_base;
-        let ctx = job.vm.slot;
+        let ctx = job.slot();
         let tta = encode::stamp_seed(ids::TA_SEED, n);
         let tfs = encode::stamp_seed(ids::FS_SEED, n);
         // Early tiling: a later render member after a render of the same prefix whose render
