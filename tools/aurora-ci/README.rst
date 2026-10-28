@@ -189,11 +189,11 @@ trusts only the branch and the queue.
 What this trusts: the record is the pull request run's own word. Nothing
 shows which job of that run wrote it, or that it verified those exact
 package bytes, so code at the reviewed head that ran in that run could
-have written it. And for these pull requests the trusted build moves after
-the merge: the push takes the usual path for the key (a branch or queue
-run's packages and verification, else a build, and KUnit and boot unless a
-branch or queue run already verified the key), so a failure there comes
-after the change has merged.
+have written it. And for these pull requests any trusted build and test
+still needed happens after the merge: the push takes the usual path for the
+key (a branch or queue run's packages and verification, else a build, and
+KUnit and boot unless a branch or queue run already verified the key), so a
+failure there comes after the change has merged.
 
 What keeps untrusted code off
 paid runners is GitHub's setting to
