@@ -91,6 +91,10 @@ const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
     desc: c"Apple AGX Graphics",
 };
 
+// Open DRM files and exported DMA buffers take their callbacks' module from `MODULE`. With
+// `None`, a modular build could be unloaded while they still point into it.
+const _: () = assert!(<AsahiDrmDriver as drm::driver::Driver>::MODULE.is_some());
+
 /// DRM Driver implementation for `AsahiDriver`.
 #[vtable]
 impl drm::driver::Driver for AsahiDrmDriver {
@@ -152,6 +156,10 @@ kernel::of_device_table!(
         (
             of::DeviceId::new(c"apple,agx-t8140"),
             ProbeConfig::G17(&hw::t8140::CONFIG)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6040"),
+            ProbeConfig::G17(&hw::t6040::CONFIG)
         ),
         (
             of::DeviceId::new(c"apple,agx-t8103"),
@@ -390,6 +398,8 @@ impl AsahiPlatformDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         cfg: &'static g17::Config,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
+        // The GPU memory limits and RSS attribution apply only to G17 for now.
+        crate::memacct::LEDGER.configure();
         // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
         let resources = regs::Resources::new(pdev)?;
@@ -419,6 +429,11 @@ impl AsahiPlatformDriver {
                 return Err(error);
             }
         };
+        if let Err(error) =
+            crate::sysfs_exports::register_idle(raw_dev, crate::g17::power::IDLE_HOLD_MS.as_ptr())
+        {
+            dev_warn!(pdev.as_ref(), "idle_off_delay_ms not registered: {:?}\n", error);
+        }
         Ok(AsahiPlatformDriverData {
             _device: reg.device().into(),
             _reg: reg,
@@ -433,7 +448,7 @@ impl AsahiPlatformDriver {
 
 impl Drop for AsahiPlatformDriverData<'_> {
     fn drop(&mut self) {
-        // SAFETY: `self.raw_dev` was set in `probe` from the platform
+        // `self.raw_dev` was set in `probe` from the platform
         // device's `as_raw()`, valid for the lifetime of the bound driver.
         if !self.raw_dev.is_null() {
             crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);

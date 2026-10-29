@@ -2190,6 +2190,16 @@
    "note": "Actual production-body host control plus runtime mutants; kernel services modeled, no private hardware fixtures."
   },
   {
+   "name": "tools/asahi/g15-display-order-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/g15-display-order-tests.py"
+   ],
+   "rust": "1.93.1",
+   "note": "Actual display publication, T6030/T6031 link and admit() bodies on OF/device-link and admission-order models; C and admit() mutants must build and fail. No hardware or private fixtures."
+  },
+  {
    "name": "tools/testing/selftests/drivers/gpu/asahi-g15/run.py",
    "group": "tools",
    "argv": [
