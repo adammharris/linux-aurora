@@ -2,6 +2,7 @@
 import http.client
 import io
 import json
+import subprocess
 import unittest
 import zipfile
 
@@ -121,6 +122,28 @@ class LookupTest(TempDirTestCase):
         commit_file(self.kernel, ".github/workflows/kernel-ci.yml", "on: push\n", "workflow")
         commit_file(self.kernel, "tools/aurora-ci/plan.py", "print()\n", "ci tool")
         self.assertEqual(self.key(), before)
+
+
+class EnsureCommitTest(TempDirTestCase):
+    def present(self, repo, sha):
+        return subprocess.run(["git", "-C", str(repo), "--no-lazy-fetch", "cat-file", "-e", f"{sha}^{{commit}}"],
+                              stderr=subprocess.DEVNULL).returncode == 0
+
+    def test_fetches_only_the_missing_commit_into_a_partial_clone(self):
+        # The plan job's checkout: depth 1, blob:none. Asking a partial clone
+        # for a missing object fetches it with all of its history.
+        origin = self.init_repo("origin")
+        first = commit_file(origin, "Makefile", "1\n", "first")
+        base = commit_file(origin, "Makefile", "2\n", "base")
+        commit_file(origin, "Makefile", "3\n", "head")
+        git(origin, "config", "uploadpack.allowFilter", "true")
+        git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+        clone = self.tmp / "clone"
+        git(self.tmp, "clone", "--quiet", "--depth=1", "--filter=blob:none", "--no-checkout",
+            origin.as_uri(), str(clone))
+        lookup.ensure_commit(clone, base)
+        self.assertTrue(self.present(clone, base))
+        self.assertFalse(self.present(clone, first))
 
 
 class QueuedPullRequestTest(unittest.TestCase):

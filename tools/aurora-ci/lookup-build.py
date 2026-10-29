@@ -77,8 +77,11 @@ def kernel_id(repo, rev):
 
 
 def ensure_commit(repo, sha, remote="origin"):
-    """Fetch a commit's trees (no file contents) if the checkout lacks it."""
-    if subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"],
+    """Fetch a commit's trees (no file contents) if the checkout lacks it.
+
+    The check must not fetch: a partial clone fetches a missing object on
+    demand with all of its history, millions of kernel commits and trees."""
+    if subprocess.run(["git", "-C", str(repo), "--no-lazy-fetch", "cat-file", "-e", f"{sha}^{{commit}}"],
                       stderr=subprocess.DEVNULL).returncode:
         git(repo, "fetch", "--quiet", "--no-tags", "--depth=1", "--filter=blob:none", remote, sha)
 

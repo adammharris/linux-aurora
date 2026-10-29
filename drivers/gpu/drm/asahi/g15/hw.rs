@@ -51,6 +51,7 @@ pub(crate) enum Board {
     /// ([`super::board::record`], [`super::board::device_tree`]), with the SoC's reference
     /// words for what neither carries ([`super::board::record::Reference`]). A value the
     /// builder refuses stops admission, before any firmware is touched.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     DeviceTree(&'static super::board::record::Reference),
     /// No board data: admission refuses the SoC before anything firmware-visible.
     None,
@@ -514,8 +515,6 @@ pub(crate) mod sizes {
     pub(crate) const AHEAD_RECORDS: u32 = 64;
     /// Policy bound on logical queues reported in QUEUE_LIMITS (not a firmware limit).
     pub(crate) const MAX_QUEUES: u32 = 58;
-    /// TTBAT user slots: user VMs hold one each for their lifetime (ASIDs 1..63).
-    pub(crate) const MAX_VMS: u32 = 63;
 }
 
 /// Firmware channels, doorbells, seeds and identifiers.

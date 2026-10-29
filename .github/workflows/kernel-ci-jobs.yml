@@ -222,9 +222,9 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # Needs nothing from plan, so it starts with it.
   host-tests:
     name: host tests (${{ matrix.group }})
-    needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -232,7 +232,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [tools, aurora-sep]
+        group: [tools, aurora-sep, aurora-sep-slow]
     env:
       GROUP: ${{ matrix.group }}
     steps:
