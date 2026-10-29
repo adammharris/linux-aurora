@@ -566,6 +566,9 @@ pub(crate) struct Queue {
     replay_error: Option<Error>,
     replay_prepared: bool,
     exit: Option<exit::Transaction>,
+    /// Since when the kill of this failed queue's context waits for other contexts' compute,
+    /// and whether that wait was reported.
+    kill_wait: Option<(u64, bool)>,
     installed: bool,
     /// Bit `p` set once a work slot of priority class `p` named this queue.
     outer_started: u8,
@@ -575,6 +578,9 @@ pub(crate) struct Queue {
     config_cache: Option<(QueueConfig, u64)>,
     ordinal: u32,
     submitted: u32,
+    /// The stamp of the newest command the firmware reported failed ([`Self::note_fault`]),
+    /// while it is newer than the stored stamp.
+    fault_stamp: Option<u32>,
     /// Prepared packets of the bound owner about to publish (see [`Self::claim`]).
     claims: u32,
     last_published: u64,
@@ -594,8 +600,9 @@ pub(crate) struct Queue {
     source_readers: Arc<core::sync::atomic::AtomicU32>,
     source_hint: crate::g17::sync_input::ReaderHint,
     /// The doorbell withheld from publications that had [`WITHHOLD_DEPTH`] - 1 or more
-    /// unretired commands of this queue ahead of them, the publication of the first, and the
-    /// compute work slots written at its priority once its slot was.
+    /// unretired commands of this queue ahead of them, the publication of the first of them
+    /// that no doorbell has announced, and the compute work slots written at its priority once
+    /// the last one's slot was.
     withheld_doorbell: Option<(u64, u64, u64)>,
 }
 
@@ -628,7 +635,10 @@ impl Queue {
     }
 
     /// The queue has left ordinary retirement: a timeout, kill, quarantine, replay, recovery
-    /// witness or exit is in progress.
+    /// witness or exit is in progress, or retirement stopped at a command the firmware
+    /// finished without a completion record. A front whose record has arrived and that only
+    /// waits for its stamp is ordinary retirement: [`Self::due_doorbell`] counts it as
+    /// finished, and ringing at once there rang most withheld doorbells early.
     fn settling(&self) -> bool {
         self.quarantined
             || self.released
@@ -636,7 +646,8 @@ impl Queue {
             || self.replays.len != 0
             || self.replay_retirement
             || self.awaiting_witness
-            || self.retire_pending
+            || (self.retire_pending
+                && self.active.front().is_none_or(|active| active.observed.is_none()))
             || self.retired_by_teardown
             || self.spared_quarantine
             || self.failure_status_pending
@@ -688,12 +699,14 @@ impl Queue {
             replay_error: None,
             replay_prepared: false,
             exit: None,
+            kill_wait: None,
             installed: false,
             outer_started: 0,
             published_config: None,
             config_cache: None,
             ordinal: 0,
             submitted: 0,
+            fault_stamp: None,
             claims: 0,
             last_published: 0,
             last_end: 0,
@@ -714,6 +727,37 @@ impl Queue {
             withheld_doorbell: None,
         })
     }
+    /// The firmware failed the command whose completion stamp is `stamp`. It writes a
+    /// zero-duration completion record for it, which quarantines the queue, but stores no
+    /// stamp: without this the quarantine would wait for its retirement witness forever and
+    /// keep the queue's backing. Commands published after the failed one still need their own
+    /// stamp or record.
+    pub(crate) fn note_fault(&mut self, stamp: u32) {
+        if self
+            .fault_stamp
+            .is_none_or(|old| retirement::stamp_newer(stamp, old))
+        {
+            self.fault_stamp = Some(stamp);
+        }
+    }
+
+    /// The firmware failed a command of this quarantined queue, and the queue still waits for
+    /// its retirement witness: commands published after the failed one, which the firmware
+    /// never runs, or the failed command itself, whose ring entry it does not consume (a ray
+    /// traversal's, on Neo). Only a kill of the queue's context gives them back.
+    pub(crate) fn fault_pending(&self) -> bool {
+        self.fault_stamp.is_some() && self.quarantined && self.awaiting_witness && self.exit.is_none()
+    }
+
+    /// The stamp that proves retirement: the stored one, or a newer reported fault's.
+    fn witness_stamp(&self) -> Result<u32> {
+        let stored = self.graph.stamp()?;
+        Ok(match self.fault_stamp {
+            Some(fault) if retirement::stamp_newer(fault, stored) => fault,
+            _ => stored,
+        })
+    }
+
     pub(crate) fn qid(&self) -> u8 {
         self.kick.id().qid()
     }
@@ -746,6 +790,16 @@ impl Queue {
     }
     pub(crate) fn in_flight(&self) -> bool {
         self.active.len != 0 && !self.quarantined
+    }
+    /// The oldest command is a published long job (ray traversal or AS build) whose
+    /// completion record the driver has not seen yet.
+    pub(crate) fn long_job_running(&self) -> bool {
+        !self.quarantined
+            && self.active.front().is_some_and(|active| {
+                active.observed.is_none()
+                    && active.packet.is_published()
+                    && active.packet.command.long_job()
+            })
     }
     /// Quarantines without a pending witness no longer describe live pipe order.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
@@ -1096,7 +1150,7 @@ impl Queue {
             if !retirement::quarantined_retired(
                 &newest,
                 self.graph.cursors()?,
-                self.graph.stamp()?,
+                self.witness_stamp()?,
                 self.active.len as u32,
                 self.submitted,
             )? {
@@ -1140,6 +1194,7 @@ impl Queue {
             drop(self.active.pop());
         }
         self.awaiting_witness = false;
+        self.fault_stamp = None;
         self.retirement_proved = false;
         self.replay_retirement = false;
         self.spared_deferred = false;
@@ -1584,6 +1639,7 @@ impl Queue {
         self.spared_deferred = false;
         self.retire_pending = false;
         self.awaiting_witness = false;
+        self.fault_stamp = None;
         self.retirement_proved = false;
         self.replay_retirement = false;
         self.replay_error = None;
@@ -1952,6 +2008,8 @@ pub(crate) trait Host {
         -> Result;
     fn notify_compute(&mut self, priority: u8, message: u64) -> Result;
     fn compute_written(&self, priority: u8) -> u64;
+    /// Compute work slots at `priority` that a doorbell has announced.
+    fn compute_announced(&self, priority: u8) -> u64;
     fn note_submission(&mut self) -> Result;
 }
 
@@ -2303,6 +2361,15 @@ impl Queue {
                 && self.withheld_doorbell.is_none_or(|(withheld, _, _)| withheld == doorbell)
             {
                 let written = host.compute_written(policy.priority());
+                // Once another doorbell announced every slot the withheld one covered, it
+                // starts over from this publication: it then waits for this command's own
+                // predecessors rather than for those of slots already announced.
+                if self
+                    .withheld_doorbell
+                    .is_some_and(|(_, _, last)| host.compute_announced(policy.priority()) >= last)
+                {
+                    self.withheld_doorbell = None;
+                }
                 let entry = self.withheld_doorbell.get_or_insert((doorbell, published, written));
                 entry.2 = written;
             } else {

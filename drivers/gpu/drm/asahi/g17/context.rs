@@ -114,6 +114,9 @@ pub(crate) struct Context {
     scheduler: Arc<KernelObject>,
     scheduler_generation: u32,
     published: AtomicBool,
+    /// A kill of this context was published, through a compute queue or on its render pairs'
+    /// behalf. A context is killed at most once.
+    kill_published: AtomicBool,
     /// Advisory only: publication still checks the physical binding under the
     /// device mutex. False skips an inline attempt known to need admission.
     compute_binding_hint: AtomicBool,
@@ -197,6 +200,7 @@ impl Context {
             scheduler,
             scheduler_generation,
             published: AtomicBool::new(false),
+            kill_published: AtomicBool::new(false),
             compute_binding_hint: AtomicBool::new(false),
             render_seen: AtomicBool::new(false),
             qos,
@@ -280,6 +284,28 @@ impl Context {
             _work: self.work.clone(),
         }
     }
+    /// Called once the firmware consumed this context's scheduler release. If its work list
+    /// still links a node, the firmware keeps referencing that node: on Neo a render command
+    /// that ran behind a failed compute command is never unlinked, and a later context given
+    /// the same work storage (the object cache hands it out again) made the firmware recover
+    /// the GPU. Keep the storage mapped and out of reuse until firmware stop; returns whether
+    /// it was linked.
+    pub(crate) fn retain_linked_work(&self, pool: &Arc<Pool>) -> bool {
+        // An unreadable head counts as linked: retaining is the safe side.
+        let linked = self.work_head().map_or(true, |head| head != [0, self.work_head_va()]);
+        if linked {
+            self.work.lock().object.retain_until_stop(pool);
+        }
+        linked
+    }
+
+    /// The firmware may still walk this context's work list into memory it names: a node is
+    /// linked and the scheduler page shows no kill. Unreadable state counts as linked.
+    pub(crate) fn firmware_may_link(&self) -> bool {
+        let killed = super::queue::compute::exit::State::read(self).map_or(0, |state| state.killed);
+        must_retain(self.work_head().ok(), self.work_head_va(), killed)
+    }
+
     pub(crate) fn work_head_va(&self) -> u64 {
         self.work_base + (UAT_PGSZ + 0x400) as u64
     }
@@ -292,6 +318,16 @@ impl Context {
         ];
         fence(Ordering::Acquire);
         Ok(head)
+    }
+
+    /// Record that a kill of this context was published (see `kill_published`).
+    pub(crate) fn note_kill_published(&self) {
+        self.kill_published.store(true, Ordering::Release);
+    }
+
+    /// A kill of this context was published.
+    pub(crate) fn kill_published(&self) -> bool {
+        self.kill_published.load(Ordering::Acquire)
     }
 
     pub(crate) fn is_published(&self) -> bool {
@@ -463,9 +499,25 @@ impl QosIds {
     }
 }
 
+/// Memory a context's work list may lead the firmware to stays allocated: a linked node (or
+/// an unreadable head) and no acknowledged kill.
+fn must_retain(head: Option<[u64; 2]>, head_va: u64, killed: u32) -> bool {
+    killed == 0 && head.is_none_or(|head| head != [0, head_va])
+}
+
 #[kunit_tests(asahi_g17_qos_capacity)]
 mod capacity_tests {
     use super::*;
+
+    #[test]
+    fn linked_unkilled_work_is_retained() {
+        let va = 0xfffffc20_0000_4400;
+        assert!(!must_retain(Some([0, va]), va, 0));
+        assert!(must_retain(Some([0xfffffc20_0000_0000, 0xfffffc20_0000_0098]), va, 0));
+        assert!(must_retain(None, va, 0));
+        assert!(!must_retain(Some([0xfffffc20_0000_0000, 0xfffffc20_0000_0098]), va, 1));
+        assert!(!must_retain(None, va, 1));
+    }
 
     #[test]
     fn failed_client_construction_returns_every_qos_id() {

@@ -186,7 +186,7 @@ pub(super) struct Registry {
 impl Registry {
     /// Initialize inside the firmware allocation instead of staging the whole
     /// registry on the probe stack. No additional allocation is required.
-    #[cfg(CONFIG_KUNIT)]
+    #[cfg(CONFIG_KUNIT = "y")]
     pub(super) fn new(
         clusters: u32,
         deflake: crate::g17::fw::render::Deflake,
@@ -541,6 +541,7 @@ impl Registry {
             .qids
             .reserve_for(identity, DataMaster::Compute, Some(FIRST_COMPUTE_QID), queues)
             .map_err(|error| self.compute_admission_error(error))?;
+        self.note_build_room();
         let reservation = ComputeReservation { slot, id, owner };
         self.compute[slot] = Some(ComputeEntry {
             reservation,
@@ -584,6 +585,7 @@ impl Registry {
         self.reserved(reservation)?;
         self.qids.cancel_unpublished(reservation.id)?;
         self.compute[reservation.slot] = None;
+        self.note_build_room();
         Ok(())
     }
 
@@ -601,6 +603,7 @@ impl Registry {
         if unpublished {
             self.qids.cancel_unpublished(entry.reservation.id)?;
             self.compute[slot] = None;
+            self.note_build_room();
         }
         Ok(())
     }
@@ -1396,6 +1399,9 @@ impl compute::Host for ComputeHost<'_> {
     fn compute_written(&self, priority: u8) -> u64 {
         self.port.compute_written(priority)
     }
+    fn compute_announced(&self, priority: u8) -> u64 {
+        self.port.compute_announced(priority)
+    }
     fn note_submission(&mut self) -> Result {
         self.effort.submit();
         super::Firmware::apply_shared_effort(self.init, self.effort, self.port, super::power::FULL_EFFORT)
@@ -1442,6 +1448,9 @@ impl compute::Host for DirectHost<'_> {
     }
     fn compute_written(&self, priority: u8) -> u64 {
         self.port.compute_written(priority)
+    }
+    fn compute_announced(&self, priority: u8) -> u64 {
+        self.port.compute_announced(priority)
     }
     fn note_submission(&mut self) -> Result {
         Ok(())
@@ -2373,6 +2382,12 @@ impl Registry {
         writeln!(f, "qos_ids used={} total=126", self.qos_ids.used())?;
         writeln!(f, "metrics_ids used={} total={}", self.metrics.used(), super::fw::buffer::METRICS_SLOTS)?;
         self.render.write_capacity(f)?;
+        let now = now_ns();
+        let waits = || self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .filter_map(|queue| queue.kill_waiting(now));
+        compute_exit::write_kill_waits(f, waits().count(), waits().max().unwrap_or(0))?;
+        compute_exit::write_render_kills(f, self.teardown.kill_waits(now).count(),
+                                         self.teardown.kill_waits(now).max().unwrap_or(0))?;
         writeln!(f, "compute_slots used={} total={} reusable={} building={}",
                  self.compute.iter().flatten().count(), self.compute.len(),
                  self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).filter(|queue| queue.reusable()).count(),
