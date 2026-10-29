@@ -51,7 +51,9 @@ jobs:
       kernel_tree: ${{ steps.lookup.outputs.kernel_tree }}
       recipe_commit: ${{ steps.lookup.outputs.recipe_commit }}
       package_run: ${{ steps.lookup.outputs.package_run }}
+      package_artifact: ${{ steps.lookup.outputs.package_artifact }}
       verified_run: ${{ steps.lookup.outputs.verified_run }}
+      pull_request_run: ${{ steps.lookup.outputs.pull_request_run }}
       base_tree: ${{ steps.lookup.outputs.base_tree }}
       baseline_run: ${{ steps.lookup.outputs.baseline_run }}
     steps:
@@ -96,9 +98,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ steps.plan.outputs.base_sha }}
           FORCE: ${{ steps.plan.outputs.force }}
+          MERGE_QUEUE_REF: ${{ github.event_name == 'merge_group' && github.ref || '' }}
         run: |
           python3 -I tools/aurora-ci/lookup-build.py --kernel . \
-            --recipe-repo "$RUNNER_TEMP/omarchy-pkgs" --base-sha "$BASE_SHA" --force "$FORCE"
+            --recipe-repo "$RUNNER_TEMP/omarchy-pkgs" --base-sha "$BASE_SHA" --force "$FORCE" \
+            --merge-queue-ref "$MERGE_QUEUE_REF"
 
   commits:
     name: commits
@@ -333,10 +337,20 @@ jobs:
           cp omarchy-pkgs/build-output/edge/aarch64/linux-aurora-*.pkg.tar.zst out/packages/
           ls -l out/packages
       - name: Download the packages built for this key
-        if: env.REUSE_RUN != ''
+        if: env.REUSE_RUN != '' && needs.plan.outputs.package_artifact == ''
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: kernel-package-${{ env.KEY }}
+          path: out
+          run-id: ${{ env.REUSE_RUN }}
+          github-token: ${{ github.token }}
+      # The very artifact plan paired with the verification; fails if a
+      # re-run of that pull request run has replaced it since.
+      - name: Download the pull request run's packages
+        if: needs.plan.outputs.package_artifact != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.plan.outputs.package_artifact }}
           path: out
           run-id: ${{ env.REUSE_RUN }}
           github-token: ${{ github.token }}
