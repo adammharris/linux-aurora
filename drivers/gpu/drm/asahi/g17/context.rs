@@ -39,7 +39,7 @@ impl QosIds {
         let mut used = self.used.lock();
         let id = used.trailing_ones();
         if id == 128 {
-            return Err(ENOSPC);
+            return Err(super::capacity::refused(super::capacity::Site::QosIds));
         }
         *used |= 1u128 << id;
         Ok(QosLease {
@@ -114,13 +114,22 @@ pub(crate) struct Context {
     scheduler: Arc<KernelObject>,
     scheduler_generation: u32,
     published: AtomicBool,
+    /// Advisory only: publication still checks the physical binding under the
+    /// device mutex. False skips an inline attempt known to need admission.
+    compute_binding_hint: AtomicBool,
+    /// Mixed-engine contexts keep the original inline publication path.
+    render_seen: AtomicBool,
     qos: QosLease,
     owner_pid: u32,
     states: WorkStates,
+    /// Signalled when a work state returns; publishers that found none wait on it.
+    state_returns: Arc<super::availability::Availability>,
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
     render_blocks: AtomicUsize,
+    /// Timestamp pages of retired compute commands, mapped in this context's VM.
+    compute_timestamps: Arc<super::completion::ComputeTimestampCache>,
     /// Fixed for the context's life. Physical queues bound to it carry this
     /// profile in every record, ring, doorbell and registration.
     policy: Policy,
@@ -133,6 +142,7 @@ impl Context {
         execution: Arc<ExecutionContext>,
         owner_pid: u32,
         policy: Policy,
+        state_returns: Arc<super::availability::Availability>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let qos = qos.acquire()?;
@@ -187,18 +197,41 @@ impl Context {
             scheduler,
             scheduler_generation,
             published: AtomicBool::new(false),
+            compute_binding_hint: AtomicBool::new(false),
+            render_seen: AtomicBool::new(false),
             qos,
             owner_pid,
             states: WorkStates::new(),
+            state_returns,
             work,
             work_base,
             render,
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
+            compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
         self.execution.vm()
+    }
+    pub(crate) fn compute_binding_hint(&self) -> bool {
+        self.render_seen.load(Ordering::Acquire)
+            || self.compute_binding_hint.load(Ordering::Relaxed)
+    }
+    /// This logical queue has submitted render work, so its compute may have a render prefix.
+    pub(crate) fn render_seen(&self) -> bool {
+        self.render_seen.load(Ordering::Acquire)
+    }
+    pub(crate) fn note_render(&self) {
+        if !self.render_seen.load(Ordering::Relaxed) {
+            self.render_seen.store(true, Ordering::Release);
+        }
+    }
+    pub(crate) fn note_compute_binding(&self, owned: bool) {
+        self.compute_binding_hint.store(owned, Ordering::Relaxed);
+    }
+    pub(crate) fn compute_timestamps(&self) -> &Arc<super::completion::ComputeTimestampCache> {
+        &self.compute_timestamps
     }
     pub(crate) fn status(&self) -> &Arc<VmStatus> {
         &self.status
@@ -329,6 +362,7 @@ pub(crate) struct WorkStateLease {
     word: AtomicU32,
 }
 impl WorkStateLease {
+    pub(super) fn status(&self) -> &Arc<VmStatus> { self.context.status() }
     pub(crate) fn deferred(context: Arc<Context>) -> Self {
         Self {
             context,
@@ -348,8 +382,9 @@ impl WorkStateLease {
                 Err(EBUSY)
             };
         };
-        if let Err(error) = self.context.work.lock().initialize(candidate) {
-            self.context.states.release(candidate);
+        let initialized = self.context.work.lock().initialize(candidate);
+        if let Err(error) = initialized {
+            self.context.release_state(candidate);
             return Err(error);
         }
         match self
@@ -358,10 +393,14 @@ impl WorkStateLease {
         {
             Ok(_) => Ok(candidate),
             Err(installed) => {
-                self.context.states.release(candidate);
+                self.context.release_state(candidate);
                 Ok(installed)
             }
         }
+    }
+    /// The domain a publisher samples before acquire() and waits on after EBUSY.
+    pub(crate) fn returns(&self) -> &Arc<super::availability::Availability> {
+        &self.context.state_returns
     }
     pub(crate) fn word(&self) -> u32 {
         self.word.load(Ordering::Acquire)
@@ -387,7 +426,8 @@ impl WorkStateLease {
     }
 
     pub(crate) fn render_slot(&self, pair: u8) -> Result<u32> {
-        self.context.work.lock().render.get(pair).ok_or(ENOSPC)
+        self.context.work.lock().render.get(pair).ok_or_else(||
+            super::capacity::refused(super::capacity::Site::RenderWorkSlots))
     }
     pub(crate) fn channel_payload(&self, pair: u8, ordinal: u64) -> Result<u8> {
         self.context
@@ -402,7 +442,51 @@ impl Drop for WorkStateLease {
     fn drop(&mut self) {
         let word = self.word();
         if word != FREE {
-            self.context.states.release(word);
+            self.context.release_state(word);
         }
+    }
+}
+
+impl Context {
+    /// Every return bumps the domain: a publisher that sampled it before its
+    /// failed acquire() then never sleeps through this node.
+    fn release_state(&self, word: u32) {
+        if self.states.release(word) {
+            self.state_returns.notify();
+        }
+    }
+}
+
+impl QosIds {
+    pub(crate) fn used(&self) -> u32 {
+        (*self.used.lock() & !3u128).count_ones()
+    }
+}
+
+#[kunit_tests(asahi_g17_qos_capacity)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn failed_client_construction_returns_every_qos_id() {
+        let ids = QosIds::new().unwrap();
+        for _ in 0..8 {
+            let mut clients = KVec::with_capacity(126, GFP_KERNEL).unwrap();
+            for _ in 0..126 {
+                clients.push(ids.acquire().unwrap(), GFP_KERNEL).unwrap();
+            }
+            assert_eq!(ids.used(), 126);
+            assert!(matches!(ids.acquire(), Err(ENOSPC)));
+            drop(clients);
+            assert_eq!(ids.used(), 0);
+            assert_eq!(*ids.used.lock(), 3);
+        }
+    }
+}
+
+impl Context {
+    pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>, scope: &str, index: usize) -> kernel::fmt::Result {
+        writeln!(f, "context scope={} index={} id={} work_used={} work_total={} render_used={} render_total=2",
+                 scope, index, self.id(), self.states.used(), STATE_COUNT, self.work.lock().render.used())
     }
 }

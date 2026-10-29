@@ -24,14 +24,17 @@ struct Service<'a> {
 }
 
 impl event::Transport for Service<'_> {
+    fn roles(&self) -> &'static [Role] {
+        self.firmware.roles()
+    }
     fn trace(&mut self, role: Role) {
-        let firmware = &mut self.firmware;
+        let firmware = &mut *self.firmware;
         firmware
             .rings
             .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
     }
     fn statistics(&mut self, role: Role) {
-        let firmware = &mut self.firmware;
+        let firmware = &mut *self.firmware;
         firmware
             .rings
             .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
@@ -128,8 +131,8 @@ impl recovery::Memory for Service<'_> {
     fn clear_timestamps(&self) -> Result {
         self.firmware.init.clear_timestamps()
     }
-    fn entries(&self) -> Result<recovery::Entries> {
-        self.firmware.init.entries()
+    fn entry(&self, index: usize) -> Result<(u32, u32)> {
+        self.firmware.init.entry(index)
     }
     fn wait_tick(&self) {
         self.firmware.init.wait_tick();
@@ -200,6 +203,22 @@ impl recovery::Queues for Service<'_> {
         }
         self.firmware.queues.classify_render(class)
     }
+    fn note_interrupted(&mut self, qid: u8, stamp: u32) -> recovery::Interrupted {
+        let render = self.firmware.queues.note_render_interrupted(qid, stamp);
+        if render != recovery::Interrupted::None {
+            return render;
+        }
+        self.firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .find(|queue| queue.qid() == qid)
+            .map_or(recovery::Interrupted::None, |queue| {
+                queue.note_interrupted(stamp)
+            })
+    }
     fn settle_blamed_render(&mut self, qid: u8, error: Error) {
         let result = self
             .firmware
@@ -217,14 +236,34 @@ impl recovery::Queues for Service<'_> {
         let result = self.firmware.release_compute_witnesses(self.deferred);
         self.settlement_error = self.settlement_error.or(result.err());
     }
+    fn announce_withheld(&mut self) {
+        let mut doorbells = [0u64; 4];
+        for mut queue in self
+            .firmware
+            .queues
+            .compute
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref_mut())
+        {
+            if let Some(doorbell) = queue.take_withheld_doorbell() {
+                doorbells[((doorbell >> 2) & 3) as usize] = doorbell;
+            }
+        }
+        // One doorbell per priority class announces every queue's work slots on that ring.
+        for doorbell in doorbells.into_iter().filter(|doorbell| *doorbell != 0) {
+            let result = self.firmware.port.notify_compute(((doorbell >> 2) & 3) as u8, doorbell);
+            self.settlement_error = self.settlement_error.or(result.err());
+        }
+    }
 }
 
 impl Firmware {
     fn release_compute_witnesses(&mut self, deferred: &mut DeferredBatch) -> Result {
         let state = recovery::Memory::recovery_state(&self.init)?;
-        let view = crate::g17::qos::View::new(self.init.qos()?)?;
+        let port = &self.port;
         let registry = &mut self.queues;
-        for queue in registry
+        for mut queue in registry
             .compute
             .iter_mut()
             .flatten()
@@ -232,7 +271,7 @@ impl Firmware {
         {
             queue.release_witnessed(
                 state,
-                |owner| registry.accounting.complete(&view, &[owner]),
+                |owner| port.qos_complete(&[owner]),
                 &mut |event| deferred.push(event),
             )?;
         }
@@ -263,6 +302,10 @@ impl Firmware {
 
     /// Preparation admission is already closed and all builders have joined.
     pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
+        if self.recovery.restart_limit(super::now_ns()) {
+            pr_warn!("G17: restart storm limit reached\n");
+            return Err(ETIMEDOUT);
+        }
         let shared = self.primary.state.shared.clone();
         let mut service = Service {
             firmware: self,
@@ -272,7 +315,11 @@ impl Firmware {
         };
         let result = recovery::service(&mut service, || {
             shared.crashed.load(core::sync::atomic::Ordering::Acquire)
-        })?;
+        });
+        // Publishers without the device mutex stamp their tickets with this
+        // mirror; they rejoin only after preparation admission reopens.
+        service.firmware.port.set_generation(service.firmware.recovery.generation());
+        let result = result?;
         if let Some(error) = result.target_error {
             dev_warn!(
                 shared.dev.as_ref(),
@@ -300,7 +347,7 @@ impl crate::g17::Shared {
     /// boundary; the collector itself still owns every deferred completion.
     pub(in crate::g17) fn run_runtime_events(self: &Arc<Self>) {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
-            self.stop_queues();
+            self.stop_runtime();
             return;
         }
         let mut deferred = {
@@ -315,8 +362,10 @@ impl crate::g17::Shared {
             };
             deferred
         };
+        crate::g17::trace::event(0);
         let result = self.runtime_event_turn(&mut deferred);
         deferred.finish();
+        crate::g17::trace::event(2);
         self.queue_feed();
         if let Some(firmware) = (*self.state.lock()).as_deref_mut() {
             firmware.queues.worker_deferred = Some(deferred);
@@ -324,7 +373,7 @@ impl crate::g17::Shared {
         if let Err(error) = result {
             dev_err!(self.dev.as_ref(), "GPU event service failed: {:?}\n", error);
             self.lose_device_quietly();
-            self.stop_queues();
+            self.stop_runtime();
         }
     }
 
@@ -344,8 +393,9 @@ impl crate::g17::Shared {
             (recover, masks)
         };
         deferred.finish();
+        crate::g17::trace::event(1);
         if recover {
-            self.preparations.wait_drained();
+            self.preparations.wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
         }
         let mut state = self.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
@@ -388,6 +438,11 @@ impl crate::g17::Shared {
             .any(|queue| queue.in_flight());
         let in_flight = compute || firmware.queues.render_in_flight();
         let idle = firmware.idle_check(now, in_flight)?;
+        let lingers = if firmware.recovery.pending() {
+            None
+        } else {
+            firmware.expire_render_lingers(now)?
+        };
         firmware.reclaim_drained_renders(deferred)?;
         firmware.service_compute_exit(deferred)?;
         let pools = firmware.service_compute_pools(deferred, now)?;
@@ -419,7 +474,7 @@ impl crate::g17::Shared {
                 .iter()
                 .flatten()
                 .filter_map(|entry| entry.queue.as_deref())
-                .any(|queue| queue.retirement_polling());
+                .any(|queue| queue.retirement_polling() || queue.pool_release_pending());
         if polling {
             self.queue_poll();
         }
@@ -430,11 +485,14 @@ impl crate::g17::Shared {
         } else {
             idle
         };
-        // A retained compute pool gives its backing back when it expires.
-        let idle = match (idle, pools) {
-            (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
-            (delay, expiry) => delay.or(expiry),
-        };
+        // A retained compute pool gives its backing back when it expires, and
+        // so does an idle render free-list registration.
+        let idle = [pools, lingers]
+            .into_iter()
+            .fold(idle, |idle, expiry| match (idle, expiry) {
+                (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
+                (delay, expiry) => delay.or(expiry),
+            });
         if let Some(delay) = idle {
             self.queue_idle(delay);
         }
@@ -444,7 +502,8 @@ impl crate::g17::Shared {
         } else if !recover
             && !polling
             && (channel::Events::pending(&firmware.init, Role::Primary)?
-                || channel::Events::pending(&firmware.init, Role::Secondary)?)
+                || (firmware.secondary.is_some()
+                    && channel::Events::pending(&firmware.init, Role::Secondary)?))
         {
             // A full bounded pass must not depend on a fresh notification for
             // records that arrived while it was consuming the same ring.
@@ -454,6 +513,11 @@ impl crate::g17::Shared {
         drop(state);
         if grow_ready {
             self.queue_grow();
+        }
+        // Firmware ring room, consumed releases and teardown steps have no
+        // event of their own: recheck render publishers' conditions every pass.
+        if self.renders.has_waiters() {
+            self.renders.notify();
         }
         Ok(())
     }

@@ -17,6 +17,15 @@ impl RenderState {
     }
 
     pub(in crate::g17::runtime) fn teardown_idle(&self, context: &Arc<Context>) -> Result<bool> {
+        // A pair that changed owner keeps running this scheduler's queues until
+        // the new owner's first command leaves it, whichever context owns it now.
+        let scheduler = Some(context.scheduler_va());
+        if self.entries.iter().flatten().any(|entry| match entry.pair.as_ref() {
+            Some(pair) => pair.switch_in_flight() == scheduler,
+            None => (entry.preparing.is_some() || entry.growing) && entry.borrowed_switch == scheduler,
+        }) {
+            return Ok(false);
+        }
         for entry in self.entries.iter().flatten() {
             if !entry
                 .context
@@ -35,6 +44,14 @@ impl RenderState {
             }
         }
         Ok(true)
+    }
+
+    /// Some render pair runs another context's commands.
+    pub(in crate::g17::runtime) fn foreign_in_flight(&self, context: &Arc<Context>) -> bool {
+        self.entries.iter().flatten().any(|entry| {
+            !entry.context.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, context))
+                && entry.pair.as_ref().is_some_and(|pair| pair.in_flight())
+        })
     }
 
     pub(in crate::g17::runtime) fn teardown_pools_released(&self, context: &Arc<Context>) -> bool {
@@ -120,7 +137,9 @@ impl RenderState {
             buffers.unreserve_owner(pair.buffer_id())?;
             let target = out.binding_slot()?;
             let pair = entry.pair.take().ok_or(EIO)?;
-            let (parked, retired) = KBox::into_inner(pair).park();
+            let (mut parked, retired) = KBox::into_inner(pair).park();
+            // This park follows the consumed release of `context`.
+            parked.release_consumed(context.scheduler_va());
             *target = Some(retired);
             entry.parked = Some(parked);
             // Detached backing retains these references until the worker runs.

@@ -115,8 +115,8 @@ impl Host for Service<'_> {
         self.compute
             .iter()
             .flatten()
-            .filter_map(|entry| entry.queue.as_ref())
-            .all(|queue| queue.idle_for_context(context))
+            .filter_map(|entry| entry.queue.as_deref())
+            .all(|queue| queue.idle_for_context(context) && !queue.switching_from(context))
     }
     fn flists_released(&self, context: &Arc<Context>) -> bool {
         self.render.teardown_pools_released(context)
@@ -190,10 +190,17 @@ impl Firmware {
         teardown.publish_ready(&mut service, recovery, super::now_ns())?;
         let consumer = self.init.control_consumer()?.load(Ordering::Relaxed);
         let producer = self.init.control_producer()?.load(Ordering::Relaxed);
+        let mut consumed = false;
         while teardown
             .take_consumed(consumer, producer, &mut service)?
             .is_some()
-        {}
+        {
+            consumed = true;
+        }
+        if consumed {
+            // A channel whose last scheduler release is consumed can change owner.
+            self.primary.state.shared.channels.notify();
+        }
         Ok(())
     }
 }
