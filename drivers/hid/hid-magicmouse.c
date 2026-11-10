@@ -88,6 +88,23 @@ static bool haptic_press;
 module_param(haptic_press, bool, 0644);
 MODULE_PARM_DESC(haptic_press, "play click feedback from the host on physical press (default off: the actuator's firmware does it)");
 
+/*
+ * Palm rejection on MTP trackpads. A palm resting lightly on the pad can
+ * report a touch area no bigger than a fingertip's, so user space cannot
+ * tell it apart by ABS_MT_TOUCH_MAJOR. Its approach area (tool_major) is
+ * wider than a finger's from the very first report, though, while fingers
+ * and thumbs start narrow and only spread out once pressed. A contact whose
+ * approach width exceeds palm_width within its first palm_frames reports is
+ * reported as MT_TOOL_PALM until it lifts.
+ */
+static unsigned int palm_width = 2200;
+module_param(palm_width, uint, 0644);
+MODULE_PARM_DESC(palm_width, "MTP: approach width (ABS_MT_WIDTH_MAJOR units) above which a new contact is a palm (0: off, default 2200)");
+
+static unsigned int palm_frames = 3;
+module_param(palm_frames, uint, 0644);
+MODULE_PARM_DESC(palm_frames, "MTP: reports after touch-down during which a contact can be judged a palm (default 3)");
+
 static u8 haptic_press_pulses = 1;
 module_param(haptic_press_pulses, byte, 0644);
 MODULE_PARM_DESC(haptic_press_pulses, "pulses played on press (default 1)");
@@ -269,6 +286,9 @@ struct effect_job {
  * @pos: multi touch position data of the last report.
  * @touches: Most recent data for a touch, indexed by tracking ID.
  * @tracking_ids: Mapping of current touch input data to @touches.
+ * @contact_slots: MTP slots that held a contact in the last report.
+ * @palm_slots: MTP slots whose contact is reported as a palm.
+ * @contact_age: Reports since the contact in each MTP slot touched down.
  * @haptics: Haptic device state of an MTP trackpad, NULL otherwise.
  * @taptic_hdev: Actuator HID device of an MTP trackpad, if resolved.
  * @haptic_effects: Uploaded haptic effects of an MTP trackpad.
@@ -305,6 +325,11 @@ struct magicmouse_sc {
 		bool scroll_y_active;
 	} touches[MAX_CONTACTS];
 	int tracking_ids[MAX_CONTACTS];
+
+	/* MTP palm rejection, indexed by slot. */
+	DECLARE_BITMAP(contact_slots, MAX_CONTACTS);
+	DECLARE_BITMAP(palm_slots, MAX_CONTACTS);
+	u8 contact_age[MAX_CONTACTS];
 
 	struct hid_haptic_device *haptics;
 	struct hid_device *taptic_hdev;
@@ -942,12 +967,40 @@ static void report_c1fe_finger_data(struct input_dev *input, int slot,
 static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 				    bool firmware_button);
 
+/*
+ * Track the contact in @slot across reports and decide whether it is a palm.
+ * The decision is made in the contact's first palm_frames reports and holds
+ * until the contact lifts.
+ */
+static bool magicmouse_mtp_palm(struct magicmouse_sc *msc, int slot,
+				const struct tp_finger *f, unsigned long *seen)
+{
+	unsigned int width = le16_to_int(f->tool_major) << 1;
+
+	__set_bit(slot, seen);
+
+	if (!test_bit(slot, msc->contact_slots)) {
+		msc->contact_age[slot] = 0;
+		__clear_bit(slot, msc->palm_slots);
+	}
+
+	if (palm_width && msc->contact_age[slot] < palm_frames &&
+	    width > palm_width)
+		__set_bit(slot, msc->palm_slots);
+
+	if (msc->contact_age[slot] < U8_MAX)
+		msc->contact_age[slot]++;
+
+	return test_bit(slot, msc->palm_slots);
+}
+
 static void report_finger_data(struct input_dev *input, int slot,
 			       const struct input_mt_pos *pos,
-			       const struct tp_finger *f)
+			       const struct tp_finger *f, bool palm)
 {
 	input_mt_slot(input, slot);
-	input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
+	input_mt_report_slot_state(input, palm ? MT_TOOL_PALM : MT_TOOL_FINGER,
+				   true);
 
 	input_report_abs(input, ABS_MT_TOUCH_MAJOR,
 			 le16_to_int(f->touch_major) << 1);
@@ -977,6 +1030,7 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	size_t hdr_sz = sizeof(struct tp_header);
 	const size_t touch_sz = sizeof(struct tp_finger);
 	u8 map_contacs[MAX_CONTACTS];
+	DECLARE_BITMAP(seen, MAX_CONTACTS);
 
 	// hid_warn(hdev, "%s\n", __func__);
 	// print_hex_dump_debug("appleft ev: ", DUMP_PREFIX_OFFSET, 16, 1, data,
@@ -1020,16 +1074,21 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 
 	input_mt_assign_slots(input, msc->tracking_ids, msc->pos, n, 0);
 
+	bitmap_zero(seen, MAX_CONTACTS);
 	for (i = 0; i < n; i++) {
 		int idx = map_contacs[i];
+		int slot = msc->tracking_ids[i];
+
 		f = (struct tp_finger *)(data + hdr_sz + idx * touch_sz);
 		if (msc->mtp_c1fe) {
-			report_c1fe_finger_data(input, msc->tracking_ids[i], &msc->pos[i]);
+			report_c1fe_finger_data(input, slot, &msc->pos[i]);
 		} else {
-			report_finger_data(input, msc->tracking_ids[i], &msc->pos[i], f);
+			report_finger_data(input, slot, &msc->pos[i], f,
+					   magicmouse_mtp_palm(msc, slot, f, seen));
 			pressure += le16_to_int(f->pressure);
 		}
 	}
+	bitmap_copy(msc->contact_slots, seen, MAX_CONTACTS);
 
 	input_mt_sync_frame(input);
 	/* The C1FE report carries no pressure to derive a click from. */
@@ -1315,6 +1374,10 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 		input_set_abs_params(input, ABS_MT_ORIENTATION,
 				     -J314_TP_MAX_FINGER_ORIENTATION,
 				     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
+
+		/* fingers, or palms (see palm_width) */
+		input_set_abs_params(input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX,
+				     0, 0);
 	}
 
 	/* Note: Touch Y position from the device is inverted relative
